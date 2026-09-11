@@ -1,0 +1,304 @@
+"""A deferred daemon start is a wait, not a death (#1056).
+
+``supervisor.run`` calls ``driver.start_daemon()`` once at boot, then polls
+``driver.daemon_running()`` every second and exits 2 — "the daemon died, let
+the orchestrator restart us" — the first time it answers False. But
+``start_daemon`` does not always start a daemon: the BIND9 and PowerDNS
+drivers return WITHOUT one when no config has been rendered yet
+(``named_conf_missing_startup_deferred`` / ``pdns_conf_missing_startup_deferred``)
+and leave the launch to ``swap_and_reload``, which the sync loop reaches once
+the control plane hands over the first bundle.
+
+The first bind pod on a freshly joined cluster member always boots that way —
+its state dir is empty and its bundle is not built yet — so the supervisor
+read "never started" as "died" one tick after boot, exited 2, and kubelet
+back-off-restarted the container until the bundle happened to land inside the
+1 s window. Observed on a nested 3-node QA cluster (2026-09-11): the previous
+container's whole log was ``named_conf_missing_startup_deferred`` at
+15:24:32.232 → shipper + ingest starting → heartbeat 200 → ``dns_daemon_exited``
+at 15:24:33.244; Last State exit 2; Restart Count 2; ``Back-off restarting
+failed container`` on every bind pod the two new members created.
+
+These tests pin the fixed contract: the liveness check is armed by the launch
+(a spawned or adopted pid), not by the boot.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import signal
+import threading
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from spatium_dns_agent import supervisor
+from spatium_dns_agent.config import AgentConfig
+from spatium_dns_agent.drivers import bind9, powerdns
+from spatium_dns_agent.drivers.base import DriverBase
+from spatium_dns_agent.drivers.bind9 import Bind9Driver
+from spatium_dns_agent.drivers.powerdns import PowerDNSDriver
+
+
+class _LogSpy:
+    """Records ``(level, event, kwargs)`` — independent of structlog's global
+    configuration, which another test may have cached."""
+
+    LEVELS = ("debug", "info", "warning", "error", "exception", "critical")
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, dict[str, Any]]] = []
+
+    def __getattr__(self, name: str):
+        if name not in self.LEVELS:
+            raise AttributeError(name)
+
+        def _log(event: str, **kw: Any) -> None:
+            self.calls.append((name, event, kw))
+
+        return _log
+
+    @property
+    def events(self) -> list[str]:
+        return [e for _, e, _ in self.calls]
+
+
+# ── the drivers: what start_daemon leaves behind ──────────────────────────
+
+
+def test_bind9_deferred_start_launches_nothing(tmp_path: Path, monkeypatch) -> None:
+    """An empty state dir at boot: no named.conf, no spawn, no pid."""
+    monkeypatch.setattr(bind9, "find_running_daemon", lambda comm: None)
+    spy = _LogSpy()
+    monkeypatch.setattr(bind9, "log", spy)
+    drv = Bind9Driver(state_dir=tmp_path)
+
+    drv.start_daemon()
+
+    assert spy.events == ["named_conf_missing_startup_deferred"]
+    assert drv.daemon_launched() is False
+    assert drv.daemon_running() is False
+
+
+def test_powerdns_deferred_start_launches_nothing(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(powerdns, "find_running_daemon", lambda comm: None)
+    spy = _LogSpy()
+    monkeypatch.setattr(powerdns, "log", spy)
+    drv = PowerDNSDriver(state_dir=tmp_path)
+
+    drv.start_daemon()
+
+    assert spy.events == ["pdns_conf_missing_startup_deferred"]
+    assert drv.daemon_launched() is False
+    assert drv.daemon_running() is False
+
+
+def test_bind9_spawn_arms_the_liveness_check(tmp_path: Path, monkeypatch) -> None:
+    """Once named.conf exists the spawn records the pid — the tell the
+    supervisor arms on."""
+    conf = tmp_path / "rendered" / "named.conf"
+    conf.parent.mkdir()
+    conf.write_text("options {};\n")
+    monkeypatch.setattr(bind9, "find_running_daemon", lambda comm: None)
+    monkeypatch.setattr(bind9, "wait_for_daemon", lambda comm, pid, timeout_s=5.0: None)
+    spy = _LogSpy()
+    monkeypatch.setattr(bind9, "log", spy)
+    spawned: list[list[str]] = []
+
+    class _Popen:
+        pid = 4242
+
+        def __init__(self, cmd: list[str], *a: Any, **kw: Any) -> None:
+            spawned.append(list(cmd))
+
+    monkeypatch.setattr(bind9.subprocess, "Popen", _Popen)
+    drv = Bind9Driver(state_dir=tmp_path)
+
+    drv.start_daemon()
+
+    assert spawned == [["named", "-f", "-c", str(conf)]]
+    assert spy.events == ["named_started"]
+    assert drv.daemon_launched() is True
+    assert drv.daemon_pid == 4242
+
+
+def test_adopting_a_running_daemon_counts_as_launched(tmp_path: Path, monkeypatch) -> None:
+    """``daemon_running``'s system-wide look-up adopts a live daemon (#704);
+    that arms the check the same way a spawn does."""
+    monkeypatch.setattr(bind9, "find_running_daemon", lambda comm: 77)
+    drv = Bind9Driver(state_dir=tmp_path)
+
+    assert drv.daemon_launched() is False
+    assert drv.daemon_running() is True
+    assert drv.daemon_launched() is True
+    assert drv.daemon_pid == 77
+
+
+# ── the supervisor: armed by the launch, not the boot ─────────────────────
+
+
+class _ScriptedDriver(DriverBase):
+    """``start_daemon`` defers (no pid); the test flips the daemon up and down."""
+
+    def __init__(self, state_dir: Path) -> None:
+        super().__init__(state_dir)
+        self.running = False
+        self.start_calls = 0
+
+    def render(self, bundle: dict[str, Any]) -> None:
+        return None
+
+    def validate(self) -> None:
+        return None
+
+    def swap_and_reload(self) -> None:
+        return None
+
+    def apply_record_op(self, op: dict[str, Any]) -> dict[str, Any] | None:
+        return None
+
+    def start_daemon(self) -> None:
+        self.start_calls += 1  # deferred: nothing spawned, daemon_pid stays None
+
+    def daemon_running(self) -> bool:
+        return self.running
+
+    def launch(self) -> None:
+        self.daemon_pid = 4242
+        self.running = True
+
+    def die(self) -> None:
+        self.running = False
+
+
+class _Idle:
+    """Stands in for every thread-bearing component: blocks until stopped."""
+
+    def __init__(self, *a: Any, **kw: Any) -> None:
+        self._stop = threading.Event()
+        self.config_apply: Any = None
+        self.pending_acks: list[Any] = []
+
+    def run(self) -> None:
+        self._stop.wait()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+@pytest.fixture
+def supervised(agent_cfg: AgentConfig, monkeypatch):
+    """``supervisor.run`` with the network-facing parts stubbed and the 1 s
+    tick scripted.
+
+    Yields ``(driver, ticks, spy, run)``: ``run(script)`` executes the
+    supervisor, firing ``script[n]`` at tick ``n``, and returns the exit code.
+    """
+    drv = _ScriptedDriver(agent_cfg.state_dir)
+    idles: list[_Idle] = []
+
+    def _idle(*a: Any, **kw: Any) -> _Idle:
+        o = _Idle(*a, **kw)
+        idles.append(o)
+        return o
+
+    monkeypatch.setattr(supervisor, "ensure_token", lambda cfg: ("agent-id", "token"))
+    monkeypatch.setattr(supervisor, "_select_driver", lambda cfg: drv)
+    for name in (
+        "HeartbeatClient",
+        "SyncLoop",
+        "MetricsPoller",
+        "QueryLogShipper",
+        "RndcStatusPoller",
+        "IngestWorker",
+    ):
+        monkeypatch.setattr(supervisor, name, _idle)
+    spy = _LogSpy()
+    monkeypatch.setattr(supervisor, "log", spy)
+    ticks: list[int] = []
+
+    def run(script: dict[int, Any], cfg: AgentConfig | None = None) -> int:
+        def fake_sleep(seconds: float) -> None:
+            assert seconds == 1.0
+            ticks.append(len(ticks) + 1)
+            action = script.get(ticks[-1])
+            if action is not None:
+                action()
+            assert len(ticks) < 50, "the supervisor never exited"
+
+        monkeypatch.setattr(supervisor.time, "sleep", fake_sleep)
+        saved = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT)}
+        try:
+            return supervisor.run(cfg if cfg is not None else agent_cfg)
+        finally:
+            for s, h in saved.items():
+                signal.signal(s, h)
+            for o in idles:
+                o.stop()
+
+    yield drv, ticks, spy, run
+
+
+def test_deferred_start_is_waited_out_then_a_real_death_exits_2(supervised) -> None:
+    """Three ticks with nothing launched must not exit; the death at tick 6 must."""
+    drv, ticks, spy, run = supervised
+
+    rc = run({4: drv.launch, 6: drv.die})
+
+    assert drv.start_calls == 1
+    assert rc == 2
+    assert ticks[-1] == 6
+    events = spy.events
+    assert events.count("dns_daemon_start_deferred_waiting") == 1
+    assert (
+        events.index("dns_daemon_start_deferred_waiting")
+        < events.index("dns_daemon_launched_after_deferred_start")
+        < events.index("dns_daemon_exited")
+    )
+    launched = next(
+        kw for _, e, kw in spy.calls if e == "dns_daemon_launched_after_deferred_start"
+    )
+    assert launched["driver"] == "bind9"
+    assert launched["waited_s"] >= 0
+    assert ("error", "dns_daemon_exited", {"driver": "bind9"}) in spy.calls
+
+
+def test_a_deferred_start_that_never_launches_is_not_an_exit(supervised) -> None:
+    """Nothing launched, ever: the loop waits until told to stop, and exits 0.
+    (In the pod, the chart's liveness probe on :53 bounds this wait.)"""
+    _drv, ticks, spy, run = supervised
+
+    rc = run({5: lambda: signal.raise_signal(signal.SIGTERM)})
+
+    assert rc == 0
+    assert ticks[-1] == 5
+    assert "dns_daemon_exited" not in spy.events
+    assert spy.events.count("dns_daemon_start_deferred_waiting") == 1
+    assert "dns_agent_signal_received" in spy.events
+    assert spy.events[-1] == "dns_agent_exiting"
+
+
+def test_a_daemon_that_was_running_at_boot_still_exits_on_death(supervised) -> None:
+    """The pre-#1056 contract is intact when ``start_daemon`` did spawn."""
+    drv, ticks, spy, run = supervised
+    drv.launch()  # what a real start_daemon leaves behind when named.conf exists
+
+    rc = run({2: drv.die})
+
+    assert rc == 2
+    assert ticks[-1] == 2
+    assert "dns_daemon_start_deferred_waiting" not in spy.events
+    assert spy.events[-1] == "dns_daemon_exited"
+
+
+def test_a_driver_that_does_not_manage_a_daemon_is_never_checked(supervised, agent_cfg) -> None:
+    """Only the daemon-managing drivers take the liveness exit at all."""
+    _drv, _ticks, spy, run = supervised
+    cfg = dataclasses.replace(agent_cfg, driver="something-else")
+
+    rc = run({3: lambda: signal.raise_signal(signal.SIGTERM)}, cfg=cfg)
+
+    assert rc == 0
+    assert "dns_daemon_start_deferred_waiting" not in spy.events
+    assert "dns_daemon_exited" not in spy.events
