@@ -66,18 +66,27 @@ import dhcp_packet as dp  # noqa: E402
 from lifecycle_log import LatencyAccumulator, LifecycleLog  # noqa: E402
 from relay_sockets import open_relay_sockets  # noqa: E402
 
+from accounting import DnsTally, rcode_name  # noqa: E402
+from spddi_perf.generator_tallies import dns_summary  # noqa: E402
+
 # dnspython is an off-box runtime dep (perf/requirements.txt: dnspython>=2.6); resolve
 # it once at import so the per-query hot path doesn't re-run the import machinery. When
 # absent (bare env) the DNS query stream + the IPAM->DNS propagation leg no-op cleanly.
 try:
     import dns.asyncquery as _dns_aq  # type: ignore
+    import dns.exception as _dns_exc  # type: ignore
     import dns.message as _dns_msg  # type: ignore
     import dns.rcode as _dns_rcode  # type: ignore
 
     _HAVE_DNSPYTHON = True
+    # A timed-out query is a timeout; every other exception is an error the
+    # tally names by type (#1057 — the two used to share one counter).
+    _DNS_TIMEOUT_EXC: tuple[type[BaseException], ...] = (
+        _dns_exc.Timeout, asyncio.TimeoutError, TimeoutError)
 except Exception:  # pragma: no cover - exercised only in a bare env
-    _dns_aq = _dns_msg = _dns_rcode = None  # type: ignore
+    _dns_aq = _dns_exc = _dns_msg = _dns_rcode = None  # type: ignore
     _HAVE_DNSPYTHON = False
+    _DNS_TIMEOUT_EXC = (asyncio.TimeoutError, TimeoutError)
 
 SERVICE = "orchestrator"
 
@@ -161,6 +170,10 @@ class Counters:
     ddns_first_publish: int = 0
     ddns_renew_writes: int = 0   # MUST stay 0 (H3) — incremented only if a renewal IP-changes
     renew_ip_changed: int = 0    # named correctness FAIL signal
+    # #1057 — every DNS answer counted. The fields above keep their meaning
+    # (add, never rename: ddi-pg's load tier folds them by name).
+    dns_answered: int = 0          # every DNS response received, any rcode (+ dns_rcode_<NAME>)
+    dns_error: int = 0             # DNS exceptions that were not timeouts (types in the log)
 
 
 def _derive_subnets(m: manifest_mod.Manifest, rp: RunPaths, log: Any) -> list[SubnetInfo]:
@@ -314,6 +327,7 @@ class Orchestrator:
         self.online_set: set[int] = set()
         # pending DHCP exchanges keyed by xid -> device index (recv correlation)
         self.pending: dict[int, int] = {}
+        self.dns_tally = DnsTally()
         # timer wheel: due_time -> list[(index, action)]
         self._timers: list[tuple[float, int, str]] = []  # min-heap of (when, index, action)
 
@@ -785,13 +799,26 @@ class Orchestrator:
         try:
             resp = await _dns_aq.udp(
                 q, self.node_ip, port=self.m.target.dns.port, timeout=2.0)
-            latency_ms = (time.monotonic() - t0) * 1000.0
-            self.lat_dns.record_ms(latency_ms)
-            rc = resp.rcode()
-            if rc in (_dns_rcode.NOERROR, _dns_rcode.NXDOMAIN):
-                self.counters.dns_ok += 1
-        except Exception:
+        except _DNS_TIMEOUT_EXC:
             self.counters.dns_timeout += 1
+            return
+        except Exception as exc:  # noqa: BLE001 — every exception is counted, by type
+            self.counters.dns_error += 1
+            if self.dns_tally.error(type(exc).__name__):
+                self.log.warning("DNS query failed: %s: %s", type(exc).__name__, exc,
+                                 extra={"fields": {"event": "dns_query_error",
+                                                   "error_type": type(exc).__name__}})
+            return
+        latency_ms = (time.monotonic() - t0) * 1000.0
+        self.lat_dns.record_ms(latency_ms)
+        # Every answer is counted under its rcode (#1057): before, REFUSED /
+        # SERVFAIL / FORMERR answers were counted as nothing, and a run whose
+        # 606k queries BIND refused read "ok 0, timeouts 46".
+        rc = resp.rcode()
+        self.counters.dns_answered += 1
+        self.dns_tally.answered(rcode_name(rc, _dns_rcode.to_text))
+        if rc in (_dns_rcode.NOERROR, _dns_rcode.NXDOMAIN):
+            self.counters.dns_ok += 1
 
     # ---------------- propagation-lag probe (single-clock) ----------------
     async def _run_propagation_probe(self, dev: Device) -> None:
@@ -938,6 +965,11 @@ class Orchestrator:
                 "departures": cur["departures"], "releases": cur["releases"],
                 "lapses": cur["lapses"], "rearrivals": cur["rearrivals"],
                 "dns_timeout": cur["dns_timeout"],
+                # #1057 — the DNS ledger at this window's end (cumulative like the
+                # fields above: never sum these across windows).
+                "dns_sent": cur["dns_sent"], "dns_ok": cur["dns_ok"],
+                "dns_answered": cur["dns_answered"], "dns_error": cur["dns_error"],
+                "dns_rcodes": dict(sorted(self.dns_tally.rcodes.items())),
             }
             append_ndjson(self.stats_path, rec)
             self._sched_lag_max = 0.0  # reset window max
@@ -945,7 +977,9 @@ class Orchestrator:
 
     def _counter_snapshot(self) -> dict[str, int]:
         c = self.counters
-        return {k: getattr(c, k) for k in c.__dataclass_fields__}
+        out = {k: getattr(c, k) for k in c.__dataclass_fields__}
+        out.update(self.dns_tally.counter_fields())  # dns_rcode_<NAME> per rcode seen
+        return out
 
     # ---------------- lifecycle ----------------
     async def run(self) -> None:
@@ -987,10 +1021,11 @@ class Orchestrator:
         for acc in (self.lat_dora, self.lat_renew, self.lat_dns,
                     self.lat_prop_ipam, self.lat_prop_dns):
             acc.dump_hdr(str(self.rp.generator(f"orchestrator.shard{self.shard}.{acc.name}.hdr")))
+        counters = self._counter_snapshot()
         summary = {
             "ts": utc_now_iso(),
             "shard": self.shard,
-            "counters": self._counter_snapshot(),
+            "counters": counters,
             "dora_ack": self.lat_dora.cumulative_summary(),
             "renew_ack": self.lat_renew.cumulative_summary(),
             "dns_resolve": self.lat_dns.cumulative_summary(),
@@ -999,6 +1034,9 @@ class Orchestrator:
             "unique_macs_with_lease_or_seen": sum(
                 1 for d in self.devices.values()
                 if d.state is not DState.OFFLINE),
+            # #1057 — the DNS outcome by rcode, folded the way the report prints it.
+            "dns": dns_summary(counters),
+            "dns_error_types": dict(sorted(self.dns_tally.errors.items())),
         }
         append_ndjson(self.rp.generator(f"orchestrator.shard{self.shard}.summary.ndjson"), summary)
         # Every socket, not just the wildcard one: relay topology opens one per
