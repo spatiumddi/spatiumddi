@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any
 
 import spddi_perf.manifest as manifest_mod
+from spddi_perf import generator_tallies as gt
 from spddi_perf.logging_util import atomic_write_json, get_logger, log_event, utc_now_iso
 from spddi_perf.runpaths import RunPaths
 
@@ -675,38 +676,64 @@ def criterion_b(rd: RunData) -> list[dict[str, Any]]:
         f"p999 {_fmt(p999, ' ms')}, max {_fmt(dns_max, ' ms')}", "< 50 / < 200 ms",
         b5_verdict))
 
-    # b6 — DNS SERVFAIL rate < 0.1% steady. dnsperf rcode + native metric cross-check.
-    servfail = _dns_rcode_rate(rd, "SERVFAIL")
+    # The orchestrator's own DNS stream, by rcode (#1057). Before per-rcode
+    # accounting its answers were invisible to b6/b6a: a run whose 606k queries
+    # BIND answered REFUSED read "ok 0, timeouts 46" and b6a said NO_DATA.
+    orch_c = gt.sum_counters(rd.orchestrator_summary)
+    orch_rc = gt.dns_rcodes(orch_c)
+    orch_answered = int(orch_c.get("dns_answered") or 0) or sum(orch_rc.values())
+    has_orch = bool(rd.orchestrator_summary)
+
+    # b6 — DNS SERVFAIL rate < 0.1% steady. dnsperf rcode + orchestrator rcode.
+    dp_sent, dp_servfail = _dnsperf_rcode_totals(rd, "SERVFAIL")
+    sf_total = dp_sent + orch_answered
+    servfail = ((dp_servfail + orch_rc.get("SERVFAIL", 0)) / sf_total) if sf_total else None
     rows.append(_row(
         "b6", "DNS SERVFAIL rate < 0.1% steady",
-        "dnsperf.rcode.SERVFAIL / sent",
+        "dnsperf.rcode.SERVFAIL / sent + orchestrator dns_rcode_SERVFAIL / dns_answered",
         _fmt(servfail * 100.0 if servfail is not None else None, "%"), "< 0.1%",
         _verdict_lt(servfail, 0.001) if servfail is not None else NO_DATA))
 
     # b6a — DNS REFUSED rate exactly 0 (structural; out-of-zone leak detector §4.9).
-    refused_total = sum(int((r.get("rcode") or {}).get("REFUSED", r.get("refused", 0)) or 0)
-                        for r in rd.dnsperf)
-    has_dnsperf = bool(rd.dnsperf)
+    # The orchestrator's REFUSED count joins dnsperf's: a refused query measured
+    # nothing, whether the name escaped the validator or the generator queried
+    # from a vantage outside the served view — the run cannot stand either way.
+    refused_dnsperf = sum(int((r.get("rcode") or {}).get("REFUSED", r.get("refused", 0)) or 0)
+                          for r in rd.dnsperf)
+    refused_orch = int(orch_rc.get("REFUSED", 0))
+    refused_total = refused_dnsperf + refused_orch
+    has_refused_data = bool(rd.dnsperf) or has_orch
     rows.append(_row(
         "b6a", "DNS REFUSED rate exactly 0 (structural — out-of-zone leak, §4.9)",
-        "dnsperf.rcode.REFUSED / refused_alert",
-        _fmt(refused_total if has_dnsperf else None), "= 0",
-        (NO_DATA if not has_dnsperf else (PASS if refused_total == 0 else FAIL)),
-        note="any REFUSED = out-of-zone query escaped the §4.9 validator (bug/leak)"))
+        "dnsperf.rcode.REFUSED + orchestrator dns_rcode_REFUSED",
+        (f"{refused_total} (dnsperf {refused_dnsperf}, orchestrator {refused_orch})"
+         if has_refused_data else _fmt(None)), "= 0",
+        (NO_DATA if not has_refused_data else (PASS if refused_total == 0 else FAIL)),
+        note="any REFUSED = an out-of-zone query escaped the §4.9 validator (bug/leak), "
+             "or the generator queried from outside the served view (vantage)"))
 
-    # b7 — DNS timeout/drop rate ~0 steady. dnsperf timeouts + orchestrator dns_timeout.
+    # b7 — DNS timeout/drop rate ~0 steady. dnsperf timeouts + orchestrator dns_timeout
+    # (+ dns_error: exceptions that were not timeouts, once one counter — #1057).
+    # The orchestrator counters are cumulative per shard: read the run's final
+    # summary, or the last window per shard — never a sum over windows, which
+    # multiplied every earlier window's timeouts into the figure printed here.
     timeouts = sum(int(r.get("timeouts") or 0) for r in rd.dnsperf if r.get("kind") == "dnsperf_window")
     sent = sum(int(r.get("sent") or 0) for r in rd.dnsperf if r.get("kind") == "dnsperf_window")
-    orch_dns_to = sum(int(r.get("dns_timeout") or 0) for r in rd.orchestrator_stats)
+    if has_orch:
+        orch_dns_to = int(orch_c.get("dns_timeout") or 0)
+    else:
+        orch_dns_to = gt.dns_timeouts_from_windows(rd.orchestrator_stats)
+    orch_dns_err = int(orch_c.get("dns_error") or 0)
     to_rate = (timeouts / sent) if sent else None
     rows.append(_row(
         "b7", "DNS timeout/drop rate ~0 steady",
-        "dnsperf.timeouts/sent + orchestrator.dns_timeout",
+        "dnsperf.timeouts/sent + orchestrator dns_timeout (+ dns_error)",
         f"{_fmt(to_rate * 100.0 if to_rate is not None else None, '%')} "
-        f"(+{orch_dns_to} orch)".strip(),
+        f"(+{orch_dns_to} orch timeouts, +{orch_dns_err} errors)".strip(),
         "~0 (no sustained timeouts)",
-        (NO_DATA if to_rate is None and not rd.orchestrator_stats
-         else (PASS if (to_rate or 0) < 0.005 and orch_dns_to == 0 else FAIL))))
+        (NO_DATA if to_rate is None and not (rd.orchestrator_stats or has_orch)
+         else (PASS if (to_rate or 0) < 0.005 and orch_dns_to == 0 and orch_dns_err == 0
+               else FAIL))))
 
     # b8 — lease→IPAM→DNS propagation p95 (phase-aware) < 10s. propagation_ipam_to_dns.
     steady_prop_p95 = _phase_p95(rd, "propagation_dns_p95", _is_steady)
@@ -808,7 +835,8 @@ def _phase_pair_verdict(steady: float | None, steady_thr: float,
     return PASS if seen else NO_DATA
 
 
-def _dns_rcode_rate(rd: RunData, code: str) -> float | None:
+def _dnsperf_rcode_totals(rd: RunData, code: str) -> tuple[int, int]:
+    """(sent, answers with ``code``) over the dnsperf windows."""
     total = 0
     code_n = 0
     for r in rd.dnsperf:
@@ -818,6 +846,11 @@ def _dns_rcode_rate(rd: RunData, code: str) -> float | None:
         rc = (r.get("rcode") or {}).get(code, 0)
         total += sent
         code_n += int(rc or 0)
+    return total, code_n
+
+
+def _dns_rcode_rate(rd: RunData, code: str) -> float | None:
+    total, code_n = _dnsperf_rcode_totals(rd, code)
     return (code_n / total) if total else None
 
 
@@ -1330,6 +1363,10 @@ def build_slo_results(rd: RunData) -> dict[str, Any]:
         "overall": {"verdict": overall, "note": overall_note},
         "profile_key": _profile_key(rd.m),
         "present_surfaces": sorted(rd.present),
+        # #1057 — the orchestrator's own ledgers, folded across shards: the
+        # handshake at three strictnesses and the DNS outcome by rcode. None
+        # when no shard summary exists (absence is recorded, never fabricated).
+        "generator": gt.orchestrator_accounting(rd.orchestrator_summary),
     }
 
 
@@ -1594,6 +1631,7 @@ def render_markdown(rd: RunData, slo: dict[str, Any], deltas: dict[str, Any],
         "manifest": _manifest_human(rd.m),
         "present_surfaces": slo["present_surfaces"],
         "profile_key": slo["profile_key"],
+        "generator": slo.get("generator"),
         "fmt_verdict": _verdict_badge,
     }
     tpl = _template_path()
@@ -1686,6 +1724,15 @@ def _render_markdown_builtin(ctx: dict[str, Any]) -> str:
             lines.append(f"| {r['id']} | {slo_txt} | {meas} | {thr} | "
                          f"{_verdict_badge(r['verdict'])} |")
 
+    # Generator accounting (§8.2 / #1057) — what the orchestrator itself counted,
+    # so a handshake or DNS figure can be reconciled with the appliance's own.
+    gen = ctx.get("generator")
+    lines.append("\n## Generator accounting (orchestrator)\n")
+    if gen:
+        lines.extend(_generator_lines(gen))
+    else:
+        lines.append("_No orchestrator shard summary in the run directory._")
+
     # Bottleneck finding (§8.4 #4)
     b = ctx["bottleneck"]
     lines.append("\n## Bottleneck finding (first-to-give + ready §5 mitigation)\n")
@@ -1771,6 +1818,31 @@ def _render_markdown_builtin(ctx: dict[str, Any]) -> str:
                  "`v2-measured` (§8.3.1) once the idle floor is established.")
     lines.append("")
     return "\n".join(lines)
+
+
+def _generator_lines(gen: dict[str, Any]) -> list[str]:
+    """The generator-accounting block, one bullet per ledger (shared shape with
+    the template so the two renderers stay in sync)."""
+    h = gen.get("handshake") or {}
+    d = gen.get("dns") or {}
+
+    def pct(v: Any) -> str:
+        return "—" if v is None else f"{v:.2f}%"
+
+    rc = ", ".join(f"{k} {v:,}" for k, v in (d.get("rcodes") or {}).items()) or "none"
+    return [
+        f"- **Shards:** {gen.get('shards', 0)}",
+        f"- **DHCP handshake:** attempts {h.get('attempts', 0):,} · "
+        f"acked {h.get('acked', 0):,} ({pct(h.get('strict_pct'))} strict) · "
+        f"within budget {h.get('acked_within_budget', 0):,} ({pct(h.get('within_budget_pct'))}) · "
+        f"late {h.get('acked_late', 0):,} ({pct(h.get('with_late_pct'))} with late) · "
+        f"timeouts {h.get('timeouts', 0):,} · naks {h.get('naks', 0):,}",
+        f"- **DNS stream:** sent {d.get('sent', 0):,} · answered {d.get('answered', 0):,} · "
+        f"ok {d.get('ok', 0):,} ({pct(d.get('ok_pct_of_sent'))} of sent) · "
+        f"timeouts {d.get('timeouts', 0):,} · errors {d.get('errors', 0):,} · "
+        f"unaccounted {d.get('unaccounted', 0):,}",
+        f"- **DNS rcodes:** {rc}",
+    ]
 
 
 def _ddns_short_circuit_note(ctx: dict[str, Any]) -> str:
