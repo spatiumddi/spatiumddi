@@ -202,14 +202,13 @@ def test_the_last_fatal_wins_over_a_trailing_shutdown_line() -> None:
     AFTER the fatal on a blocked join; selecting that trailing line left the
     reason empty and the caller printed "did not come Ready within 180s". The
     fatal is the verdict."""
-    log = "\n".join(
-        [
-            'time="2026-09-10T11:52:16Z" level=fatal msg="Error: preparing server: '
-            'failed to validate token: failed to get CA certs: Get '
-            '\\"https://192.168.122.89:6443/cacerts\\": context deadline exceeded"',
-            'time="2026-09-10T11:52:16Z" level=info msg="Shutdown request received"',
-        ]
+    fatal = (
+        'time="2026-09-10T11:52:16Z" level=fatal msg="Error: preparing server: '
+        'failed to validate token: failed to get CA certs: Get '
+        '\\"https://192.168.122.89:6443/cacerts\\": context deadline exceeded"'
     )
+    shutdown = 'time="2026-09-10T11:52:16Z" level=info msg="Shutdown request received"'
+    log = "\n".join([fatal, shutdown])
     reason = _classify(log)
     assert reason, "a trailing shutdown line must not blank the reason"
     assert "could not reach the seed" in reason
