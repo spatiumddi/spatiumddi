@@ -68,6 +68,44 @@ def _pct(num: int, den: int) -> float | None:
     return round(100.0 * num / den, 3) if den > 0 else None
 
 
+def handshake_summary(counters: dict[str, Any]) -> dict[str, Any]:
+    """The DORA handshake figure at three strictnesses, from one counter set.
+
+    ``attempts``            = dora_ack + timeout + nak — every DORA the generator
+                              closed itself, one way or the other (unchanged
+                              denominator; a device that never got a verdict is
+                              in none of the three).
+    ``acked``               = dora_ack: ACKed before the device gave up, retries
+                              included — the pre-#1057 meaning, kept so existing
+                              consumers read the same figure.
+    ``acked_within_budget`` = acked minus ``dora_ack_over_budget``: the ACK
+                              answered the exchange within its own DORA_TIMEOUT_S
+                              (no retransmit had fired for it).
+    ``acked_late``          = dora_ack_late: the ACK arrived after the device had
+                              given up and been counted as a timeout. Each one is
+                              a timeout that turned out to be a slow ACK, so
+                              ``acked_late <= timeouts`` and ``with_late_pct``
+                              never exceeds 100.
+    """
+    acked = _int(counters.get("dora_ack"))
+    over = _int(counters.get("dora_ack_over_budget"))
+    late = _int(counters.get("dora_ack_late"))
+    timeouts = _int(counters.get("timeout"))
+    naks = _int(counters.get("nak"))
+    attempts = acked + timeouts + naks
+    return {
+        "attempts": attempts,
+        "acked": acked,
+        "acked_within_budget": max(0, acked - over),
+        "acked_late": late,
+        "timeouts": timeouts,
+        "naks": naks,
+        "within_budget_pct": _pct(max(0, acked - over), attempts),
+        "strict_pct": _pct(acked, attempts),
+        "with_late_pct": _pct(min(attempts, acked + late), attempts),
+    }
+
+
 def dns_summary(counters: dict[str, Any]) -> dict[str, Any]:
     """The DNS query stream's outcome ledger from one counter set.
 
@@ -117,3 +155,18 @@ def dns_timeouts_from_windows(stats_rows: Iterable[dict[str, Any]]) -> int:
         if v > per_shard.get(shard, 0):
             per_shard[shard] = v
     return sum(per_shard.values())
+
+
+def orchestrator_accounting(summaries: Iterable[dict[str, Any]]) -> dict[str, Any] | None:
+    """The report's generator block: folded counters + both ledgers, or None
+    when no shard summary exists (absence is recorded, never fabricated)."""
+    summaries = [s for s in summaries if isinstance(s, dict)]
+    if not summaries:
+        return None
+    counters = sum_counters(summaries)
+    return {
+        "shards": len(summaries),
+        "counters": dict(sorted(counters.items())),
+        "handshake": handshake_summary(counters),
+        "dns": dns_summary(counters),
+    }

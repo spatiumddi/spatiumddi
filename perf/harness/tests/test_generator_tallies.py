@@ -11,6 +11,8 @@ from spddi_perf.generator_tallies import (  # noqa: E402
     dns_rcodes,
     dns_summary,
     dns_timeouts_from_windows,
+    handshake_summary,
+    orchestrator_accounting,
     sum_counters,
 )
 
@@ -22,6 +24,22 @@ def test_sum_counters_adds_shards_including_dynamic_rcode_keys() -> None:
     assert c == {"dora_ack": 17, "dns_rcode_REFUSED": 7, "dns_rcode_NOERROR": 1,
                  "dns_rcode_SERVFAIL": 3}
     assert dns_rcodes(c) == {"REFUSED": 7, "NOERROR": 1, "SERVFAIL": 3}
+
+
+def test_handshake_three_strictnesses_from_todays_numbers() -> None:
+    """nightly-20260910 PostQA gate_load: acks 9997 / timeouts 637 → 94.01 %.
+    The pre-fix figure is `strict_pct` unchanged; a late ACK per timed-out
+    device would lift `with_late_pct` and never past 100."""
+    h = handshake_summary({"dora_ack": 9997, "timeout": 637, "nak": 0})
+    assert h["attempts"] == 10634 and h["strict_pct"] == 94.01
+    assert h["with_late_pct"] == 94.01 and h["acked_late"] == 0
+    h2 = handshake_summary({"dora_ack": 9997, "timeout": 637, "nak": 0,
+                            "dora_ack_late": 600, "dora_ack_over_budget": 40})
+    assert h2["acked_within_budget"] == 9957 and h2["within_budget_pct"] == 93.634
+    assert h2["with_late_pct"] == round(100 * 10597 / 10634, 3)
+    h3 = handshake_summary({"dora_ack": 10, "timeout": 2, "dora_ack_late": 5})
+    assert h3["with_late_pct"] == 100.0            # capped: late ≤ timeouts by construction
+    assert handshake_summary({})["strict_pct"] is None
 
 
 def test_dns_summary_shows_the_pre_fix_hole_and_the_fixed_ledger() -> None:
@@ -47,3 +65,18 @@ def test_dns_timeouts_from_windows_takes_the_last_value_per_shard_not_the_sum() 
             {"shard": 0, "dns_timeout": 46}, {"shard": 1, "dns_timeout": 2},
             {"shard": 1, "dns_timeout": 2}, "junk"]
     assert dns_timeouts_from_windows(rows) == 48      # not 1+3+46+2+2 = 54
+
+
+def test_orchestrator_accounting_block_and_absence() -> None:
+    assert orchestrator_accounting([]) is None
+    blk = orchestrator_accounting([
+        {"counters": {"dora_ack": 3, "timeout": 1, "dns_sent": 5, "dns_ok": 5,
+                      "dns_answered": 5, "dns_rcode_NOERROR": 5}},
+        {"counters": {"dora_ack": 2, "dora_ack_late": 1, "dns_sent": 1,
+                      "dns_timeout": 1}},
+    ])
+    assert blk["shards"] == 2
+    assert blk["handshake"]["acked"] == 5 and blk["handshake"]["acked_late"] == 1
+    assert blk["handshake"]["with_late_pct"] == 100.0
+    assert blk["dns"]["sent"] == 6 and blk["dns"]["timeouts"] == 1
+    assert blk["dns"]["rcodes"] == {"NOERROR": 5} and blk["dns"]["unaccounted"] == 0

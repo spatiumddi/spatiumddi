@@ -66,8 +66,11 @@ import dhcp_packet as dp  # noqa: E402
 from lifecycle_log import LatencyAccumulator, LifecycleLog  # noqa: E402
 from relay_sockets import open_relay_sockets  # noqa: E402
 
-from accounting import DnsTally, rcode_name  # noqa: E402
-from spddi_perf.generator_tallies import dns_summary  # noqa: E402
+from accounting import (  # noqa: E402
+    DORA_KINDS, KIND_DISCOVER, KIND_REBIND, KIND_RENEW, KIND_SELECT, Closed, DnsTally,
+    Exchange, ExchangeLedger, rcode_name,
+)
+from spddi_perf.generator_tallies import dns_summary, handshake_summary  # noqa: E402
 
 # dnspython is an off-box runtime dep (perf/requirements.txt: dnspython>=2.6); resolve
 # it once at import so the per-query hot path doesn't re-run the import machinery. When
@@ -135,6 +138,14 @@ class Device:
     dora_retries: int = 0
     # propagation-probe membership
     probe: bool = False
+    # #1057 — exchange-correlated accounting: the DORA / renewal round this
+    # device is on (retransmits keep it, a fresh arrival or a NAK bumps it), the
+    # token of the live T1 timer (a re-ACKed lease invalidates the old one), and
+    # whether a LEFT device got there by lapsing (a late rebind ACK revives it)
+    # or by departing (it does not).
+    episode: int = 0
+    t1_token: int = 0
+    lapsed: bool = False
 
 
 @dataclass
@@ -170,8 +181,18 @@ class Counters:
     ddns_first_publish: int = 0
     ddns_renew_writes: int = 0   # MUST stay 0 (H3) — incremented only if a renewal IP-changes
     renew_ip_changed: int = 0    # named correctness FAIL signal
-    # #1057 — every DNS answer counted. The fields above keep their meaning
-    # (add, never rename: ddi-pg's load tier folds them by name).
+    # #1057 — exchange-correlated accounting. The fields above keep their
+    # meaning (add, never rename: ddi-pg's load tier folds them by name); these
+    # make the generator's tally reconcilable with kea's and BIND's own counters.
+    dora_offer: int = 0            # OFFERs received, whatever the device was doing
+    offer_ignored: int = 0         # OFFERs that found the device not DISCOVERING
+    request_sent: int = 0          # SELECTING REQUESTs sent (one per accepted OFFER)
+    dora_ack_over_budget: int = 0  # of dora_ack: its exchange's own timer had fired
+    dora_ack_late: int = 0         # DORA ACKs after the device gave up (a `timeout` that was slow)
+    renew_ack_late: int = 0        # renew ACKs after the renew timer escalated / the device left
+    rebind_ack_late: int = 0       # rebind ACKs after the device lapsed (a `lapses` that was slow)
+    ack_duplicate: int = 0         # a second ACK for an exchange already closed
+    ack_unmatched: int = 0         # an ACK whose xid matches no exchange the ledger knows
     dns_answered: int = 0          # every DNS response received, any rcode (+ dns_rcode_<NAME>)
     dns_error: int = 0             # DNS exceptions that were not timeouts (types in the log)
 
@@ -317,6 +338,9 @@ class Orchestrator:
 
         # Latency accumulators (DORA + renew SEPARATELY, DNS resolve, both prop legs).
         self.lat_dora = LatencyAccumulator("dhcp_dora_ack")
+        # Late DORA ACKs (after the device gave up) get their own histogram so
+        # the strict one keeps its meaning and the slow tail is still visible.
+        self.lat_dora_late = LatencyAccumulator("dhcp_dora_ack_late")
         self.lat_renew = LatencyAccumulator("dhcp_renew_ack")
         self.lat_dns = LatencyAccumulator("dns_resolve")
         self.lat_prop_ipam = LatencyAccumulator("propagation_lease_to_ipam")
@@ -325,8 +349,10 @@ class Orchestrator:
         self.counters = Counters()
         self.devices: dict[int, Device] = {}
         self.online_set: set[int] = set()
-        # pending DHCP exchanges keyed by xid -> device index (recv correlation)
-        self.pending: dict[int, int] = {}
+        # Every in-flight (and recently closed) DHCP exchange keyed by xid: the
+        # reply is attributed to the exchange it answers, not to whatever the
+        # device happens to be doing when it arrives (#1057).
+        self.ledger = ExchangeLedger()
         self.dns_tally = DnsTally()
         # timer wheel: due_time -> list[(index, action)]
         self._timers: list[tuple[float, int, str]] = []  # min-heap of (when, index, action)
@@ -408,8 +434,15 @@ class Orchestrator:
     def _new_xid(self, dev: Device) -> int:
         # xid encodes the device index in the low 24 bits + a per-attempt nonce in the
         # high byte → cheap recv correlation while staying unique across re-sends.
-        nonce = self.rng.randrange(256)
-        return ((nonce & 0xFF) << 24) | (dev.index & 0xFFFFFF)
+        # The nonce must not collide with an exchange of this device the ledger
+        # still knows, or the reply would be attributed to the older send.
+        xid = dev.index & 0xFFFFFF
+        for _ in range(8):
+            nonce = self.rng.randrange(256)
+            xid = ((nonce & 0xFF) << 24) | (dev.index & 0xFFFFFF)
+            if self.ledger.get(xid) is None:
+                break
+        return xid
 
     def _send(self, pkt: bytes, dev: Device) -> None:
         sock = self._sock_for(dev)
@@ -429,7 +462,10 @@ class Orchestrator:
             self.log.debug("send failed: %s", exc,
                            extra={"fields": {"event": "send_error", "index": dev.index}})
 
-    def _send_discover(self, dev: Device) -> None:
+    def _send_discover(self, dev: Device, *, new_round: bool) -> None:
+        """A DISCOVER. ``new_round`` opens a fresh DORA round (arrival, re-arrival,
+        NAK); a retransmit after ``dora_timeout`` keeps the round, so a reply to
+        any of its sends still belongs to it."""
         if dev.discover_tpl is None:
             dev.discover_tpl = dp.build_discover(
                 mac=dev.mac, client_id=dev.client_id_bytes,
@@ -439,12 +475,18 @@ class Orchestrator:
         dev.xid = self._new_xid(dev)
         giaddr = self.subnets[dev.subnet_idx].giaddr if self.relay else None
         dp.patch_send_fields(pkt, xid=dev.xid, giaddr=giaddr)
+        if new_round:
+            dev.episode += 1
+            dev.lapsed = False
         dev.state = DState.DISCOVERING
         dev.tx_at = time.monotonic()
-        self.pending[dev.xid] = dev.index
+        self.ledger.open(dev.xid, dev.index, KIND_DISCOVER, dev.tx_at, dev.episode)
         self._send(bytes(pkt), dev)
         self.counters.dora_sent += 1
-        self._schedule(DORA_TIMEOUT_S, dev.index, "dora_timeout")
+        # The timer belongs to THIS exchange (#1057): it retransmits only if this
+        # send is still the device's live one when it fires — a DISCOVER's
+        # deadline no longer fires over the REQUEST that answered its OFFER.
+        self._schedule(DORA_TIMEOUT_S, dev.index, f"dora_timeout:{dev.xid}")
 
     def _send_request_renew(self, dev: Device) -> None:
         assert dev.leased_ip
@@ -454,11 +496,12 @@ class Orchestrator:
         dev.xid = self._new_xid(dev)
         dp.patch_send_fields(pkt, xid=dev.xid)  # NO giaddr — renew is unicast direct
         dev.state = DState.RENEWING
+        dev.episode += 1
         dev.tx_at = time.monotonic()
-        self.pending[dev.xid] = dev.index
+        self.ledger.open(dev.xid, dev.index, KIND_RENEW, dev.tx_at, dev.episode)
         self._send(bytes(pkt), dev)
         self.counters.renew_sent += 1
-        self._schedule(RENEW_TIMEOUT_S, dev.index, "renew_timeout")
+        self._schedule(RENEW_TIMEOUT_S, dev.index, f"renew_timeout:{dev.xid}")
 
     def _send_request_rebind(self, dev: Device) -> None:
         assert dev.leased_ip
@@ -470,10 +513,10 @@ class Orchestrator:
         dp.patch_send_fields(pkt, xid=dev.xid, giaddr=giaddr)
         dev.state = DState.REBINDING
         dev.tx_at = time.monotonic()
-        self.pending[dev.xid] = dev.index
+        self.ledger.open(dev.xid, dev.index, KIND_REBIND, dev.tx_at, dev.episode)
         self._send(bytes(pkt), dev)
         self.counters.rebind_sent += 1
-        self._schedule(RENEW_TIMEOUT_S, dev.index, "rebind_timeout")
+        self._schedule(RENEW_TIMEOUT_S, dev.index, f"rebind_timeout:{dev.xid}")
 
     def _send_request_selecting(self, dev: Device, offered_ip: str, server_id: str) -> None:
         pkt = bytearray(dp.build_request_selecting(
@@ -482,10 +525,18 @@ class Orchestrator:
         dev.xid = self._new_xid(dev)
         giaddr = self.subnets[dev.subnet_idx].giaddr if self.relay else None
         dp.patch_send_fields(pkt, xid=dev.xid, giaddr=giaddr)
-        dev.tx_at = time.monotonic()  # keep DORA clock running through SELECTING
-        self.pending[dev.xid] = dev.index
+        dev.tx_at = time.monotonic()  # the DORA latency is the REQUEST->ACK leg (unchanged)
+        self.ledger.open(dev.xid, dev.index, KIND_SELECT, dev.tx_at, dev.episode)
         self._send(bytes(pkt), dev)
-        self._schedule(DORA_TIMEOUT_S, dev.index, "dora_timeout")
+        self.counters.request_sent += 1
+        self._schedule(DORA_TIMEOUT_S, dev.index, f"dora_timeout:{dev.xid}")
+
+    def _schedule_t1(self, dev: Device) -> None:
+        """(Re)arm the T1 renewal for the lease the device holds now. The token
+        retires any earlier T1 timer, so a lease re-ACKed twice (a late renew
+        ACK and then the rebind's) renews once, not twice."""
+        dev.t1_token += 1
+        self._schedule(T1_RENEW_S, dev.index, f"t1_renew:{dev.t1_token}")
 
     def _send_release(self, dev: Device) -> None:
         if not (dev.leased_ip and dev.server_id):
@@ -499,12 +550,24 @@ class Orchestrator:
         self.counters.releases += 1
 
     # ---------------- FSM event handlers ----------------
-    def _on_offer(self, dev: Device, reply: dict) -> None:
+    def _on_offer(self, dev: Device, reply: dict, ex: Exchange | None, now: float) -> None:
+        self.counters.dora_offer += 1
+        if dev.state is not DState.DISCOVERING:
+            # A late or duplicate OFFER: the device already took a lease or gave
+            # up, so nobody is selecting. Counted so kea's OFFER tally reconciles
+            # with ours; the FSM does not move.
+            self.counters.offer_ignored += 1
+            if ex is not None and ex.open:
+                self.ledger.close(ex.xid, now, "offer")
+            return
         # SELECTING: accept the OFFER with a REQUEST(opt-50/opt-54).
         offered = reply.get("yiaddr")
         sid = reply.get("server_id") or offered
         if not offered or offered == "0.0.0.0":
             return
+        if ex is not None and ex.open:
+            # The DISCOVER is answered: its own timer must not retransmit it.
+            self.ledger.close(ex.xid, now, "offer")
         self._send_request_selecting(dev, offered, sid)
 
     def _ip_in_seeded_subnet(self, ip: str) -> bool:
@@ -516,84 +579,182 @@ class Orchestrator:
             return False
         return any(addr in net for net in self._seeded_nets)
 
-    def _on_ack(self, dev: Device, reply: dict, now: float) -> None:
-        prev_state = dev.state
+    def _on_ack(self, dev: Device, reply: dict, now: float, ex: Exchange | None) -> None:
+        """Attribute an ACK to the exchange it answers (#1057). Before, the
+        device's state at arrival decided what the ACK meant — and after
+        MAX_DORA_RETRIES the device was OFFLINE, so the ACK that answered its
+        last REQUEST matched no branch: counted as a timeout already, then
+        dropped with the lease kea had just allocated."""
+        if ex is None:
+            self.counters.ack_unmatched += 1
+            self.log.debug("ACK for an xid the ledger does not know",
+                           extra={"fields": {"event": "ack_unmatched", "index": dev.index,
+                                             "xid": reply.get("xid")}})
+            return
+        closed = self.ledger.close(ex.xid, now, "ack")
+        if closed is None or closed.duplicate:
+            self.counters.ack_duplicate += 1
+            return
+        latency_ms = (now - ex.tx_at) * 1000.0  # the leg this ACK actually closes
+        if ex.kind in DORA_KINDS:
+            self._on_dora_ack(dev, reply, ex, closed, latency_ms, now)
+        else:
+            self._on_renewal_ack(dev, reply, ex, closed, latency_ms, now)
+
+    def _on_dora_ack(self, dev: Device, reply: dict, ex: Exchange, closed: Closed,
+                     latency_ms: float, now: float) -> None:
         new_ip = reply.get("yiaddr")
-        latency_ms = (now - dev.tx_at) * 1000.0
-        if prev_state in (DState.DISCOVERING,):
-            # perf #454 — foreign-responder guard. If the leased IP is outside
-            # every seeded subnet, a DIFFERENT DHCP server answered (e.g. the
-            # site router on a shared LAN) — we're not testing the appliance's
-            # Kea. Count it and warn loudly (once) so the run isn't silently
-            # measuring the wrong server. Use an isolated VLAN or relay topology.
-            if new_ip and self._seeded_nets and not self._ip_in_seeded_subnet(new_ip):
-                self.counters.foreign_ack += 1
-                if not self._foreign_warned:
-                    self._foreign_warned = True
-                    self.log.error(
-                        "DHCP ACK from a FOREIGN server — leased IP %s is outside "
-                        "every seeded subnet. A non-appliance DHCP server is winning "
-                        "the broadcast race; use an isolated test VLAN or relay "
-                        "topology (perf #454).", new_ip,
-                        extra={"fields": {"event": "foreign_dhcp_responder",
-                                          "leased_ip": new_ip, "server_id": reply.get("server_id")}})
-            # DORA ACK — first lease (or re-lease after re-arrival).
-            dev.leased_ip = new_ip
-            dev.server_id = reply.get("server_id") or dev.server_id
-            dev.lease_time = int(reply.get("lease_time", self.m.scale.lease_time_s))
-            dev.state = DState.ONLINE
-            self.online_set.add(dev.index)
-            self.counters.dora_ack += 1
-            self.lat_dora.record_ms(latency_ms)
-            dev.dora_retries = 0
-            # DDNS coupling happens ONLY on first DORA (hostname-bearing devices).
+        # perf #454 — foreign-responder guard. If the leased IP is outside
+        # every seeded subnet, a DIFFERENT DHCP server answered (e.g. the
+        # site router on a shared LAN) — we're not testing the appliance's
+        # Kea. Count it and warn loudly (once) so the run isn't silently
+        # measuring the wrong server. Use an isolated VLAN or relay topology.
+        if new_ip and self._seeded_nets and not self._ip_in_seeded_subnet(new_ip):
+            self.counters.foreign_ack += 1
+            if not self._foreign_warned:
+                self._foreign_warned = True
+                self.log.error(
+                    "DHCP ACK from a FOREIGN server — leased IP %s is outside "
+                    "every seeded subnet. A non-appliance DHCP server is winning "
+                    "the broadcast race; use an isolated test VLAN or relay "
+                    "topology (perf #454).", new_ip,
+                    extra={"fields": {"event": "foreign_dhcp_responder",
+                                      "leased_ip": new_ip, "server_id": reply.get("server_id")}})
+        if closed.late:
+            # The device had given up (its `timeout` is already counted). Kea's
+            # ACK still allocated the lease: count it under its own name, keep
+            # its latency apart from the strict histogram, and take the lease
+            # unless a newer round already holds one — the server holds it, and
+            # a model that ignores it drifts from the server it measures.
+            self.counters.dora_ack_late += 1
+            self.lat_dora_late.record_ms(latency_ms)
+            self.lifecycle.emit(mac=dev.mac, index=dev.index, event="dora_ack_late",
+                                ip=new_ip, ack_ms=round(latency_ms, 2),
+                                late_by_s=round(now - (ex.gave_up_at or now), 2),
+                                ddns=bool(dev.hostname))
+            if dev.leased_ip is not None:
+                return
             if dev.hostname:
                 self.counters.ddns_first_publish += 1
-            self.lifecycle.emit(mac=dev.mac, index=dev.index, event="dora_ack",
-                                ip=new_ip, ack_ms=round(latency_ms, 2),
-                                ddns=bool(dev.hostname))
-            # Self-schedule the next renewal at T1=900s (renewals self-track online).
-            self._schedule(T1_RENEW_S, dev.index, "t1_renew")
-            # Propagation probe membership (1-in-1000 arrivals).
-            if dev.probe:
-                self._schedule(0.0, dev.index, "probe_start")
-        elif prev_state in (DState.RENEWING, DState.REBINDING):
-            # RENEW/REBIND ACK — HARD CONTRACT: same IP. A changed IP is a FAIL.
-            if new_ip and dev.leased_ip and new_ip != dev.leased_ip:
-                self.counters.renew_ip_changed += 1
-                self.counters.ddns_renew_writes += 1  # would trigger the 6-write cascade
-                self.log.error(
-                    "RENEWAL LANDED ON A DIFFERENT IP — correctness FAIL (H3)",
-                    extra={"fields": {"event": "renew_ip_changed", "index": dev.index,
-                                      "old_ip": dev.leased_ip, "new_ip": new_ip}})
-                self.lifecycle.emit(mac=dev.mac, index=dev.index, event="renew_ip_changed",
-                                    old_ip=dev.leased_ip, new_ip=new_ip)
-                dev.leased_ip = new_ip
-            dev.state = DState.ONLINE
-            if prev_state is DState.RENEWING:
+            self._take_lease(dev, reply, now)
+            return
+        # DORA ACK — first lease (or re-lease after re-arrival), before the
+        # device gave up: the pre-#1057 meaning of dora_ack, retries included.
+        self.counters.dora_ack += 1
+        if closed.over_budget:
+            self.counters.dora_ack_over_budget += 1
+        self.lat_dora.record_ms(latency_ms)
+        # DDNS coupling happens ONLY on first DORA (hostname-bearing devices).
+        if dev.hostname:
+            self.counters.ddns_first_publish += 1
+        self.lifecycle.emit(mac=dev.mac, index=dev.index, event="dora_ack",
+                            ip=new_ip, ack_ms=round(latency_ms, 2),
+                            ddns=bool(dev.hostname), over_budget=closed.over_budget)
+        self._take_lease(dev, reply, now)
+        # Propagation probe membership (1-in-1000 arrivals).
+        if dev.probe:
+            self._schedule(0.0, dev.index, "probe_start")
+
+    def _take_lease(self, dev: Device, reply: dict, now: float) -> None:
+        """The ACK's lease becomes the device's: ONLINE, T1 armed, every other
+        exchange of the DORA round (a retransmit still in flight) settled."""
+        dev.leased_ip = reply.get("yiaddr")
+        dev.server_id = reply.get("server_id") or dev.server_id
+        dev.lease_time = int(reply.get("lease_time", self.m.scale.lease_time_s))
+        dev.state = DState.ONLINE
+        dev.lapsed = False
+        dev.dora_retries = 0
+        self.online_set.add(dev.index)
+        self.ledger.settle(dev.index, now, kinds=DORA_KINDS)
+        # Self-schedule the next renewal at T1=900s (renewals self-track online).
+        self._schedule_t1(dev)
+
+    def _on_renewal_ack(self, dev: Device, reply: dict, ex: Exchange, closed: Closed,
+                        latency_ms: float, now: float) -> None:
+        new_ip = reply.get("yiaddr")
+        # RENEW/REBIND ACK — HARD CONTRACT: same IP. A changed IP is a FAIL.
+        if new_ip and dev.leased_ip and new_ip != dev.leased_ip:
+            self.counters.renew_ip_changed += 1
+            self.counters.ddns_renew_writes += 1  # would trigger the 6-write cascade
+            self.log.error(
+                "RENEWAL LANDED ON A DIFFERENT IP — correctness FAIL (H3)",
+                extra={"fields": {"event": "renew_ip_changed", "index": dev.index,
+                                  "old_ip": dev.leased_ip, "new_ip": new_ip}})
+            self.lifecycle.emit(mac=dev.mac, index=dev.index, event="renew_ip_changed",
+                                old_ip=dev.leased_ip, new_ip=new_ip)
+            dev.leased_ip = new_ip
+        renew = ex.kind == KIND_RENEW
+        if closed.late:
+            # After RENEW_TIMEOUT_S escalated the device (renew), after it lapsed
+            # (rebind), or after it departed with the request in flight. Kea
+            # answered; the count says so under its own name, whatever state
+            # the reply found. Its latency stays out of the strict histogram.
+            if renew:
+                self.counters.renew_ack_late += 1
+            else:
+                self.counters.rebind_ack_late += 1
+            event = "renew_ack_late"
+        else:
+            if renew:
                 self.counters.renew_ack += 1
             else:
                 self.counters.rebind_ack += 1
             self.lat_renew.record_ms(latency_ms)
-            self.lifecycle.emit(mac=dev.mac, index=dev.index, event="renew_ack",
-                                ip=dev.leased_ip, ack_ms=round(latency_ms, 2))
-            self._schedule(T1_RENEW_S, dev.index, "t1_renew")
-        self.pending.pop(dev.xid, None)
+            event = "renew_ack"
+        self.lifecycle.emit(mac=dev.mac, index=dev.index, event=event,
+                            ip=dev.leased_ip or new_ip, ack_ms=round(latency_ms, 2),
+                            kind=ex.kind)
+        if dev.state in (DState.RENEWING, DState.REBINDING):
+            # The lease is renewed. A late renew ACK arriving while the rebind
+            # is in flight leaves that exchange open: kea will ACK it too, and
+            # that ACK counts on its own (two ACKs from kea, two here).
+            dev.state = DState.ONLINE
+            if dev.leased_ip is None:
+                dev.leased_ip = new_ip
+            self._schedule_t1(dev)
+        elif dev.state is DState.LEFT and dev.lapsed and new_ip:
+            # Lapsed (rebind timed out), then kea's rebind ACK arrived: the
+            # server extended the lease, so the device is back ONLINE with it.
+            # A device that DEPARTED is left alone — its lease expires
+            # server-side exactly as a silent departure should (§3.2).
+            self.lifecycle.emit(mac=dev.mac, index=dev.index, event="lapse_revived", ip=new_ip)
+            dev.leased_ip = new_ip
+            dev.state = DState.ONLINE
+            dev.lapsed = False
+            self.online_set.add(dev.index)
+            self._schedule_t1(dev)
 
-    def _on_nak(self, dev: Device) -> None:
+    def _on_nak(self, dev: Device, ex: Exchange | None, now: float) -> None:
         self.counters.nak += 1
-        self.pending.pop(dev.xid, None)
+        if ex is not None:
+            self.ledger.close(ex.xid, now, "nak")
         self.lifecycle.emit(mac=dev.mac, index=dev.index, event="nak")
-        # NAK → fall back to a fresh DISCOVER (lease invalid).
+        # NAK → fall back to a fresh DISCOVER (lease invalid). Every other
+        # exchange of the device is over with it.
         dev.leased_ip = None
         self.online_set.discard(dev.index)
-        self._send_discover(dev)
+        self.ledger.settle(dev.index, now, reason="abandoned")
+        self._send_discover(dev, new_round=True)
+
+    def _timer_exchange(self, dev: Device, arg: str, now: float) -> tuple[int, bool]:
+        """(xid, live) for an exchange-scoped timer: ``live`` when the exchange
+        is still open AND still the device's current send — the only case a
+        deadline may act on. Anything else (answered, superseded by a later
+        send of the same round, already retired) is marked expired and left."""
+        xid = int(arg) if arg else dev.xid
+        ex = self.ledger.get(xid)
+        if ex is None or not ex.open:
+            return xid, False
+        self.ledger.expire(xid, now)
+        return xid, dev.xid == xid
 
     def _handle_timer(self, idx: int, action: str, now: float) -> None:
         dev = self.devices.get(idx)
         if dev is None:
             return
-        if action == "arrival":
+        # Timers carry the exchange (or T1 token) they belong to: "name:arg".
+        name, _sep, arg = action.partition(":")
+        if name == "arrival":
             if dev.state in (DState.OFFLINE, DState.LEFT):
                 if dev.state is DState.LEFT:
                     self.counters.rearrivals += 1
@@ -603,35 +764,44 @@ class Orchestrator:
                 # sample propagation-probe membership
                 self._probe_counter += 1
                 dev.probe = (self._probe_counter % PROPAGATION_SAMPLE) == 0
-                self._send_discover(dev)
-        elif action == "dora_timeout":
-            if dev.state is DState.DISCOVERING:
-                self.pending.pop(dev.xid, None)
+                self._send_discover(dev, new_round=True)
+        elif name == "dora_timeout":
+            _xid, live = self._timer_exchange(dev, arg, now)
+            if live and dev.state is DState.DISCOVERING:
                 dev.dora_retries += 1
                 if dev.dora_retries <= MAX_DORA_RETRIES:
-                    self._send_discover(dev)
+                    self._send_discover(dev, new_round=False)
                 else:
                     self.counters.timeout += 1
+                    # Every open exchange of the round is marked: a reply that
+                    # still arrives is a late ACK, counted as such (#1057).
+                    self.ledger.give_up(dev.index, now, DORA_KINDS)
                     dev.state = DState.OFFLINE
                     dev.dora_retries = 0
                     self.lifecycle.emit(mac=dev.mac, index=dev.index, event="timeout")
-        elif action == "t1_renew":
+        elif name == "t1_renew":
+            if arg and int(arg) != dev.t1_token:
+                return  # retired: the lease was re-ACKed since and re-armed T1
             if dev.state is DState.ONLINE and dev.leased_ip:
                 self._send_request_renew(dev)
-        elif action == "renew_timeout":
-            if dev.state is DState.RENEWING:
-                self.pending.pop(dev.xid, None)
-                # T1 unanswered → escalate to REBINDING at T2.
+        elif name == "renew_timeout":
+            _xid, live = self._timer_exchange(dev, arg, now)
+            if live and dev.state is DState.RENEWING:
+                # T1 unanswered → escalate to REBINDING at T2. The renew leg is
+                # abandoned: its ACK, if it still comes, is a late renew ACK.
+                self.ledger.give_up(dev.index, now, frozenset({KIND_RENEW}))
                 self._send_request_rebind(dev)
-        elif action == "rebind_timeout":
-            if dev.state is DState.REBINDING:
-                self.pending.pop(dev.xid, None)
+        elif name == "rebind_timeout":
+            _xid, live = self._timer_exchange(dev, arg, now)
+            if live and dev.state is DState.REBINDING:
                 self.counters.lapses += 1
+                self.ledger.give_up(dev.index, now, frozenset({KIND_RENEW, KIND_REBIND}))
                 self.online_set.discard(dev.index)
                 dev.state = DState.LEFT
                 dev.leased_ip = None
+                dev.lapsed = True
                 self.lifecycle.emit(mac=dev.mac, index=dev.index, event="lapse")
-        elif action == "depart":
+        elif name == "depart":
             if dev.state in (DState.ONLINE, DState.RENEWING, DState.REBINDING):
                 self.counters.departures += 1
                 if self.rng.random() < RELEASE_FRACTION:
@@ -641,10 +811,14 @@ class Orchestrator:
                 else:
                     self.lifecycle.emit(mac=dev.mac, index=dev.index, event="depart_silent",
                                         ip=dev.leased_ip)
+                # A renewal still in flight is abandoned with the device: its
+                # ACK, if it comes, is counted late and moves nothing.
+                self.ledger.give_up(dev.index, now)
                 self.online_set.discard(dev.index)
                 dev.state = DState.LEFT
                 dev.leased_ip = None
-        elif action == "probe_start":
+                dev.lapsed = False
+        elif name == "probe_start":
             asyncio.ensure_future(self._run_propagation_probe(dev))
 
     # ---------------- receive loop ----------------
@@ -667,8 +841,10 @@ class Orchestrator:
             if not reply:
                 continue
             xid = reply.get("xid")
-            idx = self.pending.get(xid)
-            if idx is None:
+            ex = self.ledger.get(xid)
+            if ex is not None:
+                idx = ex.index
+            else:
                 idx = xid & 0xFFFFFF if xid is not None else None  # recover from low bits
                 if idx not in self.devices:
                     continue
@@ -676,12 +852,11 @@ class Orchestrator:
             mt = reply.get("msg_type")
             now = time.monotonic()
             if mt == dp.DHCPOFFER:
-                if dev.state is DState.DISCOVERING:
-                    self._on_offer(dev, reply)
+                self._on_offer(dev, reply, ex, now)
             elif mt == dp.DHCPACK:
-                self._on_ack(dev, reply, now)
+                self._on_ack(dev, reply, now, ex)
             elif mt == dp.DHCPNAK:
-                self._on_nak(dev)
+                self._on_nak(dev, ex, now)
 
     # ---------------- scheduler loop ----------------
     async def _scheduler_loop(self) -> None:
@@ -689,6 +864,7 @@ class Orchestrator:
             now = time.monotonic()
             for idx, action in self._due(now):
                 self._handle_timer(idx, action, now)
+            self.ledger.purge(now)
             await asyncio.sleep(SCHED_TICK_S)
 
     # ---------------- arrival / departure / dns drivers (setpoint-driven) ----------------
@@ -965,8 +1141,16 @@ class Orchestrator:
                 "departures": cur["departures"], "releases": cur["releases"],
                 "lapses": cur["lapses"], "rearrivals": cur["rearrivals"],
                 "dns_timeout": cur["dns_timeout"],
-                # #1057 — the DNS ledger at this window's end (cumulative like the
-                # fields above: never sum these across windows).
+                # #1057 — the cumulative ledger at this window's end (cumulative
+                # like the fields above: never sum these across windows).
+                "dora_sent": cur["dora_sent"], "dora_offer": cur["dora_offer"],
+                "request_sent": cur["request_sent"], "dora_ack": cur["dora_ack"],
+                "dora_ack_late": cur["dora_ack_late"],
+                "renew_sent": cur["renew_sent"], "renew_ack": cur["renew_ack"],
+                "renew_ack_late": cur["renew_ack_late"],
+                "rebind_sent": cur["rebind_sent"], "rebind_ack": cur["rebind_ack"],
+                "rebind_ack_late": cur["rebind_ack_late"],
+                "ack_unmatched": cur["ack_unmatched"],
                 "dns_sent": cur["dns_sent"], "dns_ok": cur["dns_ok"],
                 "dns_answered": cur["dns_answered"], "dns_error": cur["dns_error"],
                 "dns_rcodes": dict(sorted(self.dns_tally.rcodes.items())),
@@ -1018,7 +1202,7 @@ class Orchestrator:
 
     def _finalize(self) -> None:
         # Dump cumulative HdrHistograms + a final summary.
-        for acc in (self.lat_dora, self.lat_renew, self.lat_dns,
+        for acc in (self.lat_dora, self.lat_dora_late, self.lat_renew, self.lat_dns,
                     self.lat_prop_ipam, self.lat_prop_dns):
             acc.dump_hdr(str(self.rp.generator(f"orchestrator.shard{self.shard}.{acc.name}.hdr")))
         counters = self._counter_snapshot()
@@ -1027,6 +1211,7 @@ class Orchestrator:
             "shard": self.shard,
             "counters": counters,
             "dora_ack": self.lat_dora.cumulative_summary(),
+            "dora_ack_late": self.lat_dora_late.cumulative_summary(),
             "renew_ack": self.lat_renew.cumulative_summary(),
             "dns_resolve": self.lat_dns.cumulative_summary(),
             "propagation_lease_to_ipam": self.lat_prop_ipam.cumulative_summary(),
@@ -1034,7 +1219,9 @@ class Orchestrator:
             "unique_macs_with_lease_or_seen": sum(
                 1 for d in self.devices.values()
                 if d.state is not DState.OFFLINE),
-            # #1057 — the DNS outcome by rcode, folded the way the report prints it.
+            # #1057 — the two ledgers a consumer needs without re-deriving them:
+            # the handshake at three strictnesses and the DNS outcome by rcode.
+            "handshake": handshake_summary(counters),
             "dns": dns_summary(counters),
             "dns_error_types": dict(sorted(self.dns_tally.errors.items())),
         }
