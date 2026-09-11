@@ -178,3 +178,53 @@ def test_first_match_wins_on_a_noisy_log() -> None:
         ]
     )
     assert "already an etcd member" in _classify(log)
+
+
+def test_a_dropped_path_reads_as_unreachable_not_rejected() -> None:
+    """#1052 — the verbatim terminal fatal from a firewall-dropped join
+    (member-2, 2026-09-10). The /cacerts fetch times out and k3s wraps it as a
+    token failure; it must read as an unreachable seed, never a rejected token
+    (that mislabel is what the product's retry and the Fleet UI acted on)."""
+    log = (
+        'time="2026-09-10T11:49:28Z" level=fatal msg="Error: preparing server: '
+        "failed to bootstrap cluster data: failed to check if bootstrap data has "
+        "been initialized: failed to validate token: failed to get CA certs: Get "
+        '\\"https://192.168.122.89:6443/cacerts\\": context deadline exceeded '
+        '(Client.Timeout exceeded while awaiting headers)"'
+    )
+    reason = _classify(log)
+    assert "could not reach the seed" in reason
+    assert "rejected" not in reason
+
+
+def test_the_last_fatal_wins_over_a_trailing_shutdown_line() -> None:
+    """#1052 — k3s logs an info "Shutdown request received" in the same second
+    AFTER the fatal on a blocked join; selecting that trailing line left the
+    reason empty and the caller printed "did not come Ready within 180s". The
+    fatal is the verdict."""
+    fatal = (
+        'time="2026-09-10T11:52:16Z" level=fatal msg="Error: preparing server: '
+        'failed to validate token: failed to get CA certs: Get '
+        '\\"https://192.168.122.89:6443/cacerts\\": context deadline exceeded"'
+    )
+    shutdown = 'time="2026-09-10T11:52:16Z" level=info msg="Shutdown request received"'
+    log = "\n".join([fatal, shutdown])
+    reason = _classify(log)
+    assert reason, "a trailing shutdown line must not blank the reason"
+    assert "could not reach the seed" in reason
+
+
+def test_more_transport_classes_read_as_unreachable() -> None:
+    """A TLS handshake timeout and a connection reset nested in a token failure
+    are also an unreachable seed, not a rejection."""
+    for err in ("net/http: TLS handshake timeout", "read: connection reset by peer"):
+        log = f'level=fatal msg="failed to validate token: Get \\"https://s:6443/cacerts\\": {err}"'
+        assert "could not reach the seed" in _classify(log), err
+
+
+def test_a_bare_token_failure_is_still_a_rejection() -> None:
+    """With no transport error nested in it, a token-validation failure means
+    the seed answered and refused — fail closed as before (a bare failure and
+    a CA-hash mismatch both stay 'rejected')."""
+    assert "rejected the join token" in _classify('level=fatal msg="failed to validate token"')
+    assert "rejected the join token" in _classify('msg="token CA hash does not match"')

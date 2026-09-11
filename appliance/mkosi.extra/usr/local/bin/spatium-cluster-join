@@ -81,6 +81,22 @@ K3S_AGENT_DIR="${SPATIUM_K3S_AGENT_DIR:-/var/lib/rancher/k3s/agent}"
 K3S_NODE_PASSWORD="${SPATIUM_K3S_NODE_PASSWORD:-/etc/rancher/node/password}"
 K3S_LOCAL_KUBECONFIG="${SPATIUM_K3S_KUBECONFIG:-/etc/rancher/k3s/k3s.yaml}"
 IDENTITY_BAK_ROOT="$RELEASE_STATE/k3s-identity"
+# #1052 — the etcd config k3s writes next to the data dir when it runs (its
+# ``name:`` is the member name k3s registered) and the supervisor's persisted
+# "this node is an etcd member" marker. Used to tell a slow-but-JOINED member
+# from one that died at bootstrap, without the /v3 etcd gateway (415 on this
+# build) or an etcdctl the appliance does not ship.
+ETCD_CONFIG_FILE="${SPATIUM_ETCD_CONFIG_FILE:-$K3S_SERVER_DIR/db/etcd/config}"
+ETCD_MEMBER_SIDECAR="${SPATIUM_ETCD_MEMBER_SIDECAR:-/var/lib/spatiumddi-host/release-state/etcd-member}"
+# A join that has registered with the seed's etcd is not failed at
+# READY_TIMEOUT, only slow; give it this much longer to turn Ready before the
+# rollback is even considered (a busy/slow seed, or a CPU-starved joiner).
+JOINED_READY_TIMEOUT="${SPATIUM_JOINED_READY_TIMEOUT:-600}"
+# k3s log markers that mean THIS attempt's etcd joined the seed's cluster (so
+# a rollback to a standalone etcd would strand a voter on the seed). A join
+# that died at token-validation / CA-fetch never starts etcd and logs none of
+# them, so the classic rollback stays safe for it.
+ETCD_REGISTERED_MARKERS='Starting etcd for existing cluster member|Adding member .* to etcd cluster|published local member to cluster through raft'
 # Entries under $K3S_SERVER_DIR that carry cluster identity — moved aside
 # on a join, moved back on a rollback. Kept as one list so the wipe and
 # the restore can never drift apart.
@@ -268,22 +284,67 @@ restore_identity() {
 # Reads the log on stdin so it is unit-testable; ``_k3s_log_since`` is the
 # journal reader (overridable for tests).
 classify_join_failure() {
-    local log
+    local log subject transport kind
     log="$(cat)"
-    case "$log" in
-        *"duplicate node name found"*)
+    # #1052 — classify by k3s's terminal VERDICT. Prefer the last level=fatal
+    # line (k3s's own error); a "Shutdown request received" line is the
+    # teardown that FOLLOWS the verdict — on a blocked join k3s logs it (info)
+    # in the same second as the fatal, and selecting it instead left the reason
+    # empty so the caller printed a bogus "did not come Ready within 180s".
+    # Fall back to a shutdown line, then the whole log, so a journal with
+    # neither still classifies (the duplicate-name fatal is logged inside a
+    # shutdown line at level=error, and the token/transport failures carry no
+    # level at all).
+    subject="$(printf '%s\n' "$log" | grep -E 'level=fatal' | tail -n 1)"
+    [ -n "$subject" ] || subject="$(printf '%s\n' "$log" | grep -E 'Shutdown request received' | tail -n 1)"
+    [ -n "$subject" ] || subject="$log"
+    # A transport error is k3s never getting an ANSWER: a firewall DROP (the QA
+    # drill, a real black-hole) times out — "context deadline exceeded" /
+    # "Client.Timeout exceeded while awaiting headers"; a closed port
+    # "connection refused"; a reset "connection reset" / "unexpected EOF"; a
+    # slow path "i/o timeout" / "TLS handshake timeout"; a routing hole "no
+    # route to host". None is a rejection — that is reserved for a seed that
+    # actually answered and refused (the token arm's else, and the CA-hash arm).
+    case "$subject" in
+        *"connection refused"*|*"i/o timeout"*|*"no route to host"*|\
+        *"context deadline exceeded"*|*"Client.Timeout exceeded"*|\
+        *"TLS handshake timeout"*|*"connection reset"*|*"unexpected EOF"*) transport=1 ;;
+        *) transport=0 ;;
+    esac
+    # Two stages, on purpose: first decide WHAT happened, then name it — so
+    # every reason string is written exactly once below, and the backend's
+    # contract test (tests/test_appliance_join_auto_retry.py), which reads
+    # these printf payloads to keep _join_failure_is_permanent in step with the
+    # runner, sees one payload per reason however many paths lead to it.
+    case "$subject" in
+        *"duplicate node name found"*) kind=stale_member ;;
+        *"bootstrap data already found and encrypted with different token"*) kind=stale_token ;;
+        *"member has been permanently removed from the cluster"*) kind=removed_member ;;
+        # A transport error nested INSIDE "failed to validate token" is an
+        # unreachable seed — k3s wraps the /cacerts fetch as a token failure
+        # (pkg/cluster/bootstrap.go), so a DROP reads as a token error it never
+        # got to judge. Reserve "rejected" for a bare token failure or a CA
+        # hash mismatch: a seed that answered.
+        *"failed to validate token"*)
+            if [ "$transport" = 1 ]; then kind=unreachable; else kind=rejected; fi ;;
+        *"token CA hash does not match"*) kind=rejected ;;
+        *)
+            if [ "$transport" = 1 ]; then kind=unreachable; else kind=""; fi ;;
+    esac
+    case "$kind" in
+        stale_member)
             printf '%s' "this hostname is already an etcd member of the target cluster — evict it (Fleet → Replace, or delete its k8s Node) before re-joining"
             ;;
-        *"bootstrap data already found and encrypted with different token"*)
+        stale_token)
             printf '%s' "stale k3s bootstrap data on disk — the join token does not match the cluster"
             ;;
-        *"member has been permanently removed from the cluster"*)
+        removed_member)
             printf '%s' "this node's etcd member was removed from the cluster — it must re-join as a NEW member (leave first)"
             ;;
-        *"failed to validate token"*|*"token CA hash does not match"*)
+        rejected)
             printf '%s' "the seed rejected the join token"
             ;;
-        *"connection refused"*|*"i/o timeout"*|*"no route to host"*)
+        unreachable)
             printf '%s' "could not reach the seed — check the firewall and tcp/6443 + tcp/2379-2380"
             ;;
         *)
@@ -316,7 +377,10 @@ node_was_cluster_member() {
 
 wait_ready() {
     # Poll the local kubeapi until this node reports Ready (or timeout).
-    local deadline=$(( $(date +%s) + READY_TIMEOUT )) node
+    # An optional first argument replaces READY_TIMEOUT — the #1052 joined
+    # budget below is the one caller that passes it.
+    local budget="${1:-$READY_TIMEOUT}" node
+    local deadline=$(( $(date +%s) + budget ))
     node="$(hostname)"
     export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
     while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -328,6 +392,26 @@ wait_ready() {
         sleep 5
     done
     return 1
+}
+
+# #1052 — did THIS join attempt get this node into the seed's etcd?
+#
+# READY_TIMEOUT is the budget for the NODE to report Ready; the etcd side of a
+# join finishes long before it — k3s adds the joiner as a learner within
+# seconds and promotes it to voter as soon as it has caught up. Rolling such a
+# node back re-creates a standalone etcd, with its original first-boot CA, on
+# the very peer URL the seed still lists as a voter: a foreign certificate the
+# seed's raft can never verify, so the seed loses quorum for good and its k3s
+# cycles every ~15 min (observed live, spatiumddi#1052). The /v3 etcd gateway
+# answers 415 on this build and no etcdctl is baked, so membership is read from
+# the join log the runner already scans, plus the supervisor's persisted
+# marker (written when the firewall audit last confirmed membership).
+node_registered_with_cluster_etcd() {
+    local since="${1:-}"
+    if _k3s_log_since "$since" | grep -qE "$ETCD_REGISTERED_MARKERS"; then
+        return 0
+    fi
+    [ "$(cat "$ETCD_MEMBER_SIDECAR" 2>/dev/null | tr -d '[:space:]')" = "true" ]
 }
 
 do_join() {
@@ -367,6 +451,30 @@ do_join() {
 
     log "JOIN: server=$server_url (joining the control-plane cluster)"
     write_state joining "$server_url"
+
+    # #1052 — a re-driven join on a node this runner previously KEPT as a
+    # member of THIS seed (an earlier attempt joined etcd but did not turn
+    # Ready in the budget, so it was left as a member rather than rolled back
+    # into a ghost voter) must NOT wipe it: the wipe is exactly what turns a
+    # slow member into a foreign-CA ghost. The join drop-in naming this seed
+    # plus the etcd config k3s wrote are the on-disk record of that
+    # membership. Restart k3s if needed and wait again; never wipe.
+    if node_was_cluster_member \
+            && grep -qxF "server: $server_url" "$JOIN_DROPIN" 2>/dev/null \
+            && [ -f "$ETCD_CONFIG_FILE" ]; then
+        log "JOIN: this node already joined $server_url's etcd — re-driving without an identity wipe (#1052)"
+        systemctl is-active --quiet k3s || { clean_k3s_runtime; systemctl start k3s || true; }
+        if wait_ready "$JOINED_READY_TIMEOUT"; then
+            log "JOIN ok — node is Ready as a control-plane member (re-drive, no wipe)"
+            write_state ready "$server_url"
+            mv -f "$JOIN_TRIGGER" "${JOIN_TRIGGER}.done.$(date +%s)" || true
+            exit 0
+        fi
+        log "JOIN re-drive: still a member of $server_url's etcd but not Ready within ${JOINED_READY_TIMEOUT}s — membership kept, nothing wiped"
+        write_state failed "still a member of the seed's etcd but not Ready within ${JOINED_READY_TIMEOUT}s — membership kept; Fleet -> Replace this node if the seed is gone"
+        mv -f "$JOIN_TRIGGER" "${JOIN_TRIGGER}.failed.$(date +%s)" || true
+        exit 1
+    fi
 
     systemctl stop k3s || true
     clean_k3s_runtime
@@ -447,6 +555,29 @@ EOF
         # Keep the identity backup one boot for safety; a later sweep can
         # prune ${IDENTITY_BAK_ROOT}.pre-join.* once the operator is happy.
         exit 0
+    fi
+
+    # #1052 — a join that already got this node into the seed's etcd is not
+    # failed at READY_TIMEOUT, only slow. Rolling it back now re-creates a
+    # standalone etcd (this node's original CA) on the peer URL the seed
+    # still lists as a voter — the permanent-ghost path above. So give a
+    # registered member a longer budget, and if it STILL will not turn
+    # Ready, KEEP its joined identity instead of rolling back: k3s stays a
+    # (currently-unready) member that rejoins when the seed is reachable
+    # again, and Fleet -> Replace can evict it cleanly through the seed.
+    # Nothing in this branch wipes or restores identity.
+    if node_registered_with_cluster_etcd "$k3s_started_at"; then
+        log "not Ready within ${READY_TIMEOUT}s but this node already joined the seed's etcd — waiting up to ${JOINED_READY_TIMEOUT}s more (a rollback now would strand the seed's quorum, #1052)"
+        if wait_ready "$JOINED_READY_TIMEOUT"; then
+            log "JOIN ok — node is Ready as a control-plane member (within the joined budget)"
+            write_state ready "$server_url"
+            mv -f "$JOIN_TRIGGER" "${JOIN_TRIGGER}.done.$(date +%s)" || true
+            exit 0
+        fi
+        log "JOIN not Ready within $((READY_TIMEOUT + JOINED_READY_TIMEOUT))s but this node is a member of the seed's etcd — NOT rolling back: a standalone etcd on this peer URL would leave the seed a voter short of quorum for good (#1052). k3s stays up as a member; a re-driven join will not wipe it, and Fleet -> Replace evicts it cleanly if the seed is gone."
+        write_state failed "registered with the seed's etcd but not Ready within $((READY_TIMEOUT + JOINED_READY_TIMEOUT))s — membership kept, nothing wiped; a retry re-drives without wiping, or Fleet -> Replace this node if the seed is gone"
+        mv -f "$JOIN_TRIGGER" "${JOIN_TRIGGER}.failed.$(date +%s)" || true
+        exit 1
     fi
 
     # #590 — say WHY. Some join failures are permanent until an operator
