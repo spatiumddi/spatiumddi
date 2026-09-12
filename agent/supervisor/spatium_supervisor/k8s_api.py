@@ -667,6 +667,10 @@ class PostgresReclaim:
     # hands them back as ``evicted_nodes`` next tick so the scan runs again
     # even while the Cluster reads whole
     pending_nodes: set[str] = field(default_factory=set)
+    # claims an earlier tick already deleted that are still Terminating
+    # (pvc-protection waits for the consumer pod) — reported as pending,
+    # never counted as reclaimed again
+    terminating: list[str] = field(default_factory=list)
 
     def __iter__(self):
         # ``reclaimed, deferred, err = ...`` keeps working for callers that
@@ -791,11 +795,13 @@ def reclaim_stranded_postgres_storage(
     stranded: dict[str, list[str]] = {}
     sources: dict[str, str] = {}
     pinned_to: dict[str, set[str]] = {}
+    already_terminating: set[str] = set()
     for pvc in items:
         instance = _cnpg_instance_of(pvc, cluster_name)
         if instance is None:
             continue
-        name = str((pvc.get("metadata") or {}).get("name") or "")
+        meta = pvc.get("metadata") or {}
+        name = str(meta.get("name") or "")
         pinned, source, pin_err = _pvc_pinned_hostnames(pvc)
         if pin_err:
             return PostgresReclaim(error=f"{name}: {pin_err}")
@@ -804,9 +810,12 @@ def reclaim_stranded_postgres_storage(
         stranded.setdefault(instance, []).append(name)
         sources[name] = source
         pinned_to.setdefault(instance, set()).update(pinned)
+        if meta.get("deletionTimestamp"):
+            already_terminating.add(name)
 
     reclaimed: list[str] = []
     deferred: list[str] = []
+    terminating: list[str] = []
     deferred_reason = ""
     for instance, claims in sorted(stranded.items()):
         if primary_unknown:
@@ -818,27 +827,48 @@ def reclaim_stranded_postgres_storage(
             deferred_reason = "instance is the current or target primary; retrying next tick"
             continue
         for name in sorted(claims):
+            if name in already_terminating:
+                # Deleted on an earlier tick; pvc-protection is holding it
+                # until its pod is gone. Not ours to count again — the first
+                # cut re-reported it as "reclaimed" every tick for ever
+                # (review, point 4). The pod delete below is what it waits on.
+                terminating.append(name)
+                continue
             try:
                 status, resp = _request(
                     "DELETE", f"{base}/persistentvolumeclaims/{quote(name)}"
                 )
             except RuntimeError as exc:
-                return PostgresReclaim(reclaimed, deferred, str(exc), sources, deferred_reason)
+                return PostgresReclaim(reclaimed, deferred, str(exc), sources,
+                                       deferred_reason, terminating=terminating)
             if status not in (200, 202, 404):
-                return PostgresReclaim(reclaimed, deferred, f"kubeapi status {status}: {resp[:200]!r}", sources, deferred_reason)
-            reclaimed.append(name)
+                return PostgresReclaim(reclaimed, deferred,
+                                       f"kubeapi status {status}: {resp[:200]!r}",
+                                       sources, deferred_reason, terminating=terminating)
+            if status != 404:  # 404: vanished between the list and the delete — not ours
+                reclaimed.append(name)
         # The pod the operator re-created against the stranded claim is
         # unscheduled, so a plain DELETE removes it at once and releases
         # pvc-protection; CNPG then sees a missing instance and joins a
-        # fresh one (pg_basebackup from the primary) on a live node.
+        # fresh one (pg_basebackup from the primary) on a live node. A
+        # refused delete leaves the claim Terminating under pvc-protection
+        # and CNPG unable to re-create a claim of that name, so it is an
+        # error, not a shrug (review, point 4).
+        pod_path = f"{base}/pods/{quote(instance)}"
         try:
-            _request("DELETE", f"{base}/pods/{quote(instance)}")
-        except RuntimeError:
-            pass  # the pod may already be gone; the claim reclaim is what matters
+            status, resp = _request("DELETE", pod_path)
+        except RuntimeError as exc:
+            return PostgresReclaim(reclaimed, deferred, f"pod {instance}: {exc}", sources,
+                                   deferred_reason, terminating=terminating)
+        if status not in (200, 202, 404):
+            return PostgresReclaim(reclaimed, deferred,
+                                   f"pod {instance}: kubeapi status {status}: {resp[:200]!r}",
+                                   sources, deferred_reason, terminating=terminating)
     pending = set()
     for instance in deferred:
         pending |= pinned_to.get(instance, set())
-    return PostgresReclaim(reclaimed, deferred, None, sources, deferred_reason, pending)
+    return PostgresReclaim(reclaimed, deferred, None, sources, deferred_reason, pending,
+                           terminating)
 
 
 # #272 — durable control-plane state via k3s HelmChartConfig.

@@ -32,9 +32,11 @@ class _Recorder:
     """Stand-in for k8s_api._request keyed by path: scripts every GET and
     records every DELETE, in order."""
 
-    def __init__(self, gets: dict[str, tuple[int, object]], delete_status: int = 200):
+    def __init__(self, gets: dict[str, tuple[int, object]], delete_status: int = 200,
+                 deletes: dict[str, int] | None = None):
         self._gets = gets
         self._delete_status = delete_status
+        self._deletes = deletes or {}  # per-path DELETE status overrides
         self.calls: list[tuple[str, str]] = []
 
     def __call__(self, method, path, body=None, content_type=None, timeout=None):
@@ -43,7 +45,7 @@ class _Recorder:
             status, payload = self._gets.get(path, (404, {}))
             raw = payload if isinstance(payload, (bytes, str)) else json.dumps(payload)
             return status, raw.encode() if isinstance(raw, str) else raw
-        return self._delete_status, b"{}"
+        return self._deletes.get(path, self._delete_status), b"{}"
 
     @property
     def deleted(self) -> list[str]:
@@ -69,12 +71,15 @@ def _nodes(*names: str):
     return {"items": [{"metadata": {"name": n}} for n in names]}
 
 
-def _pvc(name: str, volume: str, *, labels: dict | None = None, selected: str | None = None):
+def _pvc(name: str, volume: str, *, labels: dict | None = None, selected: str | None = None,
+         terminating: bool = False):
     meta: dict = {"name": name}
     if labels is not None:
         meta["labels"] = labels
     if selected:
         meta["annotations"] = {"volume.kubernetes.io/selected-node": selected}
+    if terminating:
+        meta["deletionTimestamp"] = "2026-09-11T21:21:55Z"
     return {"metadata": meta, "spec": {"volumeName": volume}}
 
 
@@ -460,6 +465,48 @@ def test_no_cnpg_cluster_is_a_quiet_no_op(monkeypatch) -> None:
 
     assert tuple(k8s_api.reclaim_stranded_postgres_storage(evicted_nodes=["x"])) == ([], [], None)
     assert rec.deleted == []
+
+
+def test_a_refused_pod_delete_is_an_error_with_the_claim_still_counted(monkeypatch) -> None:
+    # The first cut discarded the pod DELETE's status: a 500 read as a clean
+    # reclaim, the claim sat Terminating under pvc-protection, CNPG could not
+    # re-create a claim of that name, and every next tick logged
+    # "reclaimed" again with no error ever set (review, point 4).
+    rec = _Recorder(_world(pvcs=_LIVE_PVCS, pvs=_LIVE_PVS),
+                    deletes={f"{POD_PATH}/{CLUSTER}-3": 500})
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    out = k8s_api.reclaim_stranded_postgres_storage()
+
+    assert out.reclaimed == [f"{CLUSTER}-3"]  # the claim delete did land
+    assert out.error is not None and "500" in out.error and f"pod {CLUSTER}-3" in out.error
+
+
+def test_a_terminating_claim_is_pending_not_reclaimed_again(monkeypatch) -> None:
+    # Deleted last tick, still held by pvc-protection: no second DELETE on
+    # the claim, no "reclaimed" line, the pod delete retried.
+    pvcs = (
+        _LIVE_PVCS[0], _LIVE_PVCS[1],
+        _pvc(f"{CLUSTER}-3", "pv-3", labels=_cnpg_labels(f"{CLUSTER}-3"), terminating=True),
+    )
+    rec = _Recorder(_world(pvcs=pvcs, pvs=_LIVE_PVS))
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    out = k8s_api.reclaim_stranded_postgres_storage()
+
+    assert out.reclaimed == [] and out.error is None
+    assert out.terminating == [f"{CLUSTER}-3"]
+    assert rec.deleted == [f"{POD_PATH}/{CLUSTER}-3"]
+
+
+def test_a_claim_that_vanished_before_the_delete_is_not_counted(monkeypatch) -> None:
+    rec = _Recorder(_world(pvcs=_LIVE_PVCS, pvs=_LIVE_PVS),
+                    deletes={f"{PVC_PATH}/{CLUSTER}-3": 404})
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    out = k8s_api.reclaim_stranded_postgres_storage()
+
+    assert (out.reclaimed, out.error) == ([], None)
 
 
 def test_kubeapi_failures_are_reported_not_guessed_around(monkeypatch) -> None:

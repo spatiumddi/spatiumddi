@@ -1150,6 +1150,12 @@ def heartbeat_once(
                 instances=pg_deferred,
                 reason=pg.deferred_reason,
             )
+        if pg.terminating:
+            log.info(
+                "supervisor.heartbeat.postgres_storage_reclaim_pending",
+                pvcs=pg.terminating,
+                reason="deleted on an earlier tick; pvc-protection is waiting for the pod",
+            )
         if pg_err:
             log.warning("supervisor.heartbeat.postgres_storage_reclaim_failed", error=pg_err)
 
