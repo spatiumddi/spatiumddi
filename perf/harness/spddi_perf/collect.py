@@ -681,16 +681,21 @@ def criterion_b(rd: RunData) -> list[dict[str, Any]]:
     # BIND answered REFUSED read "ok 0, timeouts 46" and b6a said NO_DATA.
     orch_c = gt.sum_counters(rd.orchestrator_summary)
     orch_rc = gt.dns_rcodes(orch_c)
-    orch_answered = int(orch_c.get("dns_answered") or 0) or sum(orch_rc.values())
+    orch_sent = int(orch_c.get("dns_sent") or 0)
     has_orch = bool(rd.orchestrator_summary)
 
-    # b6 — DNS SERVFAIL rate < 0.1% steady. dnsperf rcode + orchestrator rcode.
+    # b6 — DNS SERVFAIL rate < 0.1% steady. dnsperf rcode + orchestrator rcode,
+    # both halves over queries SENT (dnsperf `sent`, orchestrator `dns_sent`):
+    # a query that timed out was sent and did not SERVFAIL, so the rate is per
+    # attempt on either side and reproduces against BIND's own
+    # SERVFAIL / QUERY ratio. (Over `dns_answered` a heavy-timeout run would
+    # read higher than BIND does.)
     dp_sent, dp_servfail = _dnsperf_rcode_totals(rd, "SERVFAIL")
-    sf_total = dp_sent + orch_answered
+    sf_total = dp_sent + orch_sent
     servfail = ((dp_servfail + orch_rc.get("SERVFAIL", 0)) / sf_total) if sf_total else None
     rows.append(_row(
         "b6", "DNS SERVFAIL rate < 0.1% steady",
-        "dnsperf.rcode.SERVFAIL / sent + orchestrator dns_rcode_SERVFAIL / dns_answered",
+        "dnsperf.rcode.SERVFAIL / sent + orchestrator dns_rcode_SERVFAIL / dns_sent",
         _fmt(servfail * 100.0 if servfail is not None else None, "%"), "< 0.1%",
         _verdict_lt(servfail, 0.001) if servfail is not None else NO_DATA))
 
