@@ -1126,7 +1126,7 @@ def heartbeat_once(
             log.info(
                 "supervisor.heartbeat.postgres_storage_reclaim_deferred",
                 instances=pg_deferred,
-                reason="instance is the current or target primary; retrying next tick",
+                reason=pg.deferred_reason,
             )
         if pg_err:
             log.warning("supervisor.heartbeat.postgres_storage_reclaim_failed", error=pg_err)

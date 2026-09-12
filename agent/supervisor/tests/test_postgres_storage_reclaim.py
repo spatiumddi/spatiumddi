@@ -179,6 +179,45 @@ def test_a_target_primary_counts_as_the_primary(monkeypatch) -> None:
     assert rec.deleted == []
 
 
+def test_a_cluster_that_names_no_primary_defers_everything(monkeypatch) -> None:
+    # No currentPrimary/targetPrimary in the status (none yet, or wiped by an
+    # operator restart): the primary is UNKNOWN, not absent. The first cut
+    # read an empty primary set as "everything is a replica" and would have
+    # deleted a stranded primary's PGDATA (review, point 2).
+    gets = _world(pvcs=_LIVE_PVCS, pvs=_LIVE_PVS)
+    gets[CR_PATH] = (200, {"spec": {"instances": 3}, "status": {"readyInstances": 2}})
+    rec = _Recorder(gets)
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    out = k8s_api.reclaim_stranded_postgres_storage()
+
+    assert (out.reclaimed, out.deferred, out.error) == ([], [f"{CLUSTER}-3"], None)
+    assert "no current or target primary" in out.deferred_reason
+    assert rec.deleted == []
+
+
+def test_a_cluster_with_no_status_at_all_defers_everything(monkeypatch) -> None:
+    gets = _world(pvcs=_LIVE_PVCS, pvs=_LIVE_PVS)
+    gets[CR_PATH] = (200, {"spec": {"instances": 3}})
+    rec = _Recorder(gets)
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    out = k8s_api.reclaim_stranded_postgres_storage()
+
+    assert (out.reclaimed, out.deferred) == ([], [f"{CLUSTER}-3"])
+    assert rec.deleted == []
+
+
+def test_the_primary_deferral_says_why(monkeypatch) -> None:
+    rec = _Recorder(_world(pvcs=_LIVE_PVCS, pvs=_LIVE_PVS, current=f"{CLUSTER}-3"))
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    out = k8s_api.reclaim_stranded_postgres_storage()
+
+    assert out.deferred == [f"{CLUSTER}-3"]
+    assert "current or target primary" in out.deferred_reason
+
+
 def test_a_whole_postgres_is_one_cheap_read(monkeypatch) -> None:
     rec = _Recorder(_world(ready=3, pvcs=_LIVE_PVCS, pvs=_LIVE_PVS))
     monkeypatch.setattr(k8s_api, "_request", rec)

@@ -660,6 +660,9 @@ class PostgresReclaim:
     deferred: list[str] = field(default_factory=list)
     error: str | None = None
     sources: dict[str, str] = field(default_factory=dict)
+    # why ``deferred`` is non-empty: the instance is the current or target
+    # primary, or the Cluster names no primary at all
+    deferred_reason: str = ""
 
     def __iter__(self):
         # ``reclaimed, deferred, err = ...`` keeps working for callers that
@@ -701,7 +704,8 @@ def reclaim_stranded_postgres_storage(
     as ``currentPrimary`` or ``targetPrimary`` is deferred — the caller
     retries on its next tick, by which time the operator has failed over
     (the primary's pod is gone with the node) and the same instance is a
-    stranded replica.
+    stranded replica. A Cluster that names no primary at all defers
+    everything: an unknown primary is not "no primary".
 
     Bounded and idempotent: one GET of the Cluster CR when Postgres is
     whole (``readyInstances >= instances``) and nothing was evicted this
@@ -736,6 +740,13 @@ def reclaim_stranded_postgres_storage(
     primaries = {
         str(cr_status.get(key) or "") for key in ("currentPrimary", "targetPrimary")
     } - {""}
+    # A Cluster that names NO primary (no status yet, a status wiped by an
+    # operator restart, a bootstrap in progress) is not one where every
+    # instance is a replica — it is one where the primary is unknown.
+    # Deleting anything on that reading could be the primary's PGDATA
+    # (review of the first cut, point 2), so nothing is; the next tick,
+    # with a status, decides. The deferral costs one tick.
+    primary_unknown = not primaries
 
     try:
         status, resp = _request("GET", "/api/v1/nodes")
@@ -780,9 +791,15 @@ def reclaim_stranded_postgres_storage(
 
     reclaimed: list[str] = []
     deferred: list[str] = []
+    deferred_reason = ""
     for instance, claims in sorted(stranded.items()):
+        if primary_unknown:
+            deferred.append(instance)
+            deferred_reason = "the Cluster names no current or target primary; retrying next tick"
+            continue
         if instance in primaries:
             deferred.append(instance)
+            deferred_reason = "instance is the current or target primary; retrying next tick"
             continue
         for name in sorted(claims):
             try:
@@ -790,9 +807,9 @@ def reclaim_stranded_postgres_storage(
                     "DELETE", f"{base}/persistentvolumeclaims/{quote(name)}"
                 )
             except RuntimeError as exc:
-                return PostgresReclaim(reclaimed, deferred, str(exc), sources)
+                return PostgresReclaim(reclaimed, deferred, str(exc), sources, deferred_reason)
             if status not in (200, 202, 404):
-                return PostgresReclaim(reclaimed, deferred, f"kubeapi status {status}: {resp[:200]!r}", sources)
+                return PostgresReclaim(reclaimed, deferred, f"kubeapi status {status}: {resp[:200]!r}", sources, deferred_reason)
             reclaimed.append(name)
         # The pod the operator re-created against the stranded claim is
         # unscheduled, so a plain DELETE removes it at once and releases
@@ -802,7 +819,7 @@ def reclaim_stranded_postgres_storage(
             _request("DELETE", f"{base}/pods/{quote(instance)}")
         except RuntimeError:
             pass  # the pod may already be gone; the claim reclaim is what matters
-    return PostgresReclaim(reclaimed, deferred, None, sources)
+    return PostgresReclaim(reclaimed, deferred, None, sources, deferred_reason)
 
 
 # #272 — durable control-plane state via k3s HelmChartConfig.
