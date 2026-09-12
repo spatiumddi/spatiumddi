@@ -433,10 +433,15 @@ feature simply isn't installed
 { "detail": "Feature 'network.circuit' is disabled." }
 ```
 
-Modules are **default-enabled** ("operators can't disable what they
-don't know exists"), except off-prem / secret-touching surfaces which
-declare `default_enabled=False`. Examples of gated prefixes (from
-`router.py`):
+A module's shipped default lives in `default_enabled` on its catalog
+entry and nowhere else — a `feature_module` row means an operator
+changed it. A module ships **enabled** only if it is core IPAM / DNS /
+DHCP workflow, a zero-footprint UI convenience, or a hand-invoked
+read-only diagnostic; everything else ships **disabled**
+([#1069](https://github.com/spatiumddi/spatiumddi/issues/1069)). 14 of
+53 are on out of the box. Settings → Features lists every module with
+its description either way, so a disabled one is still discoverable.
+Examples of gated prefixes (from `router.py`):
 
 | Prefix | Module id |
 |---|---|

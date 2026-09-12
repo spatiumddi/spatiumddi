@@ -1206,7 +1206,7 @@ The per-object CRUD methods are already in place (`apply_scope`, `apply_reservat
 
 ### 15.7 Migrating off Windows DHCP entirely (issue #756)
 
-Everything above treats Windows as a supported *backend*. When the goal is to stop using it, the guided **Windows cutover** surface (feature module `migration.cutover`, default-on, `/api/v1/migration/cutover`, superadmin) drives the switch per scope: parity against the live server (lease time, pools, reservations, options), the lease handover, the switch itself, and a decommission checklist.
+Everything above treats Windows as a supported *backend*. When the goal is to stop using it, the guided **Windows cutover** surface (feature module `migration.cutover`, ships **disabled**, `/api/v1/migration/cutover`, superadmin) drives the switch per scope: parity against the live server (lease time, pools, reservations, options), the lease handover, the switch itself, and a decommission checklist.
 
 Two things matter here. The **lease handover** exists because the DHCP importer (§8) deliberately skips live leases — so a naive switch hands clients to a Kea with an empty lease database, and the first renewal offers a fresh pool address to a client still using the one Windows gave it. The handover promotes each live Windows lease to a reservation (stamped `import_source="windows_cutover"`) so a renewing client keeps the address it already holds. And the **switch is ordered**: the Windows scope is deactivated *before* the managed scope is activated, so the two never answer the same subnet at once; if the managed side then fails to come up, the Windows scope is re-activated. Rollback reverses it, with the recovery-time expectation stated as the scope's lease time. See [MIGRATION.md](MIGRATION.md#windows--spatiumddi-cutover-756).
 
@@ -1658,8 +1658,10 @@ rendered Kea client-class block.
 SpatiumDDI ships DHCPv6 via Kea, but Kea does not emit ICMPv6 Router
 Advertisements. This feature lets the DHCP agent run **radvd** from
 config rendered by the control plane, and passively watches the segment
-for **rogue RAs**. Both live behind the default-enabled
-`ipv6.router_advertisements` feature module (Settings → Features).
+for **rogue RAs**. Both live behind the `ipv6.router_advertisements` feature module, which
+ships **disabled** (Settings → Features): it is the one DHCP-adjacent surface
+that ends in something transmitted onto the wire, and a v4-only install has no
+use for it ([#1069](https://github.com/spatiumddi/spatiumddi/issues/1069)).
 
 ### 19.1 RA management (radvd)
 
