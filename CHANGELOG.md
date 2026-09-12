@@ -22,6 +22,20 @@ the formatter handles the rest.
 
 ## Unreleased
 
+### Changed
+
+- **Docs site is documentation only (#1070).** `www.spatiumddi.com`
+  no longer opens on a product landing page — the hero, "Why
+  SpatiumDDI" feature grid, screenshot gallery and install pitch are
+  gone, and `index.html` is now the documentation index itself. The
+  company / product site is a separate project and will be linked
+  from the nav once it exists. The index also gains the pages it
+  had been missing (Troubleshooting, Migration, Performance testing,
+  SHIPPED, the Fleet Firewall design note), `sitemap.xml` lists every
+  page rather than a third of them, and `docs.html` redirects to the
+  index so existing links keep working. No change to how or where the
+  site is published.
+
 ### Added
 
 

@@ -1,6 +1,7 @@
 <!doctype html>
 {%- comment -%}
-  Docs page layout — single column, top nav, no sidebar.
+  Docs page layout — single column, top nav, no sidebar. Every page on the
+  site uses it, including the index (#1070 removed the product landing page).
 
   `root` is a relative prefix ("", "../", "../../") computed from the page's
   own depth, used for every asset and nav link.
@@ -34,11 +35,15 @@
   {% include nav.html root=root %}
 
   <main class="doc">
+    {%- comment -%}
+      The index is the site's home, so it gets no crumb pointing at itself.
+    {%- endcomment -%}
+    {%- unless page.url == "/" or page.url == "/index.html" %}
     <div class="doc-crumb">
-      <a href="{{ root }}index.html">Home</a> ›
-      <a href="{{ root }}docs.html">Docs</a>
+      <a href="{{ root }}index.html">Docs</a>
       {%- if page.title %} › {{ page.title }}{%- endif %}
     </div>
+    {%- endunless %}
 
     <article class="doc-body">
       {{ content }}

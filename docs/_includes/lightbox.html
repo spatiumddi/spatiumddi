@@ -5,15 +5,13 @@
 </dialog>
 
 <script>
-  // Click-to-enlarge for screenshots and diagrams.
+  // Click-to-enlarge for the diagrams and screenshots embedded in docs pages.
   //
   // Uses <dialog>.showModal(), which gives Esc-to-close, focus trapping and
   // inertness of the page behind for free — all things a hand-rolled overlay
   // has to reimplement and usually gets wrong.
   //
-  // Landing-page screenshots are wrapped in a real <a href> to the image, so
-  // without JS they still open full size; this only intercepts that click.
-  // Docs images are bare <img> (markdown emits no wrapper), so they get a
+  // Docs images are bare <img> (markdown emits no wrapper), so each gets a
   // handler directly.
   (function () {
     var dlg = document.getElementById("lightbox");
@@ -29,17 +27,6 @@
       cap.hidden = !caption;
       dlg.showModal();
     }
-
-    // Landing-page figures.
-    document.querySelectorAll("a[data-zoom]").forEach(function (a) {
-      a.addEventListener("click", function (e) {
-        e.preventDefault();
-        var fig = a.closest("figure");
-        var figcap = fig && fig.querySelector("figcaption");
-        var inner = a.querySelector("img");
-        open(a.getAttribute("href"), inner && inner.alt, figcap && figcap.textContent);
-      });
-    });
 
     // Docs diagrams. Images already inside a link are skipped — those are
     // badges and inline links, where enlarging is not the intent.
