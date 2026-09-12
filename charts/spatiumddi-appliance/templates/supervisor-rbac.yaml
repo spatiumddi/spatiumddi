@@ -213,6 +213,18 @@ rules:
     resources: ["deployments"]
     resourceNames: ["coredns"]
     verbs: ["get", "patch"]
+    # #1058 — the dead-node evict reclaims the CloudNativePG instance claim
+    # the deleted node stranded (k8s_api.reclaim_stranded_postgres_storage,
+    # every seed heartbeat). "Stranded" is decided from the bound PV's
+    # required node affinity — the thing the scheduler enforces — and
+    # PersistentVolumes are cluster-scoped, so the read lives here. Without
+    # the verb the GET 403s and the reclaim refuses to act
+    # (``postgres_storage_reclaim_failed`` on every degraded tick) rather
+    # than guess from the scheduler's selected-node annotation; the first
+    # cut of the fix did guess, and the review caught it. ``get`` only.
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

@@ -26,6 +26,7 @@ import json
 import os
 import socket
 import ssl
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -518,11 +519,14 @@ def reclaim_stranded_redis_storage(
 
     Redis here is cache + Celery broker; Postgres is the store of record,
     so the data is expendable and the replica resyncs from the master.
-    Deliberately restricted to claims with ``-redis-`` in the name: CNPG
-    manages (deletes + recreates) its own instance PVCs, and anything
-    else is not ours to reap. The PVC goes first (pvc-protection holds it
-    until its pod is gone), then the pod — the StatefulSet then recreates
-    both and the provisioner lands the new PV on a live node."""
+    Deliberately restricted to claims with ``-redis-`` in the name:
+    anything else is not ours to reap here. CloudNativePG's instance
+    claims have the same hazard but a stricter rule (a primary's claim
+    is never expendable), so they get their own reclaim —
+    :func:`reclaim_stranded_postgres_storage` (#1058). The PVC goes first
+    (pvc-protection holds it until its pod is gone), then the pod — the
+    StatefulSet then recreates both and the provisioner lands the new PV
+    on a live node."""
     base = f"/api/v1/namespaces/{quote(namespace)}"
     try:
         status, resp = _request("GET", f"{base}/persistentvolumeclaims")
@@ -562,6 +566,309 @@ def reclaim_stranded_redis_storage(
                 pass  # pod may not exist; the PVC reclaim is what matters
         reclaimed.append(name)
     return reclaimed, None
+
+
+# #1058 — CloudNativePG instance storage stranded on an evicted node.
+#
+# CNPG's own labels on the claims and pods it creates (docs: "Labels and
+# annotations"). The name fallback below follows the naming CNPG documents:
+# ``<cluster>-<ordinal>`` for the PGDATA claim, with ``-wal`` / ``-tbs-<name>``
+# suffixes for WAL and tablespace claims.
+_CNPG_CLUSTER_LABEL = "cnpg.io/cluster"
+_CNPG_INSTANCE_LABEL = "cnpg.io/instanceName"
+_CNPG_DEFAULT_CLUSTER = "spatium-control-spatiumddi-postgresql"
+_SELECTED_NODE_ANNOTATION = "volume.kubernetes.io/selected-node"
+
+
+def _pv_affinity_hostnames(pv: dict) -> set[str]:
+    """Every ``kubernetes.io/hostname`` a PV's *required* node affinity pins
+    it to. The local-path provisioner writes exactly one; a network volume
+    writes none, and an empty set means "not node-local" to the caller."""
+    out: set[str] = set()
+    required = ((pv.get("spec") or {}).get("nodeAffinity") or {}).get("required") or {}
+    for term in required.get("nodeSelectorTerms") or []:
+        for expr in (term or {}).get("matchExpressions") or []:
+            if expr.get("key") == "kubernetes.io/hostname" and expr.get("operator") == "In":
+                out.update(str(v) for v in expr.get("values") or [])
+    return out
+
+
+def _cnpg_instance_of(pvc: dict, cluster_name: str) -> str | None:
+    """The CNPG instance a claim belongs to, or None when the claim is not
+    this Cluster's (Redis, the slot-image mirror, agent state, …)."""
+    meta = pvc.get("metadata") or {}
+    labels = meta.get("labels") or {}
+    name = str(meta.get("name") or "")
+    owner = labels.get(_CNPG_CLUSTER_LABEL)
+    if owner:
+        if owner != cluster_name:
+            return None
+        instance = labels.get(_CNPG_INSTANCE_LABEL)
+        if instance:
+            return str(instance)
+    prefix = f"{cluster_name}-"
+    if not name.startswith(prefix):
+        return None
+    ordinal = name[len(prefix) :].split("-", 1)[0]
+    if not ordinal.isdigit():
+        return None
+    return f"{cluster_name}-{ordinal}"
+
+
+def _pvc_pinned_hostnames(pvc: dict) -> tuple[set[str], str, str | None]:
+    """``(hostnames, source, error)`` — where a claim's storage lives.
+
+    The bound PV's required node affinity is authoritative (it is what the
+    scheduler enforces): ``source == "pv"``. A readable PV with no hostname
+    affinity is network storage — nothing pins it, the set is empty. The
+    scheduler's ``selected-node`` annotation — what the Redis reclaim keys
+    on — stands in only when there is no PV to read (an unbound claim, or a
+    PV object already gone: 404): ``source == "annotation"``. Anything else
+    — 403, 5xx, a transport failure — is an ``error`` the caller surfaces
+    instead of guessing from the annotation: the review of the first cut
+    found the supervisor's ClusterRole had no ``persistentvolumes`` grant,
+    so every production read was a 403 that silently decided on the
+    annotation, and the network-storage guard above could never hold.
+    """
+    volume = str((pvc.get("spec") or {}).get("volumeName") or "")
+    if volume:
+        path = f"/api/v1/persistentvolumes/{quote(volume)}"
+        try:
+            status, resp = _request("GET", path)
+        except RuntimeError as exc:
+            return set(), "", str(exc)
+        if status == 200:
+            try:
+                return _pv_affinity_hostnames(json.loads(resp)), "pv", None
+            except ValueError:
+                return set(), "", f"unparseable PV {volume}"
+        if status != 404:
+            return set(), "", f"kubeapi GET {path}: status {status}: {resp[:200]!r}"
+    anns = (pvc.get("metadata") or {}).get("annotations") or {}
+    selected = anns.get(_SELECTED_NODE_ANNOTATION)
+    return ({str(selected)} if selected else set()), "annotation", None
+
+
+@dataclass
+class PostgresReclaim:
+    """What one sweep did. ``sources`` says, per reclaimed claim, whether
+    the bound PV's node affinity (``pv``) or the scheduler's selected-node
+    annotation (``annotation``) decided it was stranded — the journal
+    carries it so a live run can tell the two apart."""
+
+    reclaimed: list[str] = field(default_factory=list)
+    deferred: list[str] = field(default_factory=list)
+    error: str | None = None
+    sources: dict[str, str] = field(default_factory=dict)
+    # why ``deferred`` is non-empty: the instance is the current or target
+    # primary, or the Cluster names no primary at all
+    deferred_reason: str = ""
+    # hostnames whose stranded claims are still owed (deferred): the caller
+    # hands them back as ``evicted_nodes`` next tick so the scan runs again
+    # even while the Cluster reads whole
+    pending_nodes: set[str] = field(default_factory=set)
+    # claims an earlier tick already deleted that are still Terminating
+    # (pvc-protection waits for the consumer pod) — reported as pending,
+    # never counted as reclaimed again
+    terminating: list[str] = field(default_factory=list)
+
+    def __iter__(self):
+        # ``reclaimed, deferred, err = ...`` keeps working for callers that
+        # only need the verdict.
+        yield self.reclaimed
+        yield self.deferred
+        yield self.error
+
+
+def reclaim_stranded_postgres_storage(
+    *,
+    evicted_nodes: Iterable[str] = (),
+    namespace: str = "spatium",
+    cluster_name: str = _CNPG_DEFAULT_CLUSTER,
+) -> PostgresReclaim:
+    """Delete the CloudNativePG instance claims (and their Pending pods)
+    pinned to a node that no longer exists, so the operator re-creates the
+    instance on a live node — returns a :class:`PostgresReclaim`
+    (``reclaimed`` claim names, ``deferred`` instance names, ``error``,
+    and the affinity ``sources``).
+
+    #1058 — the Redis reclaim above rested on "CNPG manages (deletes +
+    recreates) its own instance PVCs". It does not. After a dead-node
+    replace (Node deleted here, replacement promoted under a new hostname)
+    the evicted member's instance claim stays ``Bound`` to a local-path PV
+    whose ``nodeAffinity`` names the deleted node; the operator re-creates
+    the pod against that same claim and it sits ``Pending`` with "0/3 nodes
+    are available: 3 node(s) didn't match PersistentVolume's node
+    affinity". Observed live on a nested 3-node cluster: ``readyInstances
+    2`` of ``instances 3`` for 77+ min after the replacement had joined,
+    ``healthyPVC`` still listing the stranded claim, the operator log only
+    reconciling, and ``cluster/health`` reporting the control plane HA
+    with two of three Postgres instances. The chart README documents the
+    manual repair (delete the claim, then the pod; CNPG re-clones the
+    replica from the primary); an appliance has to do it itself.
+
+    The rule that README states is enforced here, not assumed: **only a
+    replica's claim is ever deleted**. An instance the Cluster still names
+    as ``currentPrimary`` or ``targetPrimary`` is deferred — the caller
+    retries on its next tick, by which time the operator has failed over
+    (the primary's pod is gone with the node) and the same instance is a
+    stranded replica. A Cluster that names no primary at all defers
+    everything: an unknown primary is not "no primary".
+
+    Bounded and idempotent: one GET of the Cluster CR when Postgres is
+    whole (``readyInstances >= instances``) and nothing was evicted this
+    tick; the node/claim/PV scan only runs while an instance is missing,
+    or for the nodes in ``evicted_nodes`` — the names the caller evicted
+    this tick (authoritative: a just-deleted Node can still be listed) and
+    the ones a deferral left owed (``pending_nodes``).
+    "Stranded" means every hostname the claim's PV is pinned to is absent
+    from the Node list — a claim whose node is merely NotReady is left
+    alone, because that node can come back and its data with it.
+    """
+    forced = {str(n) for n in evicted_nodes if n}
+    cr_path = (
+        f"/apis/postgresql.cnpg.io/v1/namespaces/{quote(namespace)}"
+        f"/clusters/{quote(cluster_name)}"
+    )
+    try:
+        status, resp = _request("GET", cr_path)
+    except RuntimeError as exc:
+        return PostgresReclaim(error=str(exc))
+    if status == 404:
+        return PostgresReclaim()  # not a cnpg deployment / Cluster not up yet
+    if status != 200:
+        return PostgresReclaim(error=f"kubeapi status {status}: {resp[:200]!r}")
+    try:
+        cr = json.loads(resp)
+        spec = cr.get("spec") or {}
+        cr_status = cr.get("status") or {}
+        want = int(spec.get("instances") or 0)
+        ready = int(cr_status.get("readyInstances") or 0)
+    except (ValueError, TypeError, AttributeError):
+        return PostgresReclaim(error="unparseable Cluster CR")
+    if ready >= want and not forced:
+        return PostgresReclaim()
+    primaries = {
+        str(cr_status.get(key) or "") for key in ("currentPrimary", "targetPrimary")
+    } - {""}
+    # A Cluster that names NO primary (no status yet, a status wiped by an
+    # operator restart, a bootstrap in progress) is not one where every
+    # instance is a replica — it is one where the primary is unknown.
+    # Deleting anything on that reading could be the primary's PGDATA
+    # (review of the first cut, point 2), so nothing is; the next tick,
+    # with a status, decides. The deferral costs one tick.
+    primary_unknown = not primaries
+
+    try:
+        status, resp = _request("GET", "/api/v1/nodes")
+    except RuntimeError as exc:
+        return PostgresReclaim(error=str(exc))
+    if status != 200:
+        return PostgresReclaim(error=f"kubeapi status {status}: {resp[:200]!r}")
+    try:
+        live = {
+            str(((n.get("metadata") or {}).get("name")) or "")
+            for n in json.loads(resp).get("items", [])
+        } - {""}
+    except (ValueError, AttributeError):
+        return PostgresReclaim(error="unparseable node list")
+    # A node the caller just evicted is gone whatever the list says: on the
+    # eviction tick the Node DELETE is milliseconds old and the name can
+    # still be listed, which made the first cut's eviction tick a silent
+    # no-op (review, point 3) — the reclaim then waited for a later tick
+    # that the scaled-down spec kept early-outing until the replacement
+    # had joined. delete_node's success is the authority here.
+    live -= forced
+
+    base = f"/api/v1/namespaces/{quote(namespace)}"
+    try:
+        status, resp = _request("GET", f"{base}/persistentvolumeclaims")
+    except RuntimeError as exc:
+        return PostgresReclaim(error=str(exc))
+    if status != 200:
+        return PostgresReclaim(error=f"kubeapi status {status}: {resp[:200]!r}")
+    try:
+        items = json.loads(resp).get("items", [])
+    except (ValueError, AttributeError):
+        return PostgresReclaim(error="unparseable PVC list")
+
+    stranded: dict[str, list[str]] = {}
+    sources: dict[str, str] = {}
+    pinned_to: dict[str, set[str]] = {}
+    already_terminating: set[str] = set()
+    for pvc in items:
+        instance = _cnpg_instance_of(pvc, cluster_name)
+        if instance is None:
+            continue
+        meta = pvc.get("metadata") or {}
+        name = str(meta.get("name") or "")
+        pinned, source, pin_err = _pvc_pinned_hostnames(pvc)
+        if pin_err:
+            return PostgresReclaim(error=f"{name}: {pin_err}")
+        if not pinned or pinned & live:
+            continue
+        stranded.setdefault(instance, []).append(name)
+        sources[name] = source
+        pinned_to.setdefault(instance, set()).update(pinned)
+        if meta.get("deletionTimestamp"):
+            already_terminating.add(name)
+
+    reclaimed: list[str] = []
+    deferred: list[str] = []
+    terminating: list[str] = []
+    deferred_reason = ""
+    for instance, claims in sorted(stranded.items()):
+        if primary_unknown:
+            deferred.append(instance)
+            deferred_reason = "the Cluster names no current or target primary; retrying next tick"
+            continue
+        if instance in primaries:
+            deferred.append(instance)
+            deferred_reason = "instance is the current or target primary; retrying next tick"
+            continue
+        for name in sorted(claims):
+            if name in already_terminating:
+                # Deleted on an earlier tick; pvc-protection is holding it
+                # until its pod is gone. Not ours to count again — the first
+                # cut re-reported it as "reclaimed" every tick for ever
+                # (review, point 4). The pod delete below is what it waits on.
+                terminating.append(name)
+                continue
+            try:
+                status, resp = _request(
+                    "DELETE", f"{base}/persistentvolumeclaims/{quote(name)}"
+                )
+            except RuntimeError as exc:
+                return PostgresReclaim(reclaimed, deferred, str(exc), sources,
+                                       deferred_reason, terminating=terminating)
+            if status not in (200, 202, 404):
+                return PostgresReclaim(reclaimed, deferred,
+                                       f"kubeapi status {status}: {resp[:200]!r}",
+                                       sources, deferred_reason, terminating=terminating)
+            if status != 404:  # 404: vanished between the list and the delete — not ours
+                reclaimed.append(name)
+        # The pod the operator re-created against the stranded claim is
+        # unscheduled, so a plain DELETE removes it at once and releases
+        # pvc-protection; CNPG then sees a missing instance and joins a
+        # fresh one (pg_basebackup from the primary) on a live node. A
+        # refused delete leaves the claim Terminating under pvc-protection
+        # and CNPG unable to re-create a claim of that name, so it is an
+        # error, not a shrug (review, point 4).
+        pod_path = f"{base}/pods/{quote(instance)}"
+        try:
+            status, resp = _request("DELETE", pod_path)
+        except RuntimeError as exc:
+            return PostgresReclaim(reclaimed, deferred, f"pod {instance}: {exc}", sources,
+                                   deferred_reason, terminating=terminating)
+        if status not in (200, 202, 404):
+            return PostgresReclaim(reclaimed, deferred,
+                                   f"pod {instance}: kubeapi status {status}: {resp[:200]!r}",
+                                   sources, deferred_reason, terminating=terminating)
+    pending = set()
+    for instance in deferred:
+        pending |= pinned_to.get(instance, set())
+    return PostgresReclaim(reclaimed, deferred, None, sources, deferred_reason, pending,
+                           terminating)
 
 
 # #272 — durable control-plane state via k3s HelmChartConfig.
@@ -1474,7 +1781,7 @@ def patch_cnpg_instances(
     instances: int,
     *,
     pod_anti_affinity_type: str = "required",
-    cluster_name: str = "spatium-control-spatiumddi-postgresql",
+    cluster_name: str = _CNPG_DEFAULT_CLUSTER,
     namespace: str = "spatium",
 ) -> tuple[bool, str | None]:
     """Directly reconcile the CNPG ``Cluster`` CR's ``spec.instances`` and

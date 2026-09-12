@@ -322,6 +322,21 @@ _last_peer_drift_at: float = 0.0
 # request; pruned once the backend drops the name from its evict list.
 _evicted_pending: set[str] = set()
 
+# #1058 — hostnames whose stranded CNPG claims the reclaim still owes (a
+# deferral: the instance was the primary, or the Cluster named none). Handed
+# back to the sweep as evicted names next tick so it scans past its
+# "Postgres is whole" early-out; cleared by the tick that settles them.
+_stranded_pending: set[str] = set()
+
+
+def _carry_stranded(previous: set[str], evicted_now: list[str], outcome) -> set[str]:
+    """PURE — what the next tick must force: after a clean sweep, exactly
+    what it left owed; after a failed one (kubeapi error), everything that
+    was owed plus this tick's evictions, so an outage never drops a node."""
+    if outcome.error is not None:
+        return set(previous) | {str(n) for n in evicted_now}
+    return set(outcome.pending_nodes)
+
 
 def _watchdog_check_due() -> bool:
     """First call always returns True (forces a probe within the
@@ -1063,12 +1078,14 @@ def heartbeat_once(
         # backend clears the flag. Prune the stash to whatever the
         # backend still lists as pending (everything else is confirmed).
         evict_names = body_out.get("evict_node_names") or []
+        evicted_now: list[str] = []
         for name in evict_names:
             if name in _evicted_pending:
                 continue
             ok, evict_err = k8s_api.delete_node(str(name))
             if ok:
                 _evicted_pending.add(str(name))
+                evicted_now.append(str(name))
                 log.info("supervisor.heartbeat.node_evicted", node=name)
                 # #590 — the deleted node strands any local-path Redis PVC
                 # provisioned on it (node-affine PV): the replacement
@@ -1096,6 +1113,55 @@ def heartbeat_once(
                     "supervisor.heartbeat.node_evict_failed", node=name, error=evict_err
                 )
         _evicted_pending.intersection_update({str(n) for n in evict_names})
+
+        # #1058 — the deleted Node strands the CloudNativePG instance claim
+        # provisioned on it exactly as it strands Redis's, and the operator
+        # does NOT reclaim it: the re-created pod sits Pending on the dead
+        # node's PV affinity, Postgres runs 2 of 3 for good, and the
+        # replacement member never hosts an instance. Reclaim it the way
+        # the chart README says a human would — the claim, then the pod,
+        # and ONLY a replica's: an instance the Cluster still names as its
+        # primary is deferred to the next tick, by which time the operator
+        # has failed over. Every seed tick, not only the eviction one, so a
+        # deferred primary and a supervisor restart both converge; one CR
+        # read per tick while Postgres is whole. The names evicted THIS
+        # tick are handed in as authoritative (the Node DELETE is
+        # milliseconds old and the name can still be listed), so a
+        # replica's claim goes on the eviction tick itself.
+        pg = k8s_api.reclaim_stranded_postgres_storage(
+            evicted_nodes=set(evicted_now) | _stranded_pending
+        )
+        # Mutated in place rather than rebound: the module-level set is the
+        # state, and a ``global`` rebinding reads as a never-read assignment
+        # to a static analyser (it is read on the next tick).
+        owed = _carry_stranded(_stranded_pending, evicted_now, pg)
+        _stranded_pending.clear()
+        _stranded_pending.update(owed)
+        pg_reclaimed, pg_deferred, pg_err = pg.reclaimed, pg.deferred, pg.error
+        if pg_reclaimed:
+            log.info(
+                "supervisor.heartbeat.postgres_storage_reclaimed",
+                pvcs=pg_reclaimed,
+                evicted=evicted_now,
+                # which read decided each claim was stranded: the PV's node
+                # affinity ("pv") or the scheduler's selected-node
+                # annotation ("annotation", only when the PV is gone)
+                affinity_source={name: pg.sources.get(name, "") for name in pg_reclaimed},
+            )
+        if pg_deferred:
+            log.info(
+                "supervisor.heartbeat.postgres_storage_reclaim_deferred",
+                instances=pg_deferred,
+                reason=pg.deferred_reason,
+            )
+        if pg.terminating:
+            log.info(
+                "supervisor.heartbeat.postgres_storage_reclaim_pending",
+                pvcs=pg.terminating,
+                reason="deleted on an earlier tick; pvc-protection is waiting for the pod",
+            )
+        if pg_err:
+            log.warning("supervisor.heartbeat.postgres_storage_reclaim_failed", error=pg_err)
 
         # #590 — cluster DNS must survive a node loss. k3s's bundled
         # CoreDNS is a single replica that deterministically sits on the
