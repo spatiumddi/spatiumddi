@@ -291,7 +291,7 @@ def test_deferred_start_is_waited_out_then_a_real_death_exits_2(supervised) -> N
     assert rc == 2
     assert ticks[-1] == 6
     events = spy.events
-    assert events.count("dns_daemon_start_deferred_waiting") == 1
+    assert events.count("dns_daemon_start_deferred_waiting") == 2  # wait ticks 1 and 2
     assert (
         events.index("dns_daemon_start_deferred_waiting")
         < events.index("dns_daemon_launched_after_deferred_start")
@@ -316,7 +316,8 @@ def test_a_deferred_start_that_never_launches_is_not_an_exit(supervised) -> None
     assert sv.ticks[-1] == 5
     assert "dns_daemon_exited" not in sv.spy.events
     assert "dns_agent_thread_died" not in sv.spy.events
-    assert sv.spy.events.count("dns_daemon_start_deferred_waiting") == 1
+    # logged at ticks 1, 2 and 4 of the wait (the backoff schedule below)
+    assert sv.spy.events.count("dns_daemon_start_deferred_waiting") == 3
     assert "dns_agent_signal_received" in sv.spy.events
     assert sv.spy.events[-1] == "dns_agent_exiting"
 
@@ -419,3 +420,59 @@ def test_a_driver_that_does_not_manage_a_daemon_is_never_checked(supervised, age
     assert rc == 0
     assert "dns_daemon_start_deferred_waiting" not in sv.spy.events
     assert "dns_daemon_exited" not in sv.spy.events
+
+
+# ── the wait stays visible: re-logged on a backoff, degraded in the heartbeat ──
+
+
+def test_wait_log_schedule() -> None:
+    """The first tick, doubling to 32 s, then every minute — a ``--tail`` an
+    hour into the wait still shows the state, without a line a second."""
+    assert [n for n in range(1, 200) if supervisor.wait_log_due(n)] == [
+        1, 2, 4, 8, 16, 32, 60, 120, 180,
+    ]
+
+
+def test_the_waiting_state_is_relogged_on_the_backoff(supervised) -> None:
+    sv = supervised
+
+    rc = sv.run({130: sv.sigterm})
+
+    assert rc == 0
+    waits = [kw for _, e, kw in sv.spy.calls if e == "dns_daemon_start_deferred_waiting"]
+    assert len(waits) == 8  # ticks 1, 2, 4, 8, 16, 32, 60, 120
+    assert all(isinstance(kw["waited_s"], float) and kw["driver"] == "bind9" for kw in waits)
+
+
+def test_waiting_sets_the_heartbeat_daemon_status_and_the_launch_clears_it(supervised) -> None:
+    """The heartbeat carries ``daemon: {status: degraded, reason: start
+    deferred, no bundle yet}`` for as long as the wait lasts and ``ok`` once
+    the daemon is up. Sampled from inside ``daemon_running`` each tick."""
+    sv = supervised
+    seen: list[dict[str, Any]] = []
+    # sv.idles[0] is HeartbeatClient's stand-in; it exists once run() has
+    # constructed it, hence the late lookup.
+    sv.drv.hook_running = lambda: seen.append(dict(sv.idles[0].daemon_status))
+
+    rc = sv.run({5: sv.drv.launch, 7: sv.drv.die})
+
+    assert rc == 2
+    # tick 1 samples before the wait is marked; 2-5 during it; 6-7 after the
+    # launch cleared it.
+    assert seen[0] == {}
+    assert seen[1:5] == [supervisor.DEFERRED_DAEMON_STATUS] * 4
+    assert seen[5:] == [{"status": "ok"}, {"status": "ok"}]
+    assert sv.idles[0].daemon_status == {"status": "ok"}
+
+
+def test_a_sync_verdict_set_while_waiting_is_left_alone_on_launch(supervised) -> None:
+    """``sync.py`` owns its own degraded verdicts (a failed apply); the
+    supervisor clears only the one it set."""
+    sv = supervised
+    theirs = {"status": "degraded", "reason": "config_apply_reverted: bad acl"}
+
+    rc = sv.run({3: lambda: setattr(sv.idles[0], "daemon_status", dict(theirs)),
+                 5: sv.drv.launch, 7: sv.drv.die})
+
+    assert rc == 2
+    assert sv.idles[0].daemon_status == theirs

@@ -28,6 +28,32 @@ from .sync import SyncLoop
 
 log = structlog.get_logger(__name__)
 
+#: What the heartbeat's ``daemon`` field carries while the daemon start is
+#: deferred (no bundle rendered yet, #1056). ``sync.py`` sets its own
+#: degraded verdicts on a failed apply and clears them after the next good
+#: poll; this one is set when the wait begins and cleared by the supervisor
+#: the moment the daemon is up — and only if it is still the supervisor's
+#: own, so a sync verdict set meanwhile is left alone.
+DEFERRED_DAEMON_STATUS: dict[str, str] = {
+    "status": "degraded",
+    "reason": "start deferred, no bundle yet",
+}
+
+
+def wait_log_due(ticks_waiting: int) -> bool:
+    """Whether the waiting state is logged on this tick (1 s each): the first
+    tick, then doubling to 32 s, then every minute. With the crash loop gone
+    this line is nearly the only signal a stuck agent produces, so it has to
+    be in a ``kubectl logs --tail`` an hour in — without a line a second."""
+    return ticks_waiting in (1, 2, 4, 8, 16, 32) or (
+        ticks_waiting >= 60 and ticks_waiting % 60 == 0
+    )
+
+
+def _clear_deferred_status(heartbeat) -> None:
+    if heartbeat.daemon_status.get("reason") == DEFERRED_DAEMON_STATUS["reason"]:
+        heartbeat.daemon_status = {"status": "ok"}
+
 
 def _select_driver(cfg: AgentConfig) -> DriverBase:
     if cfg.driver == "bind9":
@@ -146,6 +172,7 @@ def run(cfg: AgentConfig) -> int:
     # liveness probe (tcp :53) still bounds the wait if no bundle ever comes.
     daemon_managed_drivers = {"bind9", "powerdns", "technitium"}
     waiting_since: float | None = None
+    waiting_ticks = 0
     while not stopping.is_set():
         time.sleep(1.0)
         # A stop requested during the tick (SIGTERM / SIGINT: a DaemonSet
@@ -167,6 +194,8 @@ def run(cfg: AgentConfig) -> int:
                         waited_s=round(time.monotonic() - waiting_since, 1),
                     )
                     waiting_since = None
+                    waiting_ticks = 0
+                    _clear_deferred_status(heartbeat)
             elif driver.daemon_launched():
                 # The stop check above closes the 1 s sleep, not the checks
                 # themselves: ``_sig`` runs between bytecodes, so a SIGTERM
@@ -176,14 +205,19 @@ def run(cfg: AgentConfig) -> int:
                 if not stopping.is_set():
                     log.error("dns_daemon_exited", driver=cfg.driver)
                     return 2
-            elif waiting_since is None:
-                waiting_since = time.monotonic()
-                log.info(
-                    "dns_daemon_start_deferred_waiting",
-                    driver=cfg.driver,
-                    note="start_daemon spawned nothing (no rendered config yet); "
-                    "the sync loop launches the daemon after the first bundle",
-                )
+            else:
+                if waiting_since is None:
+                    waiting_since = time.monotonic()
+                    heartbeat.daemon_status = dict(DEFERRED_DAEMON_STATUS)
+                waiting_ticks += 1
+                if wait_log_due(waiting_ticks):
+                    log.info(
+                        "dns_daemon_start_deferred_waiting",
+                        driver=cfg.driver,
+                        waited_s=round(time.monotonic() - waiting_since, 1),
+                        note="start_daemon spawned nothing (no rendered config yet); "
+                        "the sync loop launches the daemon after the first bundle",
+                    )
         # If any critical thread died (e.g. the sync loop dropped its
         # token after a 401/404 and self-stopped), exit so the container
         # orchestrator restarts us — bootstrap then re-registers from
