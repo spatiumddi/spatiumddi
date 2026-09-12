@@ -133,9 +133,10 @@ def test_dns_tally_counts_every_rcode_and_names_errors_once() -> None:
         t.answered(name)
     assert t.counter_fields() == {
         "dns_rcode_NOERROR": 1, "dns_rcode_REFUSED": 2, "dns_rcode_SERVFAIL": 1}
-    assert t.error("OSError") is True
-    assert t.error("OSError") is False
-    assert t.error("BadResponse") is True
+    first = t.error("OSError")
+    second = t.error("OSError")
+    other = t.error("BadResponse")
+    assert (first, second, other) == (True, False, True)
     assert t.errors == {"OSError": 2, "BadResponse": 1}
 
 

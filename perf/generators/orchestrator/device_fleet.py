@@ -77,17 +77,17 @@ from spddi_perf.generator_tallies import dns_summary, handshake_summary  # noqa:
 # absent (bare env) the DNS query stream + the IPAM->DNS propagation leg no-op cleanly.
 try:
     import dns.asyncquery as _dns_aq  # type: ignore
-    import dns.exception as _dns_exc  # type: ignore
     import dns.message as _dns_msg  # type: ignore
     import dns.rcode as _dns_rcode  # type: ignore
+    from dns.exception import Timeout as _DnsTimeout  # type: ignore
 
     _HAVE_DNSPYTHON = True
     # A timed-out query is a timeout; every other exception is an error the
     # tally names by type (#1057 — the two used to share one counter).
     _DNS_TIMEOUT_EXC: tuple[type[BaseException], ...] = (
-        _dns_exc.Timeout, asyncio.TimeoutError, TimeoutError)
+        _DnsTimeout, asyncio.TimeoutError, TimeoutError)
 except Exception:  # pragma: no cover - exercised only in a bare env
-    _dns_aq = _dns_exc = _dns_msg = _dns_rcode = None  # type: ignore
+    _dns_aq = _dns_msg = _dns_rcode = None  # type: ignore
     _HAVE_DNSPYTHON = False
     _DNS_TIMEOUT_EXC = (asyncio.TimeoutError, TimeoutError)
 
