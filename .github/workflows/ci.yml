@@ -745,7 +745,14 @@ jobs:
   # ran (#955 merged on 25 green checks that opened none of its files) while
   # the backend path filter, which did not know ``perf/`` either, spent all 8
   # backend shards on it. Hermetic: the tests use a fake socket, no network,
-  # no appliance, ~0.01 s.
+  # no appliance, well under a second.
+  #
+  # PyYAML, dnspython and hdrhistogram are the orchestrator's and report's
+  # own imports (perf/requirements.txt): the tests that drive the
+  # orchestrator FSM and the report against them (#1057) import-skip without
+  # the first two, and with pytest alone that skip let a reverted fix pass
+  # this job green (review of #1063). hdrhistogram ships a wheel for x86_64
+  # only, which this runner is.
   #
   # Tests only, like the agent + appliance jobs: ``perf/`` is outside the
   # Backend Lint scope and carries pre-existing ruff/black drift (25 findings,
@@ -762,7 +769,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install pytest
+        run: pip install pytest pyyaml dnspython hdrhistogram
 
       - name: Run tests
         run: python -m pytest perf -q

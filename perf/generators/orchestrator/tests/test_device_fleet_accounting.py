@@ -1,9 +1,10 @@
 """The orchestrator's FSM wired to the exchange ledger (#1057), driven without a
 socket: replies are injected as parsed dicts and timers fired by hand.
 
-Needs the harness deps (PyYAML for the manifest, dnspython for the DNS leg);
-skipped where they are absent (CI's perf job installs pytest only — the pure
-ledger is covered by test_accounting.py there).
+Needs PyYAML (the manifest) and dnspython (the DNS leg) — both installed by
+the perf CI job; in a bare environment the file import-skips. The one
+assertion that needs the HdrHistogram backend (the .hdr dump) is gated on
+it: hdrhistogram ships a wheel for x86_64 only.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ sys.path.insert(0, str(HERE.parents[1]))                 # generators/orchestrat
 sys.path.insert(0, str(HERE.parents[3] / "harness"))     # spddi_perf
 
 import device_fleet as df  # noqa: E402
+import lifecycle_log  # noqa: E402
 from accounting import DORA_KINDS, KIND_RENEW, KIND_SELECT  # noqa: E402
 from spddi_perf.runpaths import RunPaths  # noqa: E402
 
@@ -292,4 +294,7 @@ def test_finalize_writes_the_ledgers_into_the_shard_summary(orch):
     assert summary["handshake"]["strict_pct"] == 100.0 and summary["handshake"]["acked_late"] == 0
     assert summary["dns"]["rcodes"] == {"REFUSED": 1} and summary["dns"]["ok"] == 0
     assert summary["dora_ack_late"]["count"] == 0 and summary["dora_ack"]["count"] == 1
-    assert o.rp.generator("orchestrator.shard0.dhcp_dora_ack_late.hdr").exists()
+    # The encoded histogram exists only with the HdrHistogram backend; the
+    # reservoir fallback dumps nothing (lifecycle_log.dump_hdr).
+    hdr = o.rp.generator("orchestrator.shard0.dhcp_dora_ack_late.hdr")
+    assert hdr.exists() == lifecycle_log._HAVE_HDR

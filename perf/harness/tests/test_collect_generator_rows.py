@@ -1,7 +1,7 @@
 """collect.py reads the orchestrator's per-rcode and late-ACK ledgers (#1057).
 
-Needs PyYAML (the manifest loader) — skipped in a bare env; the fold itself is
-covered by test_generator_tallies.py there.
+Needs PyYAML (the manifest loader), installed by the perf CI job; in a bare
+environment the file import-skips.
 """
 
 from __future__ import annotations
@@ -60,6 +60,18 @@ def test_b6a_fails_structurally_on_the_orchestrators_refused_answers(tmp_path):
     assert slo["generator"]["handshake"]["acked_late"] == 300
     assert slo["generator"]["handshake"]["strict_pct"] == round(100 * 8599 / 9294, 3)
     assert slo["generator"]["handshake"]["with_late_pct"] == round(100 * 8899 / 9294, 3)
+
+
+def test_b6_rates_servfail_over_queries_sent_not_answered(tmp_path):
+    """8 SERVFAILs in 10,000 sent of which 8,000 were answered: 0.08 % per
+    attempt (PASS), which is what BIND's SERVFAIL / QUERY ratio would show;
+    over the answers it would read 0.10 % and FAIL the < 0.1 % row."""
+    run = {"shard": 0, "counters": {"dns_sent": 10000, "dns_answered": 8000, "dns_ok": 7992,
+                                    "dns_timeout": 2000, "dns_rcode_NOERROR": 7992,
+                                    "dns_rcode_SERVFAIL": 8, "dora_ack": 1}}
+    b6 = rows_by_id(collect.criterion_b(rundata(tmp_path, [run])))["b6"]
+    assert b6["measured"] == "0.08%" and b6["verdict"] == collect.PASS
+    assert b6["source"].endswith("dns_rcode_SERVFAIL / dns_sent")
 
 
 def test_b6a_is_no_data_without_any_dns_source_and_passes_on_zero_refused(tmp_path):
