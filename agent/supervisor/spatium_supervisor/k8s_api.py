@@ -663,6 +663,10 @@ class PostgresReclaim:
     # why ``deferred`` is non-empty: the instance is the current or target
     # primary, or the Cluster names no primary at all
     deferred_reason: str = ""
+    # hostnames whose stranded claims are still owed (deferred): the caller
+    # hands them back as ``evicted_nodes`` next tick so the scan runs again
+    # even while the Cluster reads whole
+    pending_nodes: set[str] = field(default_factory=set)
 
     def __iter__(self):
         # ``reclaimed, deferred, err = ...`` keeps working for callers that
@@ -709,7 +713,10 @@ def reclaim_stranded_postgres_storage(
 
     Bounded and idempotent: one GET of the Cluster CR when Postgres is
     whole (``readyInstances >= instances``) and nothing was evicted this
-    tick; the node/claim/PV scan only runs while an instance is missing.
+    tick; the node/claim/PV scan only runs while an instance is missing,
+    or for the nodes in ``evicted_nodes`` — the names the caller evicted
+    this tick (authoritative: a just-deleted Node can still be listed) and
+    the ones a deferral left owed (``pending_nodes``).
     "Stranded" means every hostname the claim's PV is pinned to is absent
     from the Node list — a claim whose node is merely NotReady is left
     alone, because that node can come back and its data with it.
@@ -761,6 +768,13 @@ def reclaim_stranded_postgres_storage(
         } - {""}
     except (ValueError, AttributeError):
         return PostgresReclaim(error="unparseable node list")
+    # A node the caller just evicted is gone whatever the list says: on the
+    # eviction tick the Node DELETE is milliseconds old and the name can
+    # still be listed, which made the first cut's eviction tick a silent
+    # no-op (review, point 3) — the reclaim then waited for a later tick
+    # that the scaled-down spec kept early-outing until the replacement
+    # had joined. delete_node's success is the authority here.
+    live -= forced
 
     base = f"/api/v1/namespaces/{quote(namespace)}"
     try:
@@ -776,6 +790,7 @@ def reclaim_stranded_postgres_storage(
 
     stranded: dict[str, list[str]] = {}
     sources: dict[str, str] = {}
+    pinned_to: dict[str, set[str]] = {}
     for pvc in items:
         instance = _cnpg_instance_of(pvc, cluster_name)
         if instance is None:
@@ -788,6 +803,7 @@ def reclaim_stranded_postgres_storage(
             continue
         stranded.setdefault(instance, []).append(name)
         sources[name] = source
+        pinned_to.setdefault(instance, set()).update(pinned)
 
     reclaimed: list[str] = []
     deferred: list[str] = []
@@ -819,7 +835,10 @@ def reclaim_stranded_postgres_storage(
             _request("DELETE", f"{base}/pods/{quote(instance)}")
         except RuntimeError:
             pass  # the pod may already be gone; the claim reclaim is what matters
-    return PostgresReclaim(reclaimed, deferred, None, sources, deferred_reason)
+    pending = set()
+    for instance in deferred:
+        pending |= pinned_to.get(instance, set())
+    return PostgresReclaim(reclaimed, deferred, None, sources, deferred_reason, pending)
 
 
 # #272 — durable control-plane state via k3s HelmChartConfig.

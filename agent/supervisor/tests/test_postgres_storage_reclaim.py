@@ -241,6 +241,65 @@ def test_an_eviction_this_tick_forces_the_scan_past_a_stale_status(monkeypatch) 
     assert (reclaimed, deferred, err) == ([f"{CLUSTER}-3"], [], None)
 
 
+def test_the_eviction_tick_reclaims_with_the_node_still_listed(monkeypatch) -> None:
+    # On the eviction tick delete_node has just returned and the Node list
+    # can still carry the name (the first cut's eviction tick was a silent
+    # no-op for exactly that reason — review, point 3). The names the
+    # caller evicted are authoritative.
+    rec = _Recorder(
+        _world(
+            ready=3,  # the dead node's pod still reads Ready for the node-monitor grace
+            nodes=("ddipg-seed", "ddipg-member-1", "ddipg-member-2"),
+            pvcs=_LIVE_PVCS,
+            pvs=_LIVE_PVS,
+        )
+    )
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    out = k8s_api.reclaim_stranded_postgres_storage(evicted_nodes=["ddipg-member-2"])
+
+    assert (out.reclaimed, out.deferred, out.error) == ([f"{CLUSTER}-3"], [], None)
+    assert rec.deleted == [f"{PVC_PATH}/{CLUSTER}-3", f"{POD_PATH}/{CLUSTER}-3"]
+
+
+def test_a_deferral_names_its_node_for_the_next_tick(monkeypatch) -> None:
+    # The primary on the evicted node is deferred; the caller must be told
+    # which node to force next tick, or the scaled-down spec's "Postgres is
+    # whole" early-out would sit on the deferral until the replacement joins.
+    rec = _Recorder(_world(pvcs=_LIVE_PVCS, pvs=_LIVE_PVS, current=f"{CLUSTER}-3"))
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    out = k8s_api.reclaim_stranded_postgres_storage(evicted_nodes=["ddipg-member-2"])
+
+    assert out.deferred == [f"{CLUSTER}-3"]
+    assert out.pending_nodes == {"ddipg-member-2"}
+    assert rec.deleted == []
+
+
+def test_a_clean_reclaim_leaves_nothing_owed(monkeypatch) -> None:
+    rec = _Recorder(_world(pvcs=_LIVE_PVCS, pvs=_LIVE_PVS))
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    out = k8s_api.reclaim_stranded_postgres_storage(evicted_nodes=["ddipg-member-2"])
+
+    assert out.reclaimed == [f"{CLUSTER}-3"] and out.pending_nodes == set()
+
+
+def test_the_heartbeat_carries_what_a_sweep_left_owed() -> None:
+    from spatium_supervisor import heartbeat
+
+    owed = k8s_api.PostgresReclaim(deferred=[f"{CLUSTER}-3"], pending_nodes={"ddipg-member-2"})
+    assert heartbeat._carry_stranded(set(), ["ddipg-member-2"], owed) == {"ddipg-member-2"}
+    settled = k8s_api.PostgresReclaim(reclaimed=[f"{CLUSTER}-3"])
+    assert heartbeat._carry_stranded({"ddipg-member-2"}, [], settled) == set()
+    # a kubeapi outage drops nothing: everything owed plus this tick's evictions stays forced
+    failed = k8s_api.PostgresReclaim(error="kubeapi status 503")
+    assert heartbeat._carry_stranded({"ddipg-member-2"}, ["ddipg-member-4"], failed) == {
+        "ddipg-member-2",
+        "ddipg-member-4",
+    }
+
+
 def test_a_claim_on_a_node_that_still_exists_is_left_alone(monkeypatch) -> None:
     # NotReady is not gone: the Node object is still registered, so the node
     # (and the data on it) can come back. Only a hostname absent from the

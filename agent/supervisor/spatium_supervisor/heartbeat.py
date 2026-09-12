@@ -322,6 +322,21 @@ _last_peer_drift_at: float = 0.0
 # request; pruned once the backend drops the name from its evict list.
 _evicted_pending: set[str] = set()
 
+# #1058 — hostnames whose stranded CNPG claims the reclaim still owes (a
+# deferral: the instance was the primary, or the Cluster named none). Handed
+# back to the sweep as evicted names next tick so it scans past its
+# "Postgres is whole" early-out; cleared by the tick that settles them.
+_stranded_pending: set[str] = set()
+
+
+def _carry_stranded(previous: set[str], evicted_now: list[str], outcome) -> set[str]:
+    """PURE — what the next tick must force: after a clean sweep, exactly
+    what it left owed; after a failed one (kubeapi error), everything that
+    was owed plus this tick's evictions, so an outage never drops a node."""
+    if outcome.error is not None:
+        return set(previous) | {str(n) for n in evicted_now}
+    return set(outcome.pending_nodes)
+
 
 def _watchdog_check_due() -> bool:
     """First call always returns True (forces a probe within the
@@ -1109,8 +1124,15 @@ def heartbeat_once(
         # primary is deferred to the next tick, by which time the operator
         # has failed over. Every seed tick, not only the eviction one, so a
         # deferred primary and a supervisor restart both converge; one CR
-        # read per tick while Postgres is whole.
-        pg = k8s_api.reclaim_stranded_postgres_storage(evicted_nodes=evicted_now)
+        # read per tick while Postgres is whole. The names evicted THIS
+        # tick are handed in as authoritative (the Node DELETE is
+        # milliseconds old and the name can still be listed), so a
+        # replica's claim goes on the eviction tick itself.
+        global _stranded_pending
+        pg = k8s_api.reclaim_stranded_postgres_storage(
+            evicted_nodes=set(evicted_now) | _stranded_pending
+        )
+        _stranded_pending = _carry_stranded(_stranded_pending, evicted_now, pg)
         pg_reclaimed, pg_deferred, pg_err = pg.reclaimed, pg.deferred, pg.error
         if pg_reclaimed:
             log.info(
