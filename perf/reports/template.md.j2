@@ -8,7 +8,7 @@
   sync. Context keys: run_id, profile, generated_at, slo_thresholds_version,
   incomplete, criteria{a,b,c,d:{name,verdict,summary,rows[]}}, overall{verdict,note},
   deltas{row_count_ledger,table_delta,db_size}, bottleneck, comparison, manifest,
-  present_surfaces, profile_key.
+  present_surfaces, profile_key, generator{shards,handshake,dns} (or none).
 -#}
 # SpatiumDDI 24h Performance Run — `{{ run_id }}`
 {% if incomplete %}
@@ -44,6 +44,18 @@ OVERALL: {{ overall.verdict }} — {{ overall.note }}
 | {{ r.id }} | {{ r.slo|replace("|", "\\|") }} | {{ r.measured|string|replace("|", "\\|") }} | {{ r.threshold|string|replace("|", "\\|") }} | {{ r.verdict|badge }} |
 {% endfor %}
 {% endfor %}
+
+## Generator accounting (orchestrator)
+{% if generator %}
+
+- **Shards:** {{ generator.shards }}
+- **DHCP handshake:** attempts {{ "{:,}".format(generator.handshake.attempts) }} · acked {{ "{:,}".format(generator.handshake.acked) }} ({{ "%.2f%%"|format(generator.handshake.strict_pct) if generator.handshake.strict_pct is not none else "—" }} strict) · within budget {{ "{:,}".format(generator.handshake.acked_within_budget) }} ({{ "%.2f%%"|format(generator.handshake.within_budget_pct) if generator.handshake.within_budget_pct is not none else "—" }}) · late {{ "{:,}".format(generator.handshake.acked_late) }} ({{ "%.2f%%"|format(generator.handshake.with_late_pct) if generator.handshake.with_late_pct is not none else "—" }} with late) · timeouts {{ "{:,}".format(generator.handshake.timeouts) }} · naks {{ "{:,}".format(generator.handshake.naks) }}
+- **DNS stream:** sent {{ "{:,}".format(generator.dns.sent) }} · answered {{ "{:,}".format(generator.dns.answered) }} · ok {{ "{:,}".format(generator.dns.ok) }} ({{ "%.2f%%"|format(generator.dns.ok_pct_of_sent) if generator.dns.ok_pct_of_sent is not none else "—" }} of sent) · timeouts {{ "{:,}".format(generator.dns.timeouts) }} · errors {{ "{:,}".format(generator.dns.errors) }} · unaccounted {{ "{:,}".format(generator.dns.unaccounted) }}
+- **DNS rcodes:** {% for k, v in generator.dns.rcodes.items() %}{{ k }} {{ "{:,}".format(v) }}{{ ", " if not loop.last }}{% else %}none{% endfor %}
+{% else %}
+
+_No orchestrator shard summary in the run directory._
+{% endif %}
 
 ## Bottleneck finding (first-to-give + ready §5 mitigation)
 
