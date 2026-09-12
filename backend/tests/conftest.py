@@ -14,7 +14,7 @@ behaviour exactly.
 """
 
 import os
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Iterator
 from urllib.parse import urlsplit, urlunsplit
 
 # IMPORTANT: the per-worker DATABASE_URL override below MUST run before any
@@ -191,7 +191,7 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
 
 
 @pytest.fixture(autouse=True)
-def _all_feature_modules_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+def _all_feature_modules_enabled() -> Iterator[None]:
     """Treat every catalog module as default-ENABLED for the suite.
 
     Which modules ship on is a product decision, revised in #1069 from 37
@@ -214,17 +214,34 @@ def _all_feature_modules_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     The shipped values themselves are pinned by
     ``test_feature_module_defaults.py``, which reads the catalog source
     rather than importing it, so this patch cannot mask a wrong default.
+
+    Deliberately does NOT take the ``monkeypatch`` fixture, though that is
+    the obvious way to write it. ``monkeypatch`` is function-scoped and
+    SHARED with the test, so requesting it from an autouse fixture hoists
+    its creation ahead of the DB fixtures — and finalizers run in reverse,
+    so it would then undo the test's own patches AFTER the session and
+    connection tear down. Tests that stub ``socket.getaddrinfo`` or
+    ``asyncpg.connect`` (``test_dns_axfr_helper``, ``test_fix_l5_ssrf``,
+    ``test_rewrap_partial_abort``) would then error in teardown, on a
+    stub that is theirs and an ordering they never asked to change.
     """
     import dataclasses
 
     from app.services import feature_modules as fm
 
-    patched = tuple(dataclasses.replace(m, default_enabled=True) for m in fm.MODULES)
-    monkeypatch.setattr(fm, "MODULES", patched)
+    original_modules = fm.MODULES
+    original_by_id = fm.MODULES_BY_ID
+    patched = tuple(dataclasses.replace(m, default_enabled=True) for m in original_modules)
+    fm.MODULES = patched
     # MODULES_BY_ID is derived at import, so patching only MODULES would leave
     # the two disagreeing about default_enabled: the list endpoint reads
     # MODULES, the toggle endpoint reads MODULES_BY_ID.
-    monkeypatch.setattr(fm, "MODULES_BY_ID", {m.id: m for m in patched})
+    fm.MODULES_BY_ID = {m.id: m for m in patched}
+    try:
+        yield
+    finally:
+        fm.MODULES = original_modules
+        fm.MODULES_BY_ID = original_by_id
 
 
 @pytest_asyncio.fixture(autouse=True)
