@@ -76,12 +76,16 @@ def test_ack_after_give_up_is_late_and_counted_once() -> None:
 
 def test_unknown_xid_is_none_and_purge_forgets_after_grace() -> None:
     led = ExchangeLedger(grace_s=10.0)
-    assert led.close(xid(9), 1.0) is None
+    unknown = led.close(xid(9), 1.0)
+    assert unknown is None
     led.open(xid(1), DEV, KIND_DISCOVER, 0.0)
     led.close(xid(1), 1.0, "nak")
-    assert led.purge(5.0) == 0 and len(led) == 1           # still known within the grace
-    assert led.purge(11.5) == 1 and len(led) == 0
-    assert led.close(xid(1), 12.0) is None                 # now unmatched
+    purged_early = led.purge(5.0)                          # still known within the grace
+    assert purged_early == 0 and len(led) == 1
+    purged_late = led.purge(11.5)
+    assert purged_late == 1 and len(led) == 0
+    forgotten = led.close(xid(1), 12.0)                    # now unmatched
+    assert forgotten is None
     assert led.open_for(DEV) == []
 
 
