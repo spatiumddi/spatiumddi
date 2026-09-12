@@ -1279,6 +1279,26 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A DNS agent whose first config had not arrived yet exited 2 one
+  second after logging `named_conf_missing_startup_deferred`, so every
+  freshly joined cluster member's bind pod crash-looped until its
+  bundle landed (#1056).** `Bind9Driver.start_daemon()` (and
+  PowerDNS's) legitimately returns without a daemon when nothing is
+  rendered yet — the sync loop starts it after the first bundle — but
+  the supervisor read "not running" as "died" from its first tick. A
+  deferred start is now a wait: the liveness exit needs a daemon that
+  was actually launched (`DriverBase.daemon_launched()`), the wait is
+  re-logged on a backoff and carried in the heartbeat as
+  `daemon.status=degraded`, and a requested stop (SIGTERM from a
+  rollout or a scale-down, wherever it lands in the loop) exits 0
+  instead of reporting the threads it just stopped as
+  `dns_agent_thread_died`. Observed on nested 3-node QA clusters: a
+  member's bind pod restart count of +2 on a healthy join is now 0,
+  and a DaemonSet rollout ends the old container 0, not 2. The
+  umbrella chart's DNS agents gain the liveness probe the appliance
+  chart already had (tcp :53, 30 s / 30 s), so a bundle that never
+  comes is still a bounded restart on both charts.
+
 
 - **Both OS slots ended up labelled `root_a` after an A/B upgrade, and
   the #995 "Keep /var" reinstall silently stopped being offered
