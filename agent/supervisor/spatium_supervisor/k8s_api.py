@@ -1781,7 +1781,7 @@ def patch_cnpg_instances(
     instances: int,
     *,
     pod_anti_affinity_type: str = "required",
-    cluster_name: str = "spatium-control-spatiumddi-postgresql",
+    cluster_name: str = _CNPG_DEFAULT_CLUSTER,
     namespace: str = "spatium",
 ) -> tuple[bool, str | None]:
     """Directly reconcile the CNPG ``Cluster`` CR's ``spec.instances`` and

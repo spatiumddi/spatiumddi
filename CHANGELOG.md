@@ -1297,12 +1297,21 @@ the formatter handles the rest.
   now reclaims a CNPG instance claim whose volume is pinned to a
   hostname no Node carries (the claim, then the Pending pod — the
   chart README's manual repair, done by the appliance itself), and
-  CNPG joins a fresh replica from the primary on a live node. Only a
+  CNPG joins a fresh replica from the primary on a live node. The
+  node's own volume affinity is what decides "pinned" — the
+  supervisor's ClusterRole gains the `persistentvolumes: get` that
+  read needs; a forbidden or failing read is surfaced, never guessed
+  around, and the journal line says which read decided. Only a
   replica's claim is ever touched: an instance the Cluster still names
-  as its current or target primary is deferred to the next heartbeat,
-  by which time the operator has failed over. Runs on every seed
-  heartbeat, so a deferred primary and a supervisor restart both
-  converge; one Cluster read per tick while Postgres is whole.
+  as its current or target primary — or any instance while the
+  Cluster names no primary at all — is deferred and retried on the
+  next heartbeat, by which time the operator has failed over. The
+  names the seed just evicted are authoritative, so a replica's claim
+  goes on the eviction tick itself; a refused pod delete is an error,
+  and a claim still Terminating from an earlier tick is reported as
+  pending, not reclaimed again. Runs on every seed heartbeat, so a
+  deferred primary and a supervisor restart both converge; one
+  Cluster read per tick while Postgres is whole.
 
 - **Both OS slots ended up labelled `root_a` after an A/B upgrade, and
   the #995 "Keep /var" reinstall silently stopped being offered
