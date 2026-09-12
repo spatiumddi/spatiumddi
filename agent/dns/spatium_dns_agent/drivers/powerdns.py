@@ -287,7 +287,6 @@ def render_dnsdist_conf(opts: dict[str, Any], has_cert: bool = False) -> str:
 class PowerDNSDriver(DriverBase):
     """PowerDNS agent driver — Phase 1."""
 
-    daemon_pid: int | None = None
 
     # ── Render / validate / swap ────────────────────────────────────────────
 
