@@ -138,6 +138,19 @@ spec:
             tcpSocket: { port: 53 }
             initialDelaySeconds: 5
             periodSeconds: 10
+          {{- /* #1056 — the agent now WAITS for its first bundle instead of
+                 exiting 2 one second after "startup deferred". A readiness
+                 probe never restarts a pod, so without a liveness probe a
+                 server whose bundle never arrives (wrong group, revoked key,
+                 a control plane that heartbeats but renders nothing) would
+                 sit NotReady for ever. Same shape as the appliance chart's
+                 dns-bind9 / dns-powerdns / dns-technitium: 30 s initial
+                 delay covers a slow first bundle, 3 × 30 s to a restart
+                 with the reason in the agent's log. */}}
+          livenessProbe:
+            tcpSocket: { port: 53 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
           resources:
             {{- toYaml ($server.resources | default (dict "requests" (dict "cpu" "100m" "memory" "128Mi") "limits" (dict "cpu" "500m" "memory" "512Mi"))) | nindent 12 }}
           volumeMounts:

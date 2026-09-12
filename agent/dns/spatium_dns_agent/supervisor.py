@@ -168,8 +168,9 @@ def run(cfg: AgentConfig) -> int:
     # container until the bundle happened to arrive inside the 1 s window
     # (#1056: ``dns_daemon_exited`` 1.0 s after the deferral, Last State
     # exit 2, restart count +2 on a member). So: wait while nothing has
-    # been launched, exit only when a launched daemon is gone. The chart's
-    # liveness probe (tcp :53) still bounds the wait if no bundle ever comes.
+    # been launched, exit only when a launched daemon is gone. The charts'
+    # liveness probes (tcp :53 — the appliance chart's, and the umbrella
+    # chart's since #1056) still bound the wait if no bundle ever comes.
     daemon_managed_drivers = {"bind9", "powerdns", "technitium"}
     waiting_since: float | None = None
     waiting_ticks = 0
