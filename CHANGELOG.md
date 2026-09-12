@@ -693,6 +693,63 @@ the formatter handles the rest.
 
 ### Changed
 
+- **Fewer features are switched on out of the box (#1069).** A fresh
+  install enabled **37 of 53** feature modules, because the policy was
+  "default-on so operators discover what exists" — so a new operator
+  met BACnet, DICOM, OT Purdue zoning, E911, a BGP looking glass and
+  SD-WAN overlays in the sidebar before creating their first subnet.
+  That policy is replaced by a criterion: a module ships **on** only
+  if it is core IPAM / DNS / DHCP workflow, a zero-footprint UI
+  convenience, or a read-only diagnostic invoked by hand; it ships
+  **off** if it is a domain-specific registry most installs never
+  populate, emits traffic or writes to infrastructure once armed,
+  calls off-prem, or is one-shot migration tooling. Day-one importers
+  are the deliberate exception to that last clause — a fresh install
+  is exactly when an estate gets imported, so DNS / DHCP / NetBox
+  import stay on while the Windows cutover does not. **14 of 53**
+  modules now ship enabled. Discovery is unaffected: Settings →
+  Features has always listed every module with its description
+  whether or not it is on, which is why the sidebar does not have to.
+  **Existing installs are untouched** — an operator already running
+  E911 or Conformity does not lose it to an upgrade they did not ask
+  for.
+
+  **The mechanism was the bug.** Non-negotiable #14 told every
+  module's migration to seed a `feature_module` row at its shipped
+  default, and the resolver prefers a row over the catalog — so
+  `default_enabled` was dead code on every install, fresh ones
+  included, since a fresh install runs the same seed migrations an
+  upgrade does. Flipping a default in the catalog would have changed
+  nothing at all. A row now means one thing, "an operator changed
+  this"; migrations no longer seed one; and the new migration deletes
+  the pristine historical seeds **on a fresh install only**, detected
+  as the `user` table being empty, which on a fresh install is exactly
+  "the application has never started" because the default admin is
+  created at API startup, after `alembic upgrade`. Its downgrade is a
+  genuine no-op rather than a stub: the old code carries the old
+  catalog, whose defaults were true, so an absent row resolves to the
+  old behaviour on its own.
+
+  Two guards keep it from drifting back. The first, in
+  `tests/test_feature_module_defaults.py`, writes out the shipped
+  value of all 53 modules, so changing one is two deliberate edits and
+  adding a module fails until somebody states which way it ships — and
+  it parses the catalog *source* rather than importing it, so it
+  cannot be masked by the new `conftest` fixture that turns every
+  module on for the test suite. The second fails any new migration
+  that touches `feature_module` at all.
+
+  Verified on a real database both ways: a full migration chain on an
+  empty database leaves zero rows, so the catalog governs; the dev
+  database with its 51 seeded rows keeps all 51.
+
+  `scripts/seed_demo.py` now enables the eight gated modules it
+  populates before it starts. It POSTs to routers the flip turns off,
+  and its HTTP helper logs a failure and walks on — so left alone it
+  would have printed a wall of 404s and produced a demo dataset with
+  no ASNs, customers, sites, circuits, services, overlays, multicast
+  groups or conformity policy in it.
+
 - **CI: a backend PR no longer waits 28 minutes on one test shard
   (#1019).** The eight `Backend — Tests` shards were split by test
   COUNT — no `.test_durations` file existed anywhere in the repo, so
@@ -1847,6 +1904,10 @@ the formatter handles the rest.
 
 ### Migrations
 
+- `a9f2c71e34b8` — #1069, data-only: on a fresh install, delete the
+  pristine `feature_module` seed rows so the catalog's
+  `default_enabled` governs. No schema change; existing installs are
+  not touched.
 - `c93f1a72e408` — `dhcp_metric_sample.receive_drop` /
   `.socket_drop` (both nullable: NULL means unmeasured) and
   `dhcp_server_group.kea_thread_pool_size` / `.kea_packet_logging`.

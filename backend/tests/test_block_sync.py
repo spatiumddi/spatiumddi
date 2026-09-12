@@ -286,8 +286,15 @@ async def test_unifi_post_legacy_rejects_rc_error():
 
 
 async def test_module_gated_404_when_off(client: AsyncClient, db_session: AsyncSession):
+    # The disabled state is stated with a row rather than inherited from the
+    # shipped default (#1069): defaults are product policy and get revised,
+    # and a test that reads "off" from the catalog silently stops testing the
+    # gate the day that policy changes. What is under test here is
+    # require_module answering 404, not which way the module ships.
+    db_session.add(FeatureModule(id="security.block_sync", enabled=False))
     _u, token = await _superadmin(db_session)
     await db_session.commit()
+    feature_modules.invalidate_cache()
     resp = await client.get("/api/v1/block-sync/blocks", headers=_hdr(token))
     assert resp.status_code == 404
 

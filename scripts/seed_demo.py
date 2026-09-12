@@ -33,6 +33,11 @@ dynamic context block has real numbers to summarise. Sections:
 * Alert rules — utilization, server-unreachable, domain-expiring
 * AI prompts — three shared triage prompts (issue #90 Phase 2)
 
+Several of those sections sit behind feature modules that do not ship
+enabled (#1069), so the run starts by turning them on — see
+``DEMO_MODULES``. Without that the gated routers answer 404 and the demo
+data for them simply never appears.
+
 Every section is idempotent — the script swallows 409 from already-
 existing rows, and PATCHes spaces / blocks where the FK targets need
 to converge on a re-run after new entities exist. A handful of
@@ -1767,9 +1772,45 @@ def seed_webhook(a: Api):
 # ── Driver ────────────────────────────────────────────────────────────────
 
 
+# Feature modules this seeder populates that do NOT ship enabled (#1069).
+# The seeder is superadmin, so it turns them on rather than logging a wall
+# of 404s and producing a half-empty demo: every one of these gates a
+# router this script POSTs to, and ``require_module`` answers 404 when the
+# module is off, which ``Api.call`` logs and walks past.
+#
+# Keep in step with the sections below — a new section whose router is
+# module-gated adds its id here, or its data silently never appears.
+DEMO_MODULES = (
+    "network.asn",
+    "network.customer",
+    "network.provider",
+    "network.service",
+    "network.circuit",
+    "network.overlay",
+    "network.multicast",
+    "compliance.conformity",
+)
+
+
+def enable_demo_modules(a: "Api") -> None:
+    """Turn on the gated modules this seeder needs, and say so.
+
+    Idempotent: enabling an already-enabled module is a no-op PATCH. It
+    writes a ``feature_module`` row, which is correct — an operator (here,
+    this script acting as one) really did change it, and it is the same
+    row Settings → Features would write.
+    """
+    print("== feature modules")
+    for module_id in DEMO_MODULES:
+        a.call("PATCH", f"/api/v1/admin/feature-modules/{module_id}", json={"enabled": True})
+    print(f"  enabled {len(DEMO_MODULES)} module(s) so their demo data is reachable")
+
+
 def main(base: str, user: str, pw: str):
     token = login(base, user, pw)
     a = Api(base, token)
+
+    enable_demo_modules(a)
 
     dns_group_id, dns_fwd_zone_id, _dns_rev_zone_id = seed_dns(a)
     dhcp_group_id = seed_dhcp_group(a)

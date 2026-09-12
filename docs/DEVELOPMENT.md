@@ -199,6 +199,10 @@ the canonical wording lives in `CLAUDE.md`.
     an explicit decision per tool.
 14. **Feature-module gating** — a new top-level resource family is
     evaluated for a togglable feature module (`app.services.feature_modules`).
+    It ships **enabled** only if it is core IPAM / DNS / DHCP workflow, a
+    zero-footprint UI convenience, or a hand-invoked read-only diagnostic;
+    otherwise disabled. Declare the value in `tests/test_feature_module_
+    defaults.py` and never seed a `feature_module` row in a migration.
 15. **New integrations show up on the Dashboard** — wire a new
     read-only integration mirror into both the IPAM `IntegrationsPanel`
     and the dedicated Integrations dashboard tab.

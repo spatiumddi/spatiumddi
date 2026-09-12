@@ -15,8 +15,12 @@ BACnet/IP building automation,
 Four IP-native domains that a generic IPAM does not speak. They look unrelated
 but they are the **same DDI primitives, specialized**: a uniqueness registry, a
 segmentation-documentation layer, and conformity rules over both. Each is a
-togglable feature module in the Network group, default-enabled so operators
-discover them, and switched off by the sites that don't run that vertical.
+togglable feature module in the Network group, and all four ship **disabled**
+([#1069](https://github.com/spatiumddi/spatiumddi/issues/1069)) — a registry
+means nothing until the site populates it, and a hospital wants DICOM where
+nobody else wants the sidebar entries. Turn one on under Settings → Features,
+which lists all four with their descriptions whether or not they are enabled.
+Enabling one arms nothing: these are registries, with no probing anywhere.
 
 The healthcare research pass concluded there should be **no**
 `network.healthcare` catch-all — the vertical splits into separable pieces, and

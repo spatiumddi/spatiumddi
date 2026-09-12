@@ -54,12 +54,17 @@ const TABS: { id: TabId; label: string; groups: string[] }[] = [
  * busts the React Query cache for both the sidebar and this page so
  * the disabled module disappears in real time.
  *
- * Default policy on a fresh install is everything-on so admins
- * discover what exists. New features added in upgrades default
- * enabled too — operators turn them off after the fact if they
- * don't want them. Off-prem / secret-touching modules can override
- * by declaring ``default_enabled=False`` in the backend catalog
- * (the integrations all do).
+ * Default policy on a fresh install (#1069): a module ships ON only
+ * if it is core IPAM / DNS / DHCP workflow, a zero-footprint UI
+ * convenience, or a hand-invoked read-only diagnostic — 14 of 53
+ * today. Everything else ships OFF and is turned on when wanted.
+ * This page IS the discovery surface: it lists every module with its
+ * description whether or not it is enabled, which is why the sidebar
+ * no longer has to. The shipped value lives in the backend catalog
+ * (``default_enabled`` in app/services/feature_modules.py).
+ *
+ * A row whose current state differs from its default is marked, so an
+ * operator can see at a glance what they have changed.
  *
  * Layout: compact two-column grid — module identity on the left,
  * toggle on the right. Bottom padding leaves room for the floating

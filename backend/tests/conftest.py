@@ -83,6 +83,7 @@ _TEST_DATABASE_URL = _per_worker_url(_BASE_TEST_DATABASE_URL, _WORKER)
 os.environ["DATABASE_URL"] = _TEST_DATABASE_URL
 
 import asyncpg  # noqa: E402  — must follow the DATABASE_URL override above
+import pytest  # noqa: E402
 import pytest_asyncio  # noqa: E402
 from httpx import ASGITransport, AsyncClient  # noqa: E402
 from sqlalchemy import text  # noqa: E402
@@ -187,6 +188,43 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
     feature_modules.invalidate_cache()
     tld_registry.invalidate_effective_cache()
     cluster_health.invalidate_probe_cache()
+
+
+@pytest.fixture(autouse=True)
+def _all_feature_modules_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Treat every catalog module as default-ENABLED for the suite.
+
+    Which modules ship on is a product decision, revised in #1069 from 37
+    of 53 to 14. The test suite must not encode it: a test DB is built by
+    ``create_all`` and so carries no ``feature_module`` rows at all, which
+    means every module-gated router would answer 404 for whichever set
+    happened to be off that release — and the next revision would be
+    another sweep through two dozen test files adding enable fixtures.
+
+    So the catalog's DEFAULTS are patched, not the table. A DB row still
+    wins over the default, so the tests that deliberately exercise the
+    gate keep working unchanged, in both directions:
+
+        db.add(FeatureModule(id="governance.approvals", enabled=False))
+
+    is still a disabled module here. A test that wants a module off must
+    say so with a row like that rather than leaning on the shipped
+    default — leaning on it is what made the default invisible.
+
+    The shipped values themselves are pinned by
+    ``test_feature_module_defaults.py``, which reads the catalog source
+    rather than importing it, so this patch cannot mask a wrong default.
+    """
+    import dataclasses
+
+    from app.services import feature_modules as fm
+
+    patched = tuple(dataclasses.replace(m, default_enabled=True) for m in fm.MODULES)
+    monkeypatch.setattr(fm, "MODULES", patched)
+    # MODULES_BY_ID is derived at import, so patching only MODULES would leave
+    # the two disagreeing about default_enabled: the list endpoint reads
+    # MODULES, the toggle endpoint reads MODULES_BY_ID.
+    monkeypatch.setattr(fm, "MODULES_BY_ID", {m.id: m for m in patched})
 
 
 @pytest_asyncio.fixture(autouse=True)

@@ -1,14 +1,15 @@
 """Feature-module toggles — operator-controlled visibility for whole
 sidebar/REST/MCP surfaces.
 
-Default-enabled-on-install is the product policy (admins discover what
-exists before they decide to disable it). Off-prem / secret-touching
-modules can override that by seeding ``enabled=False`` in the migration.
+A row here means ONE thing: an operator changed this module's state.
+The shipped default lives in the catalog
+(``app.services.feature_modules.MODULES``) and nowhere else, so a module
+with no row resolves to its ``default_enabled``. Migrations no longer
+seed rows — they used to, which made the catalog default unreachable on
+every install and is what #1069 had to undo.
 
-The catalog of known module ids lives in
-``app.services.feature_modules.MODULES`` — the table only stores the
-operator's per-module override; unknown ids in the table are tolerated
-(forward-compat with downgrades) but never gate anything.
+Unknown ids in the table are tolerated (forward-compat with downgrades)
+but never gate anything.
 """
 
 from __future__ import annotations
@@ -30,7 +31,8 @@ class FeatureModule(Base):
     ``id`` is a stable dotted name (e.g. ``network.customer``,
     ``ai.copilot``). The catalog is hardcoded in
     ``app.services.feature_modules`` so a new feature is added in one
-    place and seeds its row via Alembic.
+    place; the row is created lazily, the first time an operator
+    toggles that module.
     """
 
     __tablename__ = "feature_module"

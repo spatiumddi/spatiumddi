@@ -648,7 +648,7 @@ Full firewall rule authoring / reordering (OPNsense alias membership + PAN-OS DA
 
 ## Firewall block-list feeds (#606)
 
-The **feed inversion** — the credential-free enforcement path. Instead of SpatiumDDI holding write credentials and pushing to the device (the #601 model above), the device polls a SpatiumDDI-hosted URL and applies whatever it returns. Feature module `security.firewall_feeds`, **default-ON** (discovery only — no feed serves anything until an operator creates one).
+The **feed inversion** — the credential-free enforcement path. Instead of SpatiumDDI holding write credentials and pushing to the device (the #601 model above), the device polls a SpatiumDDI-hosted URL and applies whatever it returns. Feature module `security.firewall_feeds`, which ships **disabled** ([#1069](https://github.com/spatiumddi/spatiumddi/issues/1069)) — it is an enforcement surface, and it pairs with Active block sync, which has always been off. Even enabled, no feed serves anything until an operator creates one.
 
 A `FirewallFeed` row exposes `GET /api/v1/firewall-feeds/feeds/{id}/blocklist.txt` — an **unauthenticated** (session-less) endpoint authed purely by a per-feed token (`?token=` or `Authorization: Bearer`). It renders the active `NetworkBlock` set of the feed's kind (`ip` today) as plain text, one IP/CIDR per line — the same desired-state intent the #601 push reconcilers converge, fed by rogue-DHCP (#370), new-device watch (#459), and manual entries. The token is Fernet-encrypted at rest, shown once on create, revealed again through a password-confirmed endpoint, and rotatable (invalidating the old URL). Each poll stamps `last_polled_at` / `last_polled_ip` / `poll_count` so operators can confirm a firewall is actually consuming the feed.
 
