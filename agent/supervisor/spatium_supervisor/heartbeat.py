@@ -1128,11 +1128,15 @@ def heartbeat_once(
         # tick are handed in as authoritative (the Node DELETE is
         # milliseconds old and the name can still be listed), so a
         # replica's claim goes on the eviction tick itself.
-        global _stranded_pending
         pg = k8s_api.reclaim_stranded_postgres_storage(
             evicted_nodes=set(evicted_now) | _stranded_pending
         )
-        _stranded_pending = _carry_stranded(_stranded_pending, evicted_now, pg)
+        # Mutated in place rather than rebound: the module-level set is the
+        # state, and a ``global`` rebinding reads as a never-read assignment
+        # to a static analyser (it is read on the next tick).
+        owed = _carry_stranded(_stranded_pending, evicted_now, pg)
+        _stranded_pending.clear()
+        _stranded_pending.update(owed)
         pg_reclaimed, pg_deferred, pg_err = pg.reclaimed, pg.deferred, pg.error
         if pg_reclaimed:
             log.info(
