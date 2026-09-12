@@ -168,8 +168,14 @@ def run(cfg: AgentConfig) -> int:
                     )
                     waiting_since = None
             elif driver.daemon_launched():
-                log.error("dns_daemon_exited", driver=cfg.driver)
-                return 2
+                # The stop check above closes the 1 s sleep, not the checks
+                # themselves: ``_sig`` runs between bytecodes, so a SIGTERM
+                # that lands inside ``daemon_running()`` (a rollout that took
+                # named first) arrives here with the daemon gone and the stop
+                # already requested. A stop is a stop, whenever it lands.
+                if not stopping.is_set():
+                    log.error("dns_daemon_exited", driver=cfg.driver)
+                    return 2
             elif waiting_since is None:
                 waiting_since = time.monotonic()
                 log.info(
@@ -183,7 +189,7 @@ def run(cfg: AgentConfig) -> int:
         # orchestrator restarts us — bootstrap then re-registers from
         # PSK with a fresh empty token cache.
         dead = [t.name for t in threads if not t.is_alive()]
-        if dead:
+        if dead and not stopping.is_set():
             log.error("dns_agent_thread_died", threads=dead)
             return 2
 

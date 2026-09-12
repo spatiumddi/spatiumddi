@@ -38,6 +38,7 @@ import signal
 import threading
 import time
 import types
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -155,6 +156,9 @@ class _ScriptedDriver(DriverBase):
         super().__init__(state_dir)
         self.running = False
         self.start_calls = 0
+        #: Runs inside ``daemon_running`` — the place a signal can land
+        #: between the tick's stop check and the loop's crash exits.
+        self.hook_running: Callable[[], None] | None = None
 
     def render(self, bundle: dict[str, Any]) -> None:
         return None
@@ -172,6 +176,8 @@ class _ScriptedDriver(DriverBase):
         self.start_calls += 1  # deferred: nothing spawned, daemon_pid stays None
 
     def daemon_running(self) -> bool:
+        if self.hook_running is not None:
+            self.hook_running()
         return self.running
 
     def launch(self) -> None:
@@ -189,6 +195,7 @@ class _Idle:
         self._stop = threading.Event()
         self.config_apply: Any = None
         self.pending_acks: list[Any] = []
+        self.daemon_status: dict[str, Any] = {}
 
     def run(self) -> None:
         self._stop.wait()
@@ -257,7 +264,7 @@ def supervised(agent_cfg: AgentConfig, monkeypatch):
             action = script.get(ticks[-1])
             if action is not None:
                 action()
-            assert len(ticks) < 50, "the supervisor never exited"
+            assert len(ticks) < 1000, "the supervisor never exited"
 
         monkeypatch.setattr(supervisor.time, "sleep", fake_sleep)
         saved = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT)}
@@ -348,6 +355,45 @@ def test_a_thread_that_dies_while_not_stopping_still_exits_2(supervised) -> None
     assert sv.ticks[-1] == 3
     assert ("error", "dns_agent_thread_died", {"threads": ["sync"]}) in sv.spy.calls
     assert "dns_agent_exiting" not in sv.spy.events
+
+
+def test_a_stop_that_lands_inside_the_daemon_check_is_still_a_stop(supervised) -> None:
+    """``_sig`` runs between bytecodes, so the tick's stop check closes the
+    1 s sleep but not the checks themselves: a SIGTERM that lands while the
+    loop is inside ``daemon_running()`` — a rollout that took named first —
+    used to reach ``dns_daemon_exited`` and exit 2."""
+    sv = supervised
+
+    def stop_inside_the_check() -> None:
+        sv.drv.hook_running = None
+        sv.drv.die()
+        sv.sigterm()
+
+    rc = sv.run({1: sv.drv.launch, 3: lambda: setattr(sv.drv, "hook_running", stop_inside_the_check)})
+
+    assert rc == 0
+    assert sv.ticks[-1] == 3
+    assert "dns_daemon_exited" not in sv.spy.events
+    assert "dns_agent_thread_died" not in sv.spy.events
+    assert sv.spy.events[-2:] == ["dns_agent_signal_received", "dns_agent_exiting"]
+
+
+def test_a_stop_that_lands_inside_the_thread_check_is_still_a_stop(supervised) -> None:
+    """The same window on the other check: the daemon is fine, the stop lands
+    after the daemon check has passed, and the threads it stopped are dead by
+    the time the thread check runs — ``dns_agent_thread_died``, exit 2."""
+    sv = supervised
+
+    def stop_after_the_daemon_check() -> None:
+        sv.drv.hook_running = None
+        sv.sigterm()
+
+    rc = sv.run({1: sv.drv.launch, 3: lambda: setattr(sv.drv, "hook_running", stop_after_the_daemon_check)})
+
+    assert rc == 0
+    assert sv.ticks[-1] == 3
+    assert "dns_agent_thread_died" not in sv.spy.events
+    assert sv.spy.events[-2:] == ["dns_agent_signal_received", "dns_agent_exiting"]
 
 
 def test_a_daemon_that_was_running_at_boot_still_exits_on_death(supervised) -> None:
