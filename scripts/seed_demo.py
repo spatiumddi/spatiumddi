@@ -1782,6 +1782,7 @@ def seed_webhook(a: Api):
 # module-gated adds its id here, or its data silently never appears.
 DEMO_MODULES = (
     "network.asn",
+    "network.device",
     "network.customer",
     "network.provider",
     "network.service",

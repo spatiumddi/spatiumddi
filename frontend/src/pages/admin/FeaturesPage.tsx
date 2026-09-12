@@ -28,23 +28,22 @@ const APPROVALS_MODULE_ID = "governance.approvals";
 const headerCls =
   "flex shrink-0 items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50";
 
-// Tab → which catalog ``group`` values land on it. Each tab gets its
-// own React Query refetch but shares the underlying cache. New tabs
-// drop in here when we add module groups (e.g. "compliance" graduates
-// to its own tab once the alert rules + audit-tamper-detection items
-// land).
+// Two tabs: Integrations, and everything else.
+//
+// The split is derived from the catalog, NOT from a hardcoded list of
+// group names. It used to be a list, and it silently fell behind: the
+// catalog grew DNS, DHCP, IPAM, Appliance and UI groups, none of which
+// were named on either tab, so six modules — both DNS toggles, DHCP
+// import, NetBox import, Fleet Firewall and Saved views — rendered on
+// neither tab and were untoggleable anywhere in the product. That is
+// load-bearing now: #1069 hides most modules from the sidebar on the
+// argument that THIS page lists every one of them, so a group that can
+// go missing here falsifies the argument. Derived, it cannot.
 type TabId = "features" | "integrations";
-const TABS: { id: TabId; label: string; groups: string[] }[] = [
-  {
-    id: "features",
-    label: "Features",
-    groups: ["Network", "AI", "Compliance", "Security", "Tools"],
-  },
-  {
-    id: "integrations",
-    label: "Integrations",
-    groups: ["Integrations"],
-  },
+const INTEGRATIONS_GROUP = "Integrations";
+const TABS: { id: TabId; label: string }[] = [
+  { id: "features", label: "Features" },
+  { id: "integrations", label: "Integrations" },
 ];
 
 /** Settings → Features.
@@ -145,21 +144,28 @@ export function FeaturesPage() {
     toggleMutation.mutate({ id: m.id, enabled: next });
   };
 
-  const activeTabDef = TABS.find((t) => t.id === activeTab) ?? TABS[0];
   const grouped = useMemo(() => {
     if (!data) return [] as [string, FeatureModuleEntry[]][];
-    const visible = data.filter((m) => activeTabDef.groups.includes(m.group));
+    const visible = data.filter((m) =>
+      activeTab === "integrations"
+        ? m.group === INTEGRATIONS_GROUP
+        : m.group !== INTEGRATIONS_GROUP,
+    );
+    // Group order follows the catalog's own order (the API returns
+    // MODULES order), rather than alphabetical or a list kept here that
+    // could disagree with it. Every group the catalog defines gets a
+    // section, so nothing can be dropped by omission.
     const buckets: Record<string, FeatureModuleEntry[]> = {};
+    const order: string[] = [];
     for (const m of visible) {
-      (buckets[m.group] ??= []).push(m);
+      if (!buckets[m.group]) {
+        buckets[m.group] = [];
+        order.push(m.group);
+      }
+      buckets[m.group].push(m);
     }
-    // Stable per-tab group order: follow the order declared in
-    // ``activeTabDef.groups`` rather than alphabetical, so the
-    // Features tab reads Network → AI → Compliance → Tools.
-    return activeTabDef.groups
-      .filter((g) => buckets[g])
-      .map((g) => [g, buckets[g]] as [string, FeatureModuleEntry[]]);
-  }, [data, activeTabDef]);
+    return order.map((g) => [g, buckets[g]] as [string, FeatureModuleEntry[]]);
+  }, [data, activeTab]);
 
   const enabledCount = data?.filter((m) => m.enabled).length ?? 0;
   const totalCount = data?.length ?? 0;

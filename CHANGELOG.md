@@ -722,13 +722,48 @@ the formatter handles the rest.
   upgrade does. Flipping a default in the catalog would have changed
   nothing at all. A row now means one thing, "an operator changed
   this"; migrations no longer seed one; and the new migration deletes
-  the pristine historical seeds **on a fresh install only**, detected
-  as the `user` table being empty, which on a fresh install is exactly
-  "the application has never started" because the default admin is
-  created at API startup, after `alembic upgrade`. Its downgrade is a
-  genuine no-op rather than a stub: the old code carries the old
-  catalog, whose defaults were true, so an absent row resolves to the
-  old behaviour on its own.
+  the pristine historical seeds **on a fresh install only**. Its
+  downgrade is a genuine no-op rather than a stub: the old code carries
+  the old catalog, whose defaults were true, so an absent row resolves
+  to the old behaviour on its own.
+
+  **"Fresh" is `audit_log` being empty, not the `user` table.** The
+  obvious test is "no users yet", and it is wrong in the direction that
+  fails silently: the API seeds the default admin at lifespan start,
+  and on Compose the `api` service waited only for postgres and redis,
+  so on a cold `docker compose up -d` it could insert that admin while
+  the 291 revisions were still running. The row count would be 1, the
+  migration would call the install an upgrade, skip, and #1069 would
+  quietly do nothing on exactly the installs it is aimed at.
+  Non-negotiable #4 puts an audit row behind every mutation, and
+  logging in writes one, while nothing on the startup path does — so a
+  racing API
+  cannot manufacture the evidence, and an empty table means nobody has
+  configured anything worth preserving. Proven on a real database in
+  three shapes: a clean fresh install clears all 51 seed rows, an
+  install with 1,033 audit rows keeps all 51, and the race itself — one
+  user, zero audit rows — is still correctly treated as fresh.
+
+- **Compose waits for the schema, not just the database (#1069).** The
+  `api` and `worker` services now depend on `migrate` completing.
+  Without it the API could serve against a half-migrated schema, and
+  worse, `_seed_default_admin` runs at lifespan start and never
+  retries: if it lost the race badly enough that the `user` table did
+  not exist yet, it skipped silently and the install had no account
+  anyone could log in with. Kubernetes has had a wait-for-migrate init
+  container all along; this is Compose catching up. `beat` is left
+  alone — it only schedules, and its `depends_on` is the short list
+  form.
+
+- **Settings → Features lists every module again (#1069).** Its two
+  tabs were driven by a hardcoded list of catalog group names that had
+  fallen five groups behind, so both DNS toggles, DHCP import, NetBox
+  import, Fleet Firewall and Saved views rendered on neither tab and
+  were untoggleable anywhere in the product. The split is now derived
+  from the catalog — Integrations on one tab, everything else on the
+  other — so a new group cannot go missing by omission. That page is
+  load-bearing for the change above, which hides most modules from the
+  sidebar on the argument that this one lists all of them.
 
   Two guards keep it from drifting back. The first, in
   `tests/test_feature_module_defaults.py`, writes out the shipped
@@ -743,12 +778,12 @@ the formatter handles the rest.
   empty database leaves zero rows, so the catalog governs; the dev
   database with its 51 seeded rows keeps all 51.
 
-  `scripts/seed_demo.py` now enables the eight gated modules it
+  `scripts/seed_demo.py` now enables the nine gated modules it
   populates before it starts. It POSTs to routers the flip turns off,
   and its HTTP helper logs a failure and walks on — so left alone it
   would have printed a wall of 404s and produced a demo dataset with
-  no ASNs, customers, sites, circuits, services, overlays, multicast
-  groups or conformity policy in it.
+  no ASNs, customers, providers, circuits, services, overlays,
+  network devices, multicast groups or conformity policy in it.
 
 - **CI: a backend PR no longer waits 28 minutes on one test shard
   (#1019).** The eight `Backend — Tests` shards were split by test
