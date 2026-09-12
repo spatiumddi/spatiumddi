@@ -710,7 +710,6 @@ def _render_dnssec_policies(policies: list[dict[str, Any]]) -> str:
 
 class Bind9Driver(DriverBase):
     rendered_dir_name = "rendered"
-    daemon_pid: int | None = None
 
     # ── Render / validate / swap ────────────────────────────────────────────
 

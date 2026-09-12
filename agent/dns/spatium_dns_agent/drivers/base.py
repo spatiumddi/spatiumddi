@@ -26,6 +26,13 @@ RRSET_OP_KINDS = frozenset({"create", "update", "delete"})
 
 
 class DriverBase(ABC):
+    #: PID of the daemon this driver spawned or adopted; ``None`` until then.
+    #: Every driver sets it at its spawn / adopt points (``start_daemon`` and
+    #: the system-wide look-up in ``daemon_running``) and never clears it, so
+    #: it is also the "has the daemon been launched at all" fact that
+    #: :meth:`daemon_launched` reports.
+    daemon_pid: int | None = None
+
     def __init__(self, state_dir: Path):
         self.state_dir = state_dir
 
@@ -62,6 +69,21 @@ class DriverBase(ABC):
     @abstractmethod
     def daemon_running(self) -> bool:
         ...
+
+    def daemon_launched(self) -> bool:
+        """True once this driver has spawned or adopted its daemon.
+
+        ``start_daemon`` does not always start one: the BIND9 and PowerDNS
+        drivers return WITHOUT a daemon when no config has been rendered yet
+        (``named_conf_missing_startup_deferred`` /
+        ``pdns_conf_missing_startup_deferred``) and leave the launch to
+        ``swap_and_reload``, which the sync loop reaches once the control
+        plane hands over the first bundle. A daemon that was never launched
+        cannot have died, so the supervisor consults this before it reads
+        ``daemon_running() == False`` as "exit and let the orchestrator
+        restart us" (#1056).
+        """
+        return self.daemon_pid is not None
 
     def daemon_version(self) -> str | None:
         """Version of the DNS daemon binary, e.g. ``"5.0.5"`` / ``"9.20.26"``.

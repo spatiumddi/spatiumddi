@@ -615,7 +615,6 @@ def _record_params(rtype: str, value: str, rec: dict[str, Any]) -> dict[str, Any
 class TechnitiumDriver(DriverBase):
     """Technitium agent driver — v1."""
 
-    daemon_pid: int | None = None
 
     # ── Render / validate / swap ────────────────────────────────────────────
 

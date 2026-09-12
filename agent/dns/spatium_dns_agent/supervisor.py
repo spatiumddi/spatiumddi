@@ -28,6 +28,32 @@ from .sync import SyncLoop
 
 log = structlog.get_logger(__name__)
 
+#: What the heartbeat's ``daemon`` field carries while the daemon start is
+#: deferred (no bundle rendered yet, #1056). ``sync.py`` sets its own
+#: degraded verdicts on a failed apply and clears them after the next good
+#: poll; this one is set when the wait begins and cleared by the supervisor
+#: the moment the daemon is up — and only if it is still the supervisor's
+#: own, so a sync verdict set meanwhile is left alone.
+DEFERRED_DAEMON_STATUS: dict[str, str] = {
+    "status": "degraded",
+    "reason": "start deferred, no bundle yet",
+}
+
+
+def wait_log_due(ticks_waiting: int) -> bool:
+    """Whether the waiting state is logged on this tick (1 s each): the first
+    tick, then doubling to 32 s, then every minute. With the crash loop gone
+    this line is nearly the only signal a stuck agent produces, so it has to
+    be in a ``kubectl logs --tail`` an hour in — without a line a second."""
+    return ticks_waiting in (1, 2, 4, 8, 16, 32) or (
+        ticks_waiting >= 60 and ticks_waiting % 60 == 0
+    )
+
+
+def _clear_deferred_status(heartbeat) -> None:
+    if heartbeat.daemon_status.get("reason") == DEFERRED_DAEMON_STATUS["reason"]:
+        heartbeat.daemon_status = {"status": "ok"}
+
 
 def _select_driver(cfg: AgentConfig) -> DriverBase:
     if cfg.driver == "bind9":
@@ -129,18 +155,81 @@ def run(cfg: AgentConfig) -> int:
     # process (BIND9, PowerDNS, Technitium). If the daemon dies, we exit
     # non-zero so the orchestrator restarts the container — agent + daemon
     # are bound lifecycle-wise.
+    #
+    # "Dies" presumes it was launched. ``start_daemon()`` above returns
+    # WITHOUT a daemon when no config has been rendered yet (BIND9
+    # ``named_conf_missing_startup_deferred``, PowerDNS
+    # ``pdns_conf_missing_startup_deferred``) and the sync loop launches it
+    # from ``swap_and_reload`` once the first bundle lands. The first bind
+    # pod on a freshly joined cluster member always boots that way — its
+    # state dir is empty and the control plane has not built its bundle
+    # yet — and reading that deferred start as a death made this loop
+    # return 2 one tick after boot: kubelet then back-off-restarted the
+    # container until the bundle happened to arrive inside the 1 s window
+    # (#1056: ``dns_daemon_exited`` 1.0 s after the deferral, Last State
+    # exit 2, restart count +2 on a member). So: wait while nothing has
+    # been launched, exit only when a launched daemon is gone. The charts'
+    # liveness probes (tcp :53 — the appliance chart's, and the umbrella
+    # chart's since #1056) still bound the wait if no bundle ever comes.
     daemon_managed_drivers = {"bind9", "powerdns", "technitium"}
+    # The deferred wait can only ever begin here — ``daemon_launched()`` never
+    # goes back to False — so it is measured from the loop's start (a breath
+    # after ``start_daemon`` deferred), not from the tick that first noticed
+    # it: the re-log then reads 1, 2, 4, 8 … s, the schedule's own numbers.
+    loop_started = time.monotonic()
+    waiting = False
+    waiting_ticks = 0
     while not stopping.is_set():
         time.sleep(1.0)
-        if cfg.driver in daemon_managed_drivers and not driver.daemon_running():
-            log.error("dns_daemon_exited", driver=cfg.driver)
-            return 2
+        # A stop requested during the tick (SIGTERM / SIGINT: a DaemonSet
+        # rollout, a scale-down, an operator) has already stopped every
+        # worker thread through ``_sig`` and may have taken the daemon with
+        # it. Whatever the checks below would find dead now died because we
+        # were told to stop — take the designed exit, not the crash exits,
+        # so the container's last state reads 0 rather than "thread died"
+        # / "daemon exited" (#1056: every rollout ended the old container
+        # with exit 2 and a dns_agent_thread_died in its log).
+        if stopping.is_set():
+            break
+        if cfg.driver in daemon_managed_drivers:
+            if driver.daemon_running():
+                if waiting:
+                    log.info(
+                        "dns_daemon_launched_after_deferred_start",
+                        driver=cfg.driver,
+                        waited_s=round(time.monotonic() - loop_started, 1),
+                    )
+                    waiting = False
+                    waiting_ticks = 0
+                    _clear_deferred_status(heartbeat)
+            elif driver.daemon_launched():
+                # The stop check above closes the 1 s sleep, not the checks
+                # themselves: ``_sig`` runs between bytecodes, so a SIGTERM
+                # that lands inside ``daemon_running()`` (a rollout that took
+                # named first) arrives here with the daemon gone and the stop
+                # already requested. A stop is a stop, whenever it lands.
+                if not stopping.is_set():
+                    log.error("dns_daemon_exited", driver=cfg.driver)
+                    return 2
+            else:
+                if not waiting:
+                    waiting = True
+                    heartbeat.daemon_status = dict(DEFERRED_DAEMON_STATUS)
+                waiting_ticks += 1
+                if wait_log_due(waiting_ticks):
+                    log.info(
+                        "dns_daemon_start_deferred_waiting",
+                        driver=cfg.driver,
+                        waited_s=round(time.monotonic() - loop_started, 1),
+                        note="start_daemon spawned nothing (no rendered config yet); "
+                        "the sync loop launches the daemon after the first bundle",
+                    )
         # If any critical thread died (e.g. the sync loop dropped its
         # token after a 401/404 and self-stopped), exit so the container
         # orchestrator restarts us — bootstrap then re-registers from
         # PSK with a fresh empty token cache.
         dead = [t.name for t in threads if not t.is_alive()]
-        if dead:
+        if dead and not stopping.is_set():
             log.error("dns_agent_thread_died", threads=dead)
             return 2
 
