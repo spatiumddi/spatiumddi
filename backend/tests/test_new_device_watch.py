@@ -57,6 +57,20 @@ async def _enable_watch(db: AsyncSession) -> None:
     feature_modules.invalidate_cache()
 
 
+async def _disable_watch(db: AsyncSession) -> None:
+    """Turn the module OFF with a row, not by leaning on the shipped default.
+
+    The suite patches every catalog default to enabled (see the
+    ``_all_feature_modules_enabled`` fixture in conftest), because which
+    modules ship on is a product decision #1069 revised and the tests must
+    not encode it. A row still beats the default, so this is how a test
+    says "off" and keeps saying it through the next revision.
+    """
+    db.add(FeatureModule(id="security.new_device_watch", enabled=False))
+    await db.flush()
+    feature_modules.invalidate_cache()
+
+
 async def _make_subnet(db: AsyncSession) -> Subnet:
     space = IPSpace(name=f"nd-{uuid.uuid4().hex[:6]}", description="")
     db.add(space)
@@ -399,7 +413,8 @@ async def test_lease_event_no_sighting_when_module_off(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     server, _subnet = await _seed_dhcp(db_session)
-    await db_session.commit()  # module NOT enabled
+    await _disable_watch(db_session)
+    await db_session.commit()
 
     app.dependency_overrides[_auth_agent] = lambda: (server, {})
     try:
@@ -490,7 +505,8 @@ async def test_mac_sightings_noop_when_module_off(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     server, _subnet = await _seed_dhcp(db_session)
-    await db_session.commit()  # module NOT enabled
+    await _disable_watch(db_session)
+    await db_session.commit()
     app.dependency_overrides[_auth_agent] = lambda: (server, {})
     try:
         resp = await client.post(

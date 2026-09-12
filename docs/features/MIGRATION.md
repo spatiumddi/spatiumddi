@@ -309,8 +309,13 @@ pools or records. Its only writes are TTL reductions on a zone
 SpatiumDDI already owns, reservations synthesised from live Windows
 leases, and the `is_active` flag on a managed scope.
 
-Behind the **default-on** `migration.cutover` feature module (Settings
-→ Features, group **Tools**); router at `/api/v1/migration/cutover`,
+Behind the `migration.cutover` feature module, which ships **disabled**
+(Settings → Features, group **Tools**) — unlike the three importers, which
+stay on because a fresh install is exactly when an estate gets imported. A
+cutover is the far end of that journey: it happens after a parity check and a
+parallel run, only on installs leaving Windows
+([#1069](https://github.com/spatiumddi/spatiumddi/issues/1069)). Router at
+`/api/v1/migration/cutover`,
 **superadmin on every endpoint**. That matches the three importers, on
 the grounds that a cutover is strictly more dangerous than an import —
 inventing a grantable permission for it would be a *weaker* posture

@@ -114,6 +114,16 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      # Wait for the SCHEMA, not just the database. Without this the API
+      # can start while ``alembic upgrade head`` is still running: it
+      # serves against a half-migrated schema, and ``_seed_default_admin``
+      # runs at lifespan start, so it either creates the admin against a
+      # partly-built database or — if ``user`` does not exist yet — skips
+      # silently and never retries, leaving an install nobody can log
+      # into. The Kubernetes path has had a wait-for-migrate init
+      # container all along; this is compose catching up (#1069).
+      migrate:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live')\""]
       interval: 30s
@@ -154,6 +164,16 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      # Wait for the SCHEMA, not just the database. Without this the API
+      # can start while ``alembic upgrade head`` is still running: it
+      # serves against a half-migrated schema, and ``_seed_default_admin``
+      # runs at lifespan start, so it either creates the admin against a
+      # partly-built database or — if ``user`` does not exist yet — skips
+      # silently and never retries, leaving an install nobody can log
+      # into. The Kubernetes path has had a wait-for-migrate init
+      # container all along; this is compose catching up (#1069).
+      migrate:
+        condition: service_completed_successfully
     # The backend Dockerfile's HEALTHCHECK probes /health/live — correct
     # for the api service but wrong for the worker (no HTTP listener).
     # Override with a Celery-native ping over the broker.

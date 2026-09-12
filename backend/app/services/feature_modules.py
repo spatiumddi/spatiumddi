@@ -5,11 +5,25 @@ The catalog is the source of truth for *which modules exist*. The
 unknown rows in the table are tolerated (forward-compat with
 downgrades) but never gate anything.
 
-Default policy:
-    Default-enabled-on-install. Operators can't disable what they don't
-    know exists. Off-prem / secret-touching modules override this by
-    declaring ``default_enabled=False`` here — the migration seeds a
-    matching row.
+Default policy (#1069):
+    A module ships ENABLED only if it is part of the core IPAM / DNS /
+    DHCP workflow, a zero-footprint UI convenience, or a read-only
+    diagnostic the operator invokes by hand. Everything else ships
+    DISABLED — a domain-specific registry most installs will never
+    populate, anything that emits traffic or writes to infrastructure
+    once armed, anything that calls off-prem, and the Windows cutover.
+    Day-one importers are the deliberate exception to that last clause:
+    a fresh install is exactly when an estate gets imported.
+
+    This replaced "default-on so operators discover what exists", which
+    had put 37 of 53 modules in a new operator's sidebar — BACnet, DICOM,
+    OT zoning, E911 and a BGP looking glass among them. Discovery is
+    served by Settings → Features, which lists every module with its
+    description whether or not it is on.
+
+    The shipped value of every module is pinned by
+    ``tests/test_feature_module_defaults.py``, so changing one is a
+    deliberate edit in two places rather than a default nobody noticed.
 
 When a route gate (``require_module``) fails it raises 404, not 403:
     a disabled module is "not present" from the API surface's
@@ -51,25 +65,41 @@ class ModuleSpec:
     default_enabled: bool = True
 
 
-# Stable dotted-name ids. New modules append here AND seed a row in a
-# migration (the seed value should match ``default_enabled``).
+# Stable dotted-name ids. A new module appends here and does NOT seed a
+# row: the catalog's ``default_enabled`` IS the default, and a
+# ``feature_module`` row means "an operator changed this" (#1069). The
+# historical seeds are why flipping a default here used to do nothing —
+# a row always wins over the catalog, and a fresh install ran the same
+# seed migrations an upgrade did.
 #
-# Groups drive UI placement on Settings → Features. Three buckets so
-# far — keep this list small; we collapse fine sub-groups into broader
-# headings on the page.
+# Groups drive UI placement on Settings → Features (11 today:
+# Network, AI, Compliance, Tools, DNS, DHCP, IPAM, Integrations, Appliance, Security, UI).
+# Keep the list short — the page collapses fine sub-groups into broader
+# headings, and a group per feature would defeat that.
 MODULES: Final[tuple[ModuleSpec, ...]] = (
     # Network — everything under the sidebar's "Network" section.
+    #
+    # Of these, only Sites, VLANs, VRFs and Address sets ship ON (#1069):
+    # they are the dimensions an ordinary IPAM install uses on day one, and
+    # three of the four are referenced straight off a subnet. The rest are
+    # service-provider / MSP modelling (Customers, Providers, Services,
+    # Circuits, Overlays, ASNs) or a registry that only means something once
+    # the operator populates it (Network devices, Multicast, and the four
+    # verticals below) — real features that most installs never open, and
+    # that cost a sidebar row each until someone asks for them.
     ModuleSpec(
         id="network.customer",
         label="Customers",
         group="Network",
         description="Customer ownership records — operator-facing entity attached to IPAM/DNS/DHCP/Network rows.",
+        default_enabled=False,
     ),
     ModuleSpec(
         id="network.provider",
         label="Providers",
         group="Network",
         description="Carrier/upstream provider records, used as RESTRICT FK on circuits.",
+        default_enabled=False,
     ),
     ModuleSpec(
         id="network.site",
@@ -82,30 +112,35 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         label="Services",
         group="Network",
         description="Service catalog (MPLS L3VPN, SD-WAN, …) bound to underlying VRFs / subnets / circuits.",
+        default_enabled=False,
     ),
     ModuleSpec(
         id="network.asn",
         label="ASNs",
         group="Network",
         description="Autonomous-system records with RDAP holder + RPKI ROA enrichment.",
+        default_enabled=False,
     ),
     ModuleSpec(
         id="network.circuit",
         label="Circuits",
         group="Network",
         description="WAN circuits — carrier-supplied logical pipes between sites/providers.",
+        default_enabled=False,
     ),
     ModuleSpec(
         id="network.device",
         label="Network devices",
         group="Network",
         description="Routers/switches discovered via SNMP polling and their ARP/FDB/interface tables.",
+        default_enabled=False,
     ),
     ModuleSpec(
         id="network.overlay",
         label="Overlays",
         group="Network",
         description="SD-WAN overlay topology — sites + circuits + routing policies.",
+        default_enabled=False,
     ),
     ModuleSpec(
         id="network.vlan",
@@ -124,24 +159,29 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         label="Multicast groups",
         group="Network",
         description="Multicast group registry — addresses + producer/consumer memberships for SMPTE 2110 / Dante / NDI / market-data deployments. Niche but high-value when operators need it.",
+        default_enabled=False,
     ),
-    # Vertical-awareness modules (#543). All three are registry-only in
-    # phase 1 — no probes, no device I/O, no off-prem calls — so they are
-    # default-ENABLED for discovery (non-negotiable #13/#14): an operator
-    # can't turn on what they never knew shipped, and there is nothing to
-    # blast-radius here. AV rides the existing multicast plane; BACnet and
-    # OT enrich existing IPAM addresses.
+    # Vertical-awareness modules (#543 / #723). Registry-only — no probes,
+    # no device I/O, no off-prem calls — so nothing here is dangerous ON.
+    # They are default-OFF (#1069) for a different reason: each one is a
+    # domain-specific registry that a site either runs its whole network
+    # around or will never open once. A hospital wants DICOM; nobody else
+    # wants five extra sidebar entries. Turning one on costs one click and
+    # arms nothing, and each is listed with its description on
+    # Settings → Features whether or not it is on.
     ModuleSpec(
         id="network.av",
         label="AV over IP",
         group="Network",
         description="Audio/video-over-IP descriptors on top of the multicast registry — Dante / AES67 / SMPTE ST 2110 / NDI / RAVENNA flow labels, PTP clock domain, and operator-declared reserved ranges so allocations can be checked against the studio address plan. Registry only; no media monitoring, no NMOS connection control.",
+        default_enabled=False,
     ),
     ModuleSpec(
         id="network.bacnet",
         label="BACnet/IP devices",
         group="Network",
         description="Building-automation device registry — internetwork-unique device instance numbers, BACnet network numbers, and per-subnet BBMD designation, each attached to an existing IPAM address. Documents the BACnet topology (including the exactly-one-BBMD-per-subnet rule); never reads or writes device objects.",
+        default_enabled=False,
     ),
     ModuleSpec(
         id="network.e911",
@@ -157,30 +197,34 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
             "upload and no PSAP interaction, and it never asserts an address is valid "
             "on its own say-so."
         ),
+        default_enabled=False,
     ),
     ModuleSpec(
         id="network.dicom",
         label="DICOM AE registry",
         group="Network",
         description="Medical-imaging Application Entity registry — the institution-wide-unique AE Titles that PS3.15 Annex H specifies a registry for and that in practice live in a spreadsheet, plus the configured AE→AE association map behind 'what breaks if I renumber this host'. Network identity only: no patient data, ever, and no DICOM traffic is read or generated.",
+        default_enabled=False,
     ),
     ModuleSpec(
         id="network.ot",
         label="OT / industrial devices",
         group="Network",
         description="Industrial device descriptors and Purdue-level zoning for OT networks — PROFINET / EtherNet-IP / Modbus TCP / OPC UA role + vendor + criticality per address, per-subnet zone records, and CSV import of engineering-tool exports. Read-only identification: no tag reads, no control-protocol writes, ever.",
+        default_enabled=False,
     ),
     # BGP Looking Glass (#566) — a receive-only GoBGP collector peers with the
     # operator's routers and mirrors the live Adj-RIB-In, linking every learned
-    # prefix / origin ASN / community back into IPAM. Default-ENABLED for
-    # discovery: the Sessions/Routes surface appears, but the collector does
-    # NOTHING until an operator configures a peer (the only secret is the
-    # Fernet-encrypted MD5 password). Receive-only — never advertises.
+    # prefix / origin ASN / community back into IPAM. Default-OFF (#1069):
+    # it is inert until an operator configures a BGP peer, and an install
+    # with no routers to peer with will never configure one. Receive-only —
+    # never advertises.
     ModuleSpec(
         id="network.looking_glass",
         label="BGP Looking Glass",
         group="Network",
         description="Receive-only BGP collector that peers with your routers and surfaces the live routing table — every learned prefix, origin ASN and community linked back into IPAM / the ASN + community catalogs, RPKI-validated. Never advertises routes to your network. Discovery toggle only; the collector does nothing until you configure a peer.",
+        default_enabled=False,
     ),
     ModuleSpec(
         id="ipam.address_sets",
@@ -189,16 +233,18 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         description="Named IP ranges within a subnet carrying their own RBAC scope, so edit of a slice (e.g. .50–.99) can be delegated without subnet-wide write.",
     ),
     # IPv6 Router Advertisements — radvd management + rogue-RA detection
-    # (issue #524). Default-enabled for discovery: the per-scope RA config
-    # editor + the observed-router view appear. Emitting RAs still requires
-    # the operator to opt a scope in (ra_enabled) AND run radvd on the agent
-    # (RADVD_MANAGED=1); the passive rogue-RA sniffer is separately gated on
-    # DHCP_RA_SNIFFER_ENABLED + CAP_NET_RAW.
+    # (issue #524). Default-OFF (#1069): this is the one DHCP-adjacent
+    # surface that ends in something being transmitted onto the wire, and a
+    # v4-only install — still the common case — has no use for it. Emitting
+    # RAs additionally requires opting a scope in (ra_enabled) AND radvd on
+    # the agent (RADVD_MANAGED=1); the passive rogue-RA sniffer is separately
+    # gated on DHCP_RA_SNIFFER_ENABLED + CAP_NET_RAW.
     ModuleSpec(
         id="ipv6.router_advertisements",
         label="IPv6 Router Advertisements",
         group="Network",
         description="Manage IPv6 Router Advertisements (radvd) per subnet — M/O flags derived from the DHCPv6 mode, RDNSS/DNSSL from DNS settings, prefix + router lifetimes — plus passive rogue-RA detection with an expected-router allowlist and a rogue_ra alert. Discovery toggle only; emitting RAs needs a per-scope opt-in and radvd on the DHCP agent, and the sniffer needs DHCP_RA_SNIFFER_ENABLED.",
+        default_enabled=False,
     ),
     # AI — operator copilot, gated as a whole.
     ModuleSpec(
@@ -207,12 +253,18 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         group="AI",
         description="Multi-vendor LLM chat + MCP tool surface. Disabling hides the chat drawer and 404s /ai endpoints.",
     ),
-    # Compliance / observability extras.
+    # Compliance / observability extras. Conformity is default-OFF (#1069):
+    # it is a rules engine an operator opts into, and its builtin policies
+    # seed ``enabled=False``, so the 60 s evaluator finds nothing due and the
+    # module being off leaves no background work running invisibly. Top-N
+    # reports stay ON — read-only aggregates over data the install already
+    # has, with no footprint of their own.
     ModuleSpec(
         id="compliance.conformity",
         label="Conformity evaluations",
         group="Compliance",
         description="Declarative compliance checks + PDF export. Auditor / Compliance Editor builtin roles depend on it.",
+        default_enabled=False,
     ),
     ModuleSpec(
         id="reports.top_n",
@@ -220,12 +272,18 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         group="Compliance",
         description="Fixed Top-N reports (subnet utilization, owner IP counts, most-modified resources, noisiest DNS clients) derived from existing tables.",
     ),
-    # Tools.
+    # Tools. ``tools.network`` (ping / traceroute / dig / port test) stays ON:
+    # it is the everyday read-only diagnostic, invoked by hand, and it is the
+    # first thing reached for when something is broken. The other three are
+    # default-OFF (#1069) because each one puts something on the wire or on
+    # disk — a port scan that trips an IDS, a packet capture, a scheduled
+    # magic packet — and none is needed to run DNS, DHCP or IPAM.
     ModuleSpec(
         id="tools.nmap",
         label="Nmap scanning",
         group="Tools",
         description="On-demand nmap with live SSE output + history. Subnet/IP scan buttons hide when off.",
+        default_enabled=False,
     ),
     ModuleSpec(
         id="tools.network",
@@ -247,6 +305,7 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
             ".pcap, history with auto-retention. Captures raw traffic; high "
             "sensitivity (gated by the manage_packet_capture permission)."
         ),
+        default_enabled=False,
     ),
     ModuleSpec(
         id="tools.wake_scheduler",
@@ -258,15 +317,16 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
             "a server or appliance vantage, run history, and live target "
             "preview. Reuses the manual-wake send path; permission-gated."
         ),
+        default_enabled=False,
     ),
     # DNS — togglable extras under the Settings → Import surface and
     # the DNS sidebar group. The importer is one-shot (issue #128) —
     # operators upload BIND9 configs / live-pull from Windows DNS or
     # PowerDNS to seed SpatiumDDI with their existing zones, then the
-    # importer's job is done. Default-enabled because there's no
-    # blast radius from having the toggle on (importer endpoints are
-    # gated separately by RBAC); operators who want to hide the
-    # surface can flip it off.
+    # importer's job is done. Kept default-ON by #1069: a fresh install is
+    # exactly when an operator has an existing estate to load, so this is
+    # day-one workflow rather than clutter. No blast radius from the toggle
+    # either (importer endpoints are RBAC-gated separately).
     ModuleSpec(
         id="dns.import",
         label="DNS configuration import",
@@ -289,10 +349,9 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
     # DHCP — sister importer to ``dns.import`` (issue #129). One-shot
     # import of scopes / pools / reservations / classes from Kea JSON /
     # Windows DHCP live-pull / ISC dhcpd.conf so operators can seed a
-    # sandbox SpatiumDDI from their real DHCP estate. Same default-on
-    # rationale as the DNS importer: no blast radius from the toggle
-    # (endpoints are RBAC-gated separately), operators flip it off to
-    # hide the surface.
+    # sandbox SpatiumDDI from their real DHCP estate. Same default-ON
+    # rationale as the DNS importer (#1069): day-one workflow, and no blast
+    # radius from the toggle (endpoints are RBAC-gated separately).
     ModuleSpec(
         id="dhcp.import",
         label="DHCP configuration import",
@@ -305,9 +364,9 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
     # install and stamps them into native IPAM rows
     # (``import_source="netbox"``). One-shot migration tooling, NOT a
     # continuous reconciler (contrast the ``integrations.*`` mirrors).
-    # Default-enabled — same rationale as the DNS / DHCP importers: no
-    # blast radius from the toggle (endpoints are RBAC-gated + superadmin
-    # separately), operators flip it off to hide the surface.
+    # Default-ON — same rationale as the DNS / DHCP importers (#1069):
+    # day-one migration workflow, and no blast radius from the toggle
+    # (endpoints are RBAC-gated + superadmin separately).
     # Windows → SpatiumDDI cutover (issue #756). The one-shot importers get an
     # operator's Windows estate INTO SpatiumDDI; this is the rest of the
     # journey — parity verification, the parallel run, the per-zone/per-scope
@@ -318,15 +377,18 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
     # would be a lie about half the surface. "Tools" is where the operator
     # workflows live.
     #
-    # Default-enabled, same rationale as the three importers it extends: the
-    # surface is read-mostly and every mutating step behind it is separately
-    # superadmin-gated, so there is no blast radius from the toggle being on —
-    # and an operator cannot turn off what they never knew shipped.
+    # Default-OFF (#1069), unlike the three importers it extends. An importer
+    # is day-one work — a fresh install is exactly when an estate gets loaded,
+    # so hiding it would hide the path on the one day it is wanted. A cutover
+    # is the opposite end of the journey: it happens after a parity check and
+    # a parallel run, only on installs migrating off Windows, and every step
+    # of it is superadmin-only.
     ModuleSpec(
         id="migration.cutover",
         label="Windows cutover",
         group="Tools",
         description="Guided migration from Windows DNS / DHCP onto managed BIND9 / PowerDNS / Kea — parity verification, parallel-run shadow queries, per-zone and per-scope cutover with rollback, and the decommission checklist. Configuration → Import → Windows cutover; superadmin-only.",
+        default_enabled=False,
     ),
     ModuleSpec(
         id="ipam.import.netbox",
@@ -423,8 +485,14 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         default_enabled=False,
     ),
     # Appliance — the declarative fleet-firewall policy surface (#285
-    # Phase 3). Default-enabled for DISCOVERY/STAGING only: turning this
-    # module ON exposes the policy editor + preview but applies NOTHING.
+    # Phase 3). One of the few kept ON by #1069, and deliberately: on an
+    # appliance a per-role nftables policy is ALREADY filtering traffic
+    # (the supervisor renders it from role assignments regardless of this
+    # module), so turning the editor off would hide the only window onto a
+    # firewall that is running either way. Off-appliance the whole Appliance
+    # section is beside the point, not actively misleading.
+    # DISCOVERY/STAGING only: turning this module ON exposes the policy
+    # editor + preview but applies NOTHING.
     # Enforcement is a SEPARATE master switch (platform_settings.
     # firewall_enabled, default OFF) — flipping the module does not change
     # any node's firewall. The two gates are intentionally distinct so an
@@ -447,11 +515,18 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         group="Security",
         description="Embedded RFC 8555 ACME client that issues a CA-trusted Web UI TLS cert from Let's Encrypt, solving the DNS-01 challenge through SpatiumDDI's own managed DNS zones. Discovery toggle only — issuance is RBAC-gated and requires an explicit operator opt-in (Settings → acme_enabled).",
     ),
+    # Default-OFF (#1069): armed, this reaches out and opens TLS connections
+    # to endpoints on a schedule, and its discovery half can mint its own
+    # targets from DNS records. Both halves are additionally inert until an
+    # operator opts a zone / record in (``auto_tls_probe``) or adds a target
+    # by hand, so nothing runs on a fresh install either way — the module is
+    # off because a monitor that dials out is a posture, not a default.
     ModuleSpec(
         id="security.tls_certs",
         label="TLS certificate monitoring",
         group="Security",
         description="Watch external TLS endpoints for expiry / chain validity / SAN drift; auto-discover probe targets from DNS A/AAAA records; alert on approaching expiry, broken chains, unreachable endpoints, and unexpected cert changes. Read-only monitoring — distinct from the ACME client that issues the appliance's own cert.",
+        default_enabled=False,
     ),
     # Governance — change-gating + approval workflows. Default-off so
     # existing installs see zero behaviour change until opted in (#62).
@@ -533,9 +608,9 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         default_enabled=False,
     ),
     # Security — SpatiumDDI-hosted firewall block-list feeds (#606, the "feed
-    # inversion"). Default-ENABLED as a DISCOVERY toggle: the feeds admin page
-    # is visible so operators find the capability, but NO feed serves anything
-    # until an operator creates one (each feed is token-scoped + opt-in). This
+    # inversion"). Default-OFF (#1069): it is an enforcement surface, and it
+    # pairs with Active block sync, which has always been off. No feed serves
+    # anything until an operator creates one (each is token-scoped). This
     # is the credential-free enforcement path — a FortiGate External Threat
     # Feed / Cisco Security-Intelligence feed polls a SpatiumDDI URL instead of
     # SpatiumDDI holding write creds on the firewall.
@@ -544,17 +619,20 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         label="Firewall block-list feeds",
         group="Security",
         description="Serve the SpatiumDDI block set (the same IP/MAC intent the Active block sync module pushes) as token-scoped block-list URLs that feed-polling firewalls subscribe to — FortiGate External Threat Feed, Cisco Security Intelligence, Check Point IOC — so the firewall enforces with NO write credentials held by SpatiumDDI. Discovery toggle only: enabling this exposes the feeds page but serves nothing until you create a feed.",
+        default_enabled=False,
     ),
-    # Security — DNSBL / RBL reputation monitoring (#528). Default-ENABLED
-    # as a DISCOVERY toggle: the catalog + settings UI are visible so
-    # operators find the feature, but the module makes ZERO off-prem DNS
-    # queries until the operator flips the master ``dnsbl_monitoring_enabled``
-    # sweep switch AND enables at least one blocklist.
+    # Security — DNSBL / RBL reputation monitoring (#528). Default-OFF
+    # (#1069): armed, it queries public blocklist operators about the
+    # operator's own address space, which is an off-prem call they should
+    # choose. It additionally makes ZERO queries until the master
+    # ``dnsbl_monitoring_enabled`` sweep switch is on AND at least one
+    # blocklist is enabled, so the module toggle is the outer of two gates.
     ModuleSpec(
         id="security.dnsbl",
         label="DNSBL / RBL reputation monitoring",
         group="Security",
         description="Check every public-facing IP SpatiumDDI knows (public IPAM addresses, internet-facing subnets, NAT/PAT egress addresses, and operator-pinned IPs) against the major DNS blocklists (Spamhaus ZEN, Barracuda, SpamCop, SORBS, …) on a daily reversed-octet sweep — catching mail-deliverability / reputation problems before users report them. Discovery toggle only: no external DNS queries run until you enable the sweep (Settings → dnsbl_monitoring_enabled) and turn on at least one list.",
+        default_enabled=False,
     ),
 )
 
