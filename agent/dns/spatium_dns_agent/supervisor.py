@@ -172,7 +172,12 @@ def run(cfg: AgentConfig) -> int:
     # liveness probes (tcp :53 — the appliance chart's, and the umbrella
     # chart's since #1056) still bound the wait if no bundle ever comes.
     daemon_managed_drivers = {"bind9", "powerdns", "technitium"}
-    waiting_since: float | None = None
+    # The deferred wait can only ever begin here — ``daemon_launched()`` never
+    # goes back to False — so it is measured from the loop's start (a breath
+    # after ``start_daemon`` deferred), not from the tick that first noticed
+    # it: the re-log then reads 1, 2, 4, 8 … s, the schedule's own numbers.
+    loop_started = time.monotonic()
+    waiting = False
     waiting_ticks = 0
     while not stopping.is_set():
         time.sleep(1.0)
@@ -188,13 +193,13 @@ def run(cfg: AgentConfig) -> int:
             break
         if cfg.driver in daemon_managed_drivers:
             if driver.daemon_running():
-                if waiting_since is not None:
+                if waiting:
                     log.info(
                         "dns_daemon_launched_after_deferred_start",
                         driver=cfg.driver,
-                        waited_s=round(time.monotonic() - waiting_since, 1),
+                        waited_s=round(time.monotonic() - loop_started, 1),
                     )
-                    waiting_since = None
+                    waiting = False
                     waiting_ticks = 0
                     _clear_deferred_status(heartbeat)
             elif driver.daemon_launched():
@@ -207,15 +212,15 @@ def run(cfg: AgentConfig) -> int:
                     log.error("dns_daemon_exited", driver=cfg.driver)
                     return 2
             else:
-                if waiting_since is None:
-                    waiting_since = time.monotonic()
+                if not waiting:
+                    waiting = True
                     heartbeat.daemon_status = dict(DEFERRED_DAEMON_STATUS)
                 waiting_ticks += 1
                 if wait_log_due(waiting_ticks):
                     log.info(
                         "dns_daemon_start_deferred_waiting",
                         driver=cfg.driver,
-                        waited_s=round(time.monotonic() - waiting_since, 1),
+                        waited_s=round(time.monotonic() - loop_started, 1),
                         note="start_daemon spawned nothing (no rendered config yet); "
                         "the sync loop launches the daemon after the first bundle",
                     )
