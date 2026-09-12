@@ -11,7 +11,9 @@ carries (the claim first, then the Pending pod, so the operator joins a fresh
 instance elsewhere); NEVER the current or target primary's (deferred instead);
 never a claim on a live or merely NotReady node; never Redis's or any other
 component's; a cheap no-op while Postgres is whole unless a node was evicted
-this tick; and kubeapi errors are surfaced, never guessed around.
+this tick; and kubeapi errors are surfaced, never guessed around — a PV read that is
+forbidden or failing is an error, only a PV that does not exist falls back to the
+scheduler's selected-node annotation, and the journal records which one decided.
 """
 
 from __future__ import annotations
@@ -181,7 +183,7 @@ def test_a_whole_postgres_is_one_cheap_read(monkeypatch) -> None:
     rec = _Recorder(_world(ready=3, pvcs=_LIVE_PVCS, pvs=_LIVE_PVS))
     monkeypatch.setattr(k8s_api, "_request", rec)
 
-    assert k8s_api.reclaim_stranded_postgres_storage() == ([], [], None)
+    assert tuple(k8s_api.reclaim_stranded_postgres_storage()) == ([], [], None)
     assert rec.gets == [CR_PATH]
     assert rec.deleted == []
 
@@ -213,7 +215,7 @@ def test_a_claim_on_a_node_that_still_exists_is_left_alone(monkeypatch) -> None:
     )
     monkeypatch.setattr(k8s_api, "_request", rec)
 
-    assert k8s_api.reclaim_stranded_postgres_storage() == ([], [], None)
+    assert tuple(k8s_api.reclaim_stranded_postgres_storage()) == ([], [], None)
     assert rec.deleted == []
 
 
@@ -266,7 +268,7 @@ def test_another_clusters_claims_are_not_ours(monkeypatch) -> None:
     rec = _Recorder(_world(pvcs=pvcs, pvs={"pv-o3": "ddipg-member-2"}))
     monkeypatch.setattr(k8s_api, "_request", rec)
 
-    assert k8s_api.reclaim_stranded_postgres_storage() == ([], [], None)
+    assert tuple(k8s_api.reclaim_stranded_postgres_storage()) == ([], [], None)
     assert rec.deleted == []
 
 
@@ -277,27 +279,88 @@ def test_network_storage_is_never_stranded(monkeypatch) -> None:
     rec = _Recorder(_world(pvcs=pvcs, pvs={"pv-3": None}))
     monkeypatch.setattr(k8s_api, "_request", rec)
 
-    assert k8s_api.reclaim_stranded_postgres_storage() == ([], [], None)
+    assert tuple(k8s_api.reclaim_stranded_postgres_storage()) == ([], [], None)
     assert rec.deleted == []
 
 
-def test_an_unreadable_pv_falls_back_to_the_selected_node_annotation(monkeypatch) -> None:
+def test_a_missing_pv_falls_back_to_the_selected_node_annotation(monkeypatch) -> None:
+    # 404 = there is no PV object to read (unbound, or already released and
+    # gone): the scheduler's annotation is the only anchor left, and the
+    # journal says so.
     pvcs = (
         _pvc(f"{CLUSTER}-3", "pv-3", labels=_cnpg_labels(f"{CLUSTER}-3"), selected="ddipg-member-2"),
     )
     rec = _Recorder(_world(pvcs=pvcs, pvs={}))  # no PV scripted → 404
     monkeypatch.setattr(k8s_api, "_request", rec)
 
-    reclaimed, deferred, err = k8s_api.reclaim_stranded_postgres_storage()
+    out = k8s_api.reclaim_stranded_postgres_storage()
 
-    assert (reclaimed, deferred, err) == ([f"{CLUSTER}-3"], [], None)
+    assert tuple(out) == ([f"{CLUSTER}-3"], [], None)
+    assert out.sources == {f"{CLUSTER}-3": "annotation"}
+
+
+def test_the_live_shape_records_the_pv_as_the_source(monkeypatch) -> None:
+    rec = _Recorder(_world(pvcs=_LIVE_PVCS, pvs=_LIVE_PVS))
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    out = k8s_api.reclaim_stranded_postgres_storage()
+
+    assert out.reclaimed == [f"{CLUSTER}-3"]
+    assert out.sources == {f"{CLUSTER}-3": "pv"}
+
+
+def test_a_forbidden_pv_read_is_an_error_not_a_guess(monkeypatch) -> None:
+    # The first cut fell back to the annotation on ANY non-200 — and the
+    # supervisor's ClusterRole had no persistentvolumes grant, so every
+    # production read was a 403 that silently decided on the annotation
+    # (review of the first cut). A 403 is a misconfiguration to surface.
+    gets = _world(pvcs=_LIVE_PVCS, pvs=_LIVE_PVS)
+    gets["/api/v1/persistentvolumes/pv-1"] = (403, "forbidden")
+    rec = _Recorder(gets)
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    out = k8s_api.reclaim_stranded_postgres_storage()
+
+    assert out.reclaimed == [] and out.deferred == []
+    assert out.error is not None and "403" in out.error and "persistentvolumes/pv-1" in out.error
+    assert rec.deleted == []
+
+
+def test_a_pv_server_error_is_an_error_not_a_guess(monkeypatch) -> None:
+    gets = _world(pvcs=_LIVE_PVCS, pvs=_LIVE_PVS)
+    gets["/api/v1/persistentvolumes/pv-3"] = (500, "boom")
+    rec = _Recorder(gets)
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    out = k8s_api.reclaim_stranded_postgres_storage()
+
+    assert out.reclaimed == []
+    assert out.error is not None and "500" in out.error
+    assert rec.deleted == []
+
+
+def test_a_pv_transport_failure_is_an_error_not_a_guess(monkeypatch) -> None:
+    inner = _Recorder(_world(pvcs=_LIVE_PVCS, pvs=_LIVE_PVS))
+
+    def flaky(method, path, **kw):
+        if path == "/api/v1/persistentvolumes/pv-3":
+            raise RuntimeError("kubeapi GET /api/v1/persistentvolumes/pv-3: timed out")
+        return inner(method, path, **kw)
+
+    monkeypatch.setattr(k8s_api, "_request", flaky)
+
+    out = k8s_api.reclaim_stranded_postgres_storage()
+
+    assert out.reclaimed == []
+    assert out.error is not None and "timed out" in out.error
+    assert inner.deleted == []
 
 
 def test_no_cnpg_cluster_is_a_quiet_no_op(monkeypatch) -> None:
     rec = _Recorder({CR_PATH: (404, {})})
     monkeypatch.setattr(k8s_api, "_request", rec)
 
-    assert k8s_api.reclaim_stranded_postgres_storage(evicted_nodes=["x"]) == ([], [], None)
+    assert tuple(k8s_api.reclaim_stranded_postgres_storage(evicted_nodes=["x"])) == ([], [], None)
     assert rec.deleted == []
 
 

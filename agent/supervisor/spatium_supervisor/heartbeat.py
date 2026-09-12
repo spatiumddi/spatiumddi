@@ -1110,14 +1110,17 @@ def heartbeat_once(
         # has failed over. Every seed tick, not only the eviction one, so a
         # deferred primary and a supervisor restart both converge; one CR
         # read per tick while Postgres is whole.
-        pg_reclaimed, pg_deferred, pg_err = k8s_api.reclaim_stranded_postgres_storage(
-            evicted_nodes=evicted_now
-        )
+        pg = k8s_api.reclaim_stranded_postgres_storage(evicted_nodes=evicted_now)
+        pg_reclaimed, pg_deferred, pg_err = pg.reclaimed, pg.deferred, pg.error
         if pg_reclaimed:
             log.info(
                 "supervisor.heartbeat.postgres_storage_reclaimed",
                 pvcs=pg_reclaimed,
                 evicted=evicted_now,
+                # which read decided each claim was stranded: the PV's node
+                # affinity ("pv") or the scheduler's selected-node
+                # annotation ("annotation", only when the PV is gone)
+                affinity_source={name: pg.sources.get(name, "") for name in pg_reclaimed},
             )
         if pg_deferred:
             log.info(

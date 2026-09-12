@@ -615,26 +615,58 @@ def _cnpg_instance_of(pvc: dict, cluster_name: str) -> str | None:
     return f"{cluster_name}-{ordinal}"
 
 
-def _pvc_pinned_hostnames(pvc: dict) -> set[str]:
-    """The hostnames a claim's storage lives on. The bound PV's required
-    node affinity is authoritative (it is what the scheduler enforces);
-    the scheduler's ``selected-node`` annotation — what the Redis reclaim
-    keys on — is the fallback when the PV cannot be read. A readable PV
-    with no hostname affinity is network storage: nothing pins it."""
+def _pvc_pinned_hostnames(pvc: dict) -> tuple[set[str], str, str | None]:
+    """``(hostnames, source, error)`` — where a claim's storage lives.
+
+    The bound PV's required node affinity is authoritative (it is what the
+    scheduler enforces): ``source == "pv"``. A readable PV with no hostname
+    affinity is network storage — nothing pins it, the set is empty. The
+    scheduler's ``selected-node`` annotation — what the Redis reclaim keys
+    on — stands in only when there is no PV to read (an unbound claim, or a
+    PV object already gone: 404): ``source == "annotation"``. Anything else
+    — 403, 5xx, a transport failure — is an ``error`` the caller surfaces
+    instead of guessing from the annotation: the review of the first cut
+    found the supervisor's ClusterRole had no ``persistentvolumes`` grant,
+    so every production read was a 403 that silently decided on the
+    annotation, and the network-storage guard above could never hold.
+    """
     volume = str((pvc.get("spec") or {}).get("volumeName") or "")
     if volume:
+        path = f"/api/v1/persistentvolumes/{quote(volume)}"
         try:
-            status, resp = _request("GET", f"/api/v1/persistentvolumes/{quote(volume)}")
-        except RuntimeError:
-            status, resp = 0, b""
+            status, resp = _request("GET", path)
+        except RuntimeError as exc:
+            return set(), "", str(exc)
         if status == 200:
             try:
-                return _pv_affinity_hostnames(json.loads(resp))
+                return _pv_affinity_hostnames(json.loads(resp)), "pv", None
             except ValueError:
-                return set()
+                return set(), "", f"unparseable PV {volume}"
+        if status != 404:
+            return set(), "", f"kubeapi GET {path}: status {status}: {resp[:200]!r}"
     anns = (pvc.get("metadata") or {}).get("annotations") or {}
     selected = anns.get(_SELECTED_NODE_ANNOTATION)
-    return {str(selected)} if selected else set()
+    return ({str(selected)} if selected else set()), "annotation", None
+
+
+@dataclass
+class PostgresReclaim:
+    """What one sweep did. ``sources`` says, per reclaimed claim, whether
+    the bound PV's node affinity (``pv``) or the scheduler's selected-node
+    annotation (``annotation``) decided it was stranded — the journal
+    carries it so a live run can tell the two apart."""
+
+    reclaimed: list[str] = field(default_factory=list)
+    deferred: list[str] = field(default_factory=list)
+    error: str | None = None
+    sources: dict[str, str] = field(default_factory=dict)
+
+    def __iter__(self):
+        # ``reclaimed, deferred, err = ...`` keeps working for callers that
+        # only need the verdict.
+        yield self.reclaimed
+        yield self.deferred
+        yield self.error
 
 
 def reclaim_stranded_postgres_storage(
@@ -642,11 +674,12 @@ def reclaim_stranded_postgres_storage(
     evicted_nodes: Iterable[str] = (),
     namespace: str = "spatium",
     cluster_name: str = _CNPG_DEFAULT_CLUSTER,
-) -> tuple[list[str], list[str], str | None]:
+) -> PostgresReclaim:
     """Delete the CloudNativePG instance claims (and their Pending pods)
     pinned to a node that no longer exists, so the operator re-creates the
-    instance on a live node — returns ``(reclaimed_pvc_names,
-    deferred_instance_names, error)``.
+    instance on a live node — returns a :class:`PostgresReclaim`
+    (``reclaimed`` claim names, ``deferred`` instance names, ``error``,
+    and the affinity ``sources``).
 
     #1058 — the Redis reclaim above rested on "CNPG manages (deletes +
     recreates) its own instance PVCs". It does not. After a dead-node
@@ -685,11 +718,11 @@ def reclaim_stranded_postgres_storage(
     try:
         status, resp = _request("GET", cr_path)
     except RuntimeError as exc:
-        return [], [], str(exc)
+        return PostgresReclaim(error=str(exc))
     if status == 404:
-        return [], [], None  # not a cnpg deployment / Cluster not up yet
+        return PostgresReclaim()  # not a cnpg deployment / Cluster not up yet
     if status != 200:
-        return [], [], f"kubeapi status {status}: {resp[:200]!r}"
+        return PostgresReclaim(error=f"kubeapi status {status}: {resp[:200]!r}")
     try:
         cr = json.loads(resp)
         spec = cr.get("spec") or {}
@@ -697,9 +730,9 @@ def reclaim_stranded_postgres_storage(
         want = int(spec.get("instances") or 0)
         ready = int(cr_status.get("readyInstances") or 0)
     except (ValueError, TypeError, AttributeError):
-        return [], [], "unparseable Cluster CR"
+        return PostgresReclaim(error="unparseable Cluster CR")
     if ready >= want and not forced:
-        return [], [], None
+        return PostgresReclaim()
     primaries = {
         str(cr_status.get(key) or "") for key in ("currentPrimary", "targetPrimary")
     } - {""}
@@ -707,39 +740,43 @@ def reclaim_stranded_postgres_storage(
     try:
         status, resp = _request("GET", "/api/v1/nodes")
     except RuntimeError as exc:
-        return [], [], str(exc)
+        return PostgresReclaim(error=str(exc))
     if status != 200:
-        return [], [], f"kubeapi status {status}: {resp[:200]!r}"
+        return PostgresReclaim(error=f"kubeapi status {status}: {resp[:200]!r}")
     try:
         live = {
             str(((n.get("metadata") or {}).get("name")) or "")
             for n in json.loads(resp).get("items", [])
         } - {""}
     except (ValueError, AttributeError):
-        return [], [], "unparseable node list"
+        return PostgresReclaim(error="unparseable node list")
 
     base = f"/api/v1/namespaces/{quote(namespace)}"
     try:
         status, resp = _request("GET", f"{base}/persistentvolumeclaims")
     except RuntimeError as exc:
-        return [], [], str(exc)
+        return PostgresReclaim(error=str(exc))
     if status != 200:
-        return [], [], f"kubeapi status {status}: {resp[:200]!r}"
+        return PostgresReclaim(error=f"kubeapi status {status}: {resp[:200]!r}")
     try:
         items = json.loads(resp).get("items", [])
     except (ValueError, AttributeError):
-        return [], [], "unparseable PVC list"
+        return PostgresReclaim(error="unparseable PVC list")
 
     stranded: dict[str, list[str]] = {}
+    sources: dict[str, str] = {}
     for pvc in items:
         instance = _cnpg_instance_of(pvc, cluster_name)
         if instance is None:
             continue
-        pinned = _pvc_pinned_hostnames(pvc)
+        name = str((pvc.get("metadata") or {}).get("name") or "")
+        pinned, source, pin_err = _pvc_pinned_hostnames(pvc)
+        if pin_err:
+            return PostgresReclaim(error=f"{name}: {pin_err}")
         if not pinned or pinned & live:
             continue
-        name = str((pvc.get("metadata") or {}).get("name") or "")
         stranded.setdefault(instance, []).append(name)
+        sources[name] = source
 
     reclaimed: list[str] = []
     deferred: list[str] = []
@@ -753,9 +790,9 @@ def reclaim_stranded_postgres_storage(
                     "DELETE", f"{base}/persistentvolumeclaims/{quote(name)}"
                 )
             except RuntimeError as exc:
-                return reclaimed, deferred, str(exc)
+                return PostgresReclaim(reclaimed, deferred, str(exc), sources)
             if status not in (200, 202, 404):
-                return reclaimed, deferred, f"kubeapi status {status}: {resp[:200]!r}"
+                return PostgresReclaim(reclaimed, deferred, f"kubeapi status {status}: {resp[:200]!r}", sources)
             reclaimed.append(name)
         # The pod the operator re-created against the stranded claim is
         # unscheduled, so a plain DELETE removes it at once and releases
@@ -765,7 +802,7 @@ def reclaim_stranded_postgres_storage(
             _request("DELETE", f"{base}/pods/{quote(instance)}")
         except RuntimeError:
             pass  # the pod may already be gone; the claim reclaim is what matters
-    return reclaimed, deferred, None
+    return PostgresReclaim(reclaimed, deferred, None, sources)
 
 
 # #272 — durable control-plane state via k3s HelmChartConfig.
