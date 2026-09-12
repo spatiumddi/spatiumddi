@@ -97,6 +97,7 @@ _ZONE_SCOPE_SCAN_CAP = 20_000
     ),
     args_model=ListZonesArgs,
     category="dns",
+    module="core.dns",
 )
 async def list_dns_zones(db: AsyncSession, user: User, args: ListZonesArgs) -> list[dict[str, Any]]:
     stmt = select(DNSZone).where(DNSZone.deleted_at.is_(None))
@@ -176,6 +177,7 @@ class QueryRecordsArgs(BaseModel):
     ),
     args_model=QueryRecordsArgs,
     category="dns",
+    module="core.dns",
 )
 async def query_dns_records(
     db: AsyncSession, user: User, args: QueryRecordsArgs
@@ -225,6 +227,7 @@ class ListServerGroupsArgs(BaseModel):
     ),
     args_model=ListServerGroupsArgs,
     category="dns",
+    module="core.dns",
 )
 async def list_dns_server_groups(
     db: AsyncSession, user: User, args: ListServerGroupsArgs
@@ -280,6 +283,7 @@ class FindDnsServersArgs(BaseModel):
     ),
     args_model=FindDnsServersArgs,
     category="dns",
+    module="core.dns",
 )
 async def find_dns_servers(
     db: AsyncSession, user: User, args: FindDnsServersArgs
@@ -348,6 +352,7 @@ class PreviewZoneMoveArgs(BaseModel):
     ),
     args_model=PreviewZoneMoveArgs,
     category="dns",
+    module="core.dns",
 )
 async def preview_dns_zone_move(
     db: AsyncSession, user: User, args: PreviewZoneMoveArgs
@@ -465,6 +470,7 @@ class ForwardDnsArgs(BaseModel):
     args_model=ForwardDnsArgs,
     category="dns",
     default_enabled=False,
+    module="core.dns",
 )
 async def forward_dns(
     db: AsyncSession,  # noqa: ARG001
@@ -544,6 +550,7 @@ class ReverseDnsArgs(BaseModel):
     args_model=ReverseDnsArgs,
     category="dns",
     default_enabled=False,
+    module="core.dns",
 )
 async def reverse_dns(
     db: AsyncSession,  # noqa: ARG001
@@ -631,6 +638,7 @@ class ListDNSRecordsArgs(BaseModel):
     ),
     args_model=ListDNSRecordsArgs,
     category="dns",
+    module="core.dns",
 )
 async def list_dns_records(
     db: AsyncSession, user: User, args: ListDNSRecordsArgs
@@ -707,6 +715,7 @@ class ListDNSBlockListsArgs(BaseModel):
     ),
     args_model=ListDNSBlockListsArgs,
     category="dns",
+    module="core.dns",
 )
 async def list_dns_blocklists(
     db: AsyncSession, user: User, args: ListDNSBlockListsArgs
@@ -782,6 +791,7 @@ class ListDNSPoolsArgs(BaseModel):
     ),
     args_model=ListDNSPoolsArgs,
     category="dns",
+    module="core.dns",
 )
 async def list_dns_pools(
     db: AsyncSession, user: User, args: ListDNSPoolsArgs
@@ -867,6 +877,7 @@ class ListDNSViewsArgs(BaseModel):
     ),
     args_model=ListDNSViewsArgs,
     category="dns",
+    module="core.dns",
 )
 async def list_dns_views(
     db: AsyncSession, user: User, args: ListDNSViewsArgs
@@ -916,6 +927,7 @@ class FindZoneDNSSECInfoArgs(BaseModel):
     ),
     args_model=FindZoneDNSSECInfoArgs,
     category="dns",
+    module="core.dns",
 )
 async def find_zone_dnssec_info(
     db: AsyncSession, user: User, args: FindZoneDNSSECInfoArgs
@@ -968,6 +980,7 @@ class FindDNSRateLimitSettingsArgs(BaseModel):
     ),
     args_model=FindDNSRateLimitSettingsArgs,
     category="dns",
+    module="core.dns",
 )
 async def find_dns_rate_limit_settings(
     db: AsyncSession, user: User, args: FindDNSRateLimitSettingsArgs
@@ -1053,6 +1066,7 @@ class FindZoneDriftArgs(BaseModel):
     ),
     args_model=FindZoneDriftArgs,
     category="dns",
+    module="core.dns",
 )
 async def find_dns_zone_drift(
     db: AsyncSession, user: User, args: FindZoneDriftArgs
@@ -1102,6 +1116,7 @@ class ListDNSSECPoliciesArgs(BaseModel):
     ),
     args_model=ListDNSSECPoliciesArgs,
     category="dns",
+    module="core.dns",
 )
 async def list_dnssec_policies(
     db: AsyncSession, user: User, args: ListDNSSECPoliciesArgs
@@ -1154,6 +1169,7 @@ class FindDNSQueryStatsArgs(BaseModel):
     ),
     args_model=FindDNSQueryStatsArgs,
     category="dns",
+    module="core.dns",
 )
 async def find_dns_query_stats(
     db: AsyncSession, user: User, args: FindDNSQueryStatsArgs
@@ -1252,6 +1268,7 @@ class FindDNSQueriesArgs(BaseModel):
     ),
     args_model=FindDNSQueriesArgs,
     category="dns",
+    module="core.dns",
 )
 async def find_dns_queries(
     db: AsyncSession, user: User, args: FindDNSQueriesArgs
@@ -1433,6 +1450,7 @@ class FindDNSEncryptedTransportsArgs(BaseModel):
     ),
     args_model=FindDNSEncryptedTransportsArgs,
     category="dns",
+    module="core.dns",
 )
 async def find_dns_encrypted_transports(
     db: AsyncSession, user: User, args: FindDNSEncryptedTransportsArgs
@@ -1528,6 +1546,7 @@ class ListResolverPresetsArgs(BaseModel):
     # Read-only, and the contents are a static table of public addresses
     # shipped with the release — nothing install-specific, nothing secret.
     default_enabled=True,
+    module="core.dns",
 )
 async def list_resolver_presets(
     db: AsyncSession, user: User, args: ListResolverPresetsArgs
@@ -1589,6 +1608,7 @@ class ListBlocklistTemplatesArgs(BaseModel):
     # release: rewrite targets published by each search provider, plus
     # the ids of catalog feeds. Nothing install-specific, nothing secret.
     default_enabled=True,
+    module="core.dns",
 )
 async def list_blocklist_templates(
     db: AsyncSession, user: User, args: ListBlocklistTemplatesArgs

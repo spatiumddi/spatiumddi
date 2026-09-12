@@ -199,6 +199,20 @@ async def agent_register(
     _psk: str = Depends(_require_bootstrap_key),
 ) -> AgentRegisterResponseV2:
     """Bootstrap registration: PSK-authenticated; returns a per-server JWT."""
+    # #1068 — see the matching guard in dhcp/agents.py. Registration is
+    # the one agent call that creates a server row, so without this an
+    # agent re-registers moments after the operator empties DNS and
+    # disables the module, stranding a live server behind a 404 surface.
+    # 403, never 404: a 404 is the signal that makes an agent throw its
+    # JWT away and re-bootstrap, which would loop forever here.
+    if not await is_module_enabled(db, "core.dns"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "The DNS subsystem is disabled on this control plane, so new "
+                "agents cannot register. Enable it under Settings → Features."
+            ),
+        )
     # Resolve or create group
     if body.group_name:
         res = await db.execute(select(DNSServerGroup).where(DNSServerGroup.name == body.group_name))

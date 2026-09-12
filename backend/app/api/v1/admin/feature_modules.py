@@ -19,12 +19,13 @@ catalog metadata (label / group / description) for the Settings page.
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 from uuid import UUID
 
 import structlog
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.auth_throttle import login_rate_limited
@@ -32,6 +33,8 @@ from app.core.demo_mode import DEMO_RESTRICTED_MODULES, is_demo_mode
 from app.core.permissions import is_effective_superadmin
 from app.core.request_meta import get_trusted_client_ip
 from app.models.audit import AuditLog
+from app.models.dhcp import DHCPScope, DHCPServer
+from app.models.dns import DNSServer, DNSZone
 from app.models.feature_module import FeatureModule
 from app.models.settings import PlatformSettings
 from app.services import feature_modules as fm_svc
@@ -66,6 +69,49 @@ _BREAK_GLASS_ACTION_SUCCESS = "approvals.break_glass"
 _BREAK_GLASS_ACTION_DENIED = "approvals.break_glass_denied"
 
 
+# #1068 — a core subsystem may not be switched off while it still owns
+# live state. ``require_module`` answers 404, so disabling ``core.dhcp``
+# on an install with running Kea servers would not decommission anything:
+# it would hide every scope, pool and lease behind a not-found surface
+# while the agents kept serving from their cached config, with no way to
+# reach the rows from the UI. Refusing is the same fail-closed stance the
+# #934 / #935 moves take, and the way back out is explicit — delete the
+# servers and zones first.
+#
+# The agent routers are deliberately NOT gated (see router.py), so the
+# fleet would keep running either way; that is what makes the stranded
+# state invisible rather than obviously broken.
+# Scopes and zones are soft-delete models, so the global ``deleted_at IS
+# NULL`` filter in ``app/db.py`` applies here and a deleted row correctly
+# does not hold the toggle hostage.
+_CORE_SUBSYSTEM_STATE: dict[str, tuple[tuple[str, Any], ...]] = {
+    "core.dhcp": (("DHCP server", DHCPServer), ("DHCP scope", DHCPScope)),
+    "core.dns": (("DNS server", DNSServer), ("DNS zone", DNSZone)),
+}
+
+
+async def _refuse_disable_while_populated(db: DB, module_id: str) -> None:
+    """422 when turning off a core subsystem that still has rows."""
+    checks = _CORE_SUBSYSTEM_STATE.get(module_id)
+    if not checks:
+        return
+    counts: list[str] = []
+    for label, model in checks:
+        n = (await db.execute(select(func.count(model.id)))).scalar_one()
+        if n:
+            counts.append(f"{n} {label}{'s' if n != 1 else ''}")
+    if counts:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"Cannot disable this feature while it still has "
+                f"{' and '.join(counts)}. Delete them first — disabling would "
+                f"hide them behind a 404 without stopping the agents that "
+                f"serve them."
+            ),
+        )
+
+
 class FeatureModuleEntry(BaseModel):
     """Catalog entry + current state. ``label`` / ``group`` /
     ``description`` come from the in-process catalog so the UI doesn't
@@ -78,6 +124,12 @@ class FeatureModuleEntry(BaseModel):
     description: str
     default_enabled: bool
     enabled: bool
+    # #1068 — ids this module is meaningless without. ``enabled`` above is
+    # this module's OWN state, so a child under a disabled parent reports
+    # enabled=True while resolving off everywhere else; the page reads
+    # ``requires`` to show that as "Requires DNS" rather than as a toggle
+    # that appears to do nothing.
+    requires: list[str] = []
 
 
 class FeatureModuleToggleBody(BaseModel):
@@ -102,6 +154,7 @@ async def list_feature_modules(db: DB, current_user: CurrentUser) -> list[Featur
             description=spec.description,
             default_enabled=spec.default_enabled,
             enabled=overrides.get(spec.id, spec.default_enabled),
+            requires=list(spec.requires),
         )
         for spec in fm_svc.MODULES
     ]
@@ -134,6 +187,12 @@ async def toggle_feature_module(
         )
 
     spec = fm_svc.MODULES_BY_ID[module_id]
+
+    # #1068 — refuse to switch a core subsystem off while it still owns
+    # rows. Runs before anything is written or audited, so a refused
+    # toggle leaves no trace beyond the 422.
+    if not body.enabled:
+        await _refuse_disable_while_populated(db, module_id)
 
     # #62 self-governance lock: disabling ``governance.approvals`` is a
     # WEAKENING change. When the lock is on (and the caller isn't going
@@ -226,6 +285,7 @@ async def toggle_feature_module(
         description=spec.description,
         default_enabled=spec.default_enabled,
         enabled=row.enabled,
+        requires=list(spec.requires),
     )
 
 

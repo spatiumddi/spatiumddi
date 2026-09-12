@@ -28,6 +28,7 @@ from app.drivers.dhcp import is_agentless
 from app.drivers.dhcp.base import MACBlockDef
 from app.drivers.dhcp.registry import get_driver
 from app.models.dhcp import DHCPMACBlock, DHCPServer
+from app.services.feature_modules import is_module_enabled
 
 logger = structlog.get_logger(__name__)
 
@@ -38,6 +39,10 @@ async def _run_sync() -> dict[str, Any]:
 
     try:
         async with session_factory() as db:
+            # #1068 — the DHCP/DNS subsystem can be switched off wholesale;
+            # do no work (and open no driver connections) when it is.
+            if not await is_module_enabled(db, "core.dhcp"):
+                return {"status": "disabled"}
             servers = list((await db.execute(select(DHCPServer))).scalars().all())
 
             now = datetime.now(UTC)

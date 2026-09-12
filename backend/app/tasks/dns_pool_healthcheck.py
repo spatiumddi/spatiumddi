@@ -33,6 +33,7 @@ from app.core.agent_wake import dns_group_channel, publish_wake
 from app.models.dns import DNSPool
 from app.services.dns.pool_apply import apply_pool_state
 from app.services.dns.pool_healthcheck import apply_check_to_member, run_check
+from app.services.feature_modules import is_module_enabled
 
 logger = structlog.get_logger(__name__)
 
@@ -42,6 +43,10 @@ async def _run_pool_check_async(pool_id_str: str) -> dict[str, Any]:
     factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with factory() as db:
+            # #1068 — the DHCP/DNS subsystem can be switched off wholesale;
+            # do no work (and open no driver connections) when it is.
+            if not await is_module_enabled(db, "core.dns"):
+                return {"status": "disabled"}
             row = await db.execute(
                 select(DNSPool)
                 .where(DNSPool.id == UUID(pool_id_str))
@@ -125,6 +130,10 @@ async def _dispatch_due_async() -> int:
     queued = 0
     try:
         async with factory() as db:
+            # #1068 — the DHCP/DNS subsystem can be switched off wholesale;
+            # do no work (and open no driver connections) when it is.
+            if not await is_module_enabled(db, "core.dns"):
+                return 0
             now = datetime.now(UTC)
             rows = (
                 (

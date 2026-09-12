@@ -19,6 +19,7 @@ import structlog
 
 from app.celery_app import celery_app
 from app.db import task_session
+from app.services.feature_modules import is_module_enabled
 from app.services.profiling.passive import run_lookup_and_stamp
 
 logger = structlog.get_logger(__name__)
@@ -54,4 +55,8 @@ def lookup_fingerprint_task(self: Any, mac_address: str) -> dict[str, str]:
 
 async def _run(mac_address: str) -> None:
     async with task_session() as db:
+        # #1068 — the DHCP/DNS subsystem can be switched off wholesale;
+        # do no work (and open no driver connections) when it is.
+        if not await is_module_enabled(db, "core.dhcp"):
+            return
         await run_lookup_and_stamp(db, mac_address=mac_address)

@@ -48,6 +48,7 @@ class ListDHCPServersArgs(BaseModel):
     ),
     args_model=ListDHCPServersArgs,
     category="dhcp",
+    module="core.dhcp",
 )
 async def list_dhcp_servers(
     db: AsyncSession, user: User, args: ListDHCPServersArgs
@@ -96,6 +97,7 @@ class ListDHCPScopesArgs(BaseModel):
     ),
     args_model=ListDHCPScopesArgs,
     category="dhcp",
+    module="core.dhcp",
 )
 async def list_dhcp_scopes(
     db: AsyncSession, user: User, args: ListDHCPScopesArgs
@@ -186,6 +188,7 @@ class FindDHCPLeasesArgs(BaseModel):
     ),
     args_model=FindDHCPLeasesArgs,
     category="dhcp",
+    module="core.dhcp",
 )
 async def find_dhcp_leases(
     db: AsyncSession, user: User, args: FindDHCPLeasesArgs
@@ -269,6 +272,7 @@ class ListServerGroupsArgs(BaseModel):
     ),
     args_model=ListServerGroupsArgs,
     category="dhcp",
+    module="core.dhcp",
 )
 async def list_dhcp_server_groups(
     db: AsyncSession, user: User, args: ListServerGroupsArgs
@@ -338,6 +342,7 @@ class ListDHCPPoolsArgs(BaseModel):
     ),
     args_model=ListDHCPPoolsArgs,
     category="dhcp",
+    module="core.dhcp",
 )
 async def list_dhcp_pools(
     db: AsyncSession, user: User, args: ListDHCPPoolsArgs
@@ -396,6 +401,7 @@ class ListDHCPStaticsArgs(BaseModel):
     ),
     args_model=ListDHCPStaticsArgs,
     category="dhcp",
+    module="core.dhcp",
 )
 async def list_dhcp_statics(
     db: AsyncSession, user: User, args: ListDHCPStaticsArgs
@@ -451,6 +457,7 @@ class ListDHCPClientClassesArgs(BaseModel):
     ),
     args_model=ListDHCPClientClassesArgs,
     category="dhcp",
+    module="core.dhcp",
 )
 async def list_dhcp_client_classes(
     db: AsyncSession, user: User, args: ListDHCPClientClassesArgs
@@ -501,6 +508,7 @@ class ListDHCPOptionTemplatesArgs(BaseModel):
     ),
     args_model=ListDHCPOptionTemplatesArgs,
     category="dhcp",
+    module="core.dhcp",
 )
 async def list_dhcp_option_templates(
     db: AsyncSession, user: User, args: ListDHCPOptionTemplatesArgs
@@ -550,6 +558,7 @@ class ListPXEProfilesArgs(BaseModel):
     ),
     args_model=ListPXEProfilesArgs,
     category="dhcp",
+    module="core.dhcp",
 )
 async def list_pxe_profiles(
     db: AsyncSession, user: User, args: ListPXEProfilesArgs
@@ -612,6 +621,7 @@ class ListPhoneProfilesArgs(BaseModel):
     ),
     args_model=ListPhoneProfilesArgs,
     category="dhcp",
+    module="core.dhcp",
 )
 async def list_phone_profiles(
     db: AsyncSession, user: User, args: ListPhoneProfilesArgs
@@ -694,6 +704,7 @@ class ListDHCPMACBlocksArgs(BaseModel):
     ),
     args_model=ListDHCPMACBlocksArgs,
     category="dhcp",
+    module="core.dhcp",
 )
 async def list_dhcp_mac_blocks(
     db: AsyncSession, user: User, args: ListDHCPMACBlocksArgs
@@ -743,6 +754,7 @@ class FindDHCPPoolOccupancyArgs(BaseModel):
     ),
     args_model=FindDHCPPoolOccupancyArgs,
     category="dhcp",
+    module="core.dhcp",
 )
 async def find_dhcp_pool_occupancy(
     db: AsyncSession, user: User, args: FindDHCPPoolOccupancyArgs
@@ -814,6 +826,7 @@ class FindDHCPRespondersArgs(BaseModel):
     ),
     args_model=FindDHCPRespondersArgs,
     category="dhcp",
+    module="core.dhcp",
 )
 async def find_dhcp_responders(
     db: AsyncSession, user: User, args: FindDHCPRespondersArgs
@@ -867,6 +880,7 @@ class FindDHCPServerStatsArgs(BaseModel):
     # Read-only summary of agent-reported counters; no secrets, no off-prem
     # calls, no writes -> default-enabled per non-negotiable #13.
     default_enabled=True,
+    module="core.dhcp",
 )
 async def find_dhcp_server_stats(
     db: AsyncSession, user: User, args: FindDHCPServerStatsArgs
@@ -979,6 +993,7 @@ class FindDHCPLeaseHistoryArgs(BaseModel):
     ),
     args_model=FindDHCPLeaseHistoryArgs,
     category="dhcp",
+    module="core.dhcp",
 )
 async def find_dhcp_lease_history(
     db: AsyncSession, user: User, args: FindDHCPLeaseHistoryArgs
@@ -1055,6 +1070,7 @@ class ListDevicePoliciesArgs(BaseModel):
     args_model=ListDevicePoliciesArgs,
     category="dhcp",
     default_enabled=True,
+    module="core.dhcp",
 )
 async def find_dhcp_device_policies(
     db: AsyncSession, user: User, args: ListDevicePoliciesArgs
@@ -1100,6 +1116,7 @@ class PreviewDevicePolicyArgs(BaseModel):
     args_model=PreviewDevicePolicyArgs,
     category="dhcp",
     default_enabled=True,
+    module="core.dhcp",
 )
 async def preview_dhcp_device_policy(
     db: AsyncSession, user: User, args: PreviewDevicePolicyArgs

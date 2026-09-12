@@ -104,8 +104,11 @@ export interface NavExternalEntry {
 export const baseMainNav: NavEntry[] = [
   { label: "Dashboard", icon: LayoutDashboard, to: "/dashboard" },
   { label: "IPAM", icon: Network, to: "/ipam", end: true },
-  { label: "DHCP", icon: Server, to: "/dhcp" },
-  { label: "DNS", icon: Globe, to: "/dns", end: true },
+  // #1068 — the two subsystems an install may legitimately not run. Both
+  // ship enabled; an IPAM-only or single-subsystem install turns the
+  // unused one off under Settings → Features and the anchor goes with it.
+  { label: "DHCP", icon: Server, to: "/dhcp", module: "core.dhcp" },
+  { label: "DNS", icon: Globe, to: "/dns", end: true, module: "core.dns" },
   // #696 — top-level rather than under Administration on purpose: the
   // audience is ordinary users asking for a resource, and most of them will
   // never see the admin section at all.
@@ -130,8 +133,17 @@ export const coreIpamNav: NavEntry[] = [
 // so it belongs beside DNS in the sidebar even though the route lives under
 // /admin.
 export const dnsSectionNav: NavEntry[] = [
-  { label: "DNS Pools", icon: Workflow, to: "/dns/pools" },
-  { label: "DNSSEC Policies", icon: KeyRound, to: "/dns/dnssec-policies" },
+  { label: "DNS Pools", icon: Workflow, to: "/dns/pools", module: "core.dns" },
+  {
+    label: "DNSSEC Policies",
+    icon: KeyRound,
+    to: "/dns/dnssec-policies",
+    module: "core.dns",
+  },
+  // Domains is deliberately NOT gated on core.dns (#1068): a Domain is the
+  // registrar / expiry / RDAP record for a name, which exists whether or not
+  // SpatiumDDI serves a zone for it — an operator tracking renewals on names
+  // hosted elsewhere still wants this with DNS off.
   { label: "Domains", icon: Earth, to: "/admin/domains" },
 ];
 

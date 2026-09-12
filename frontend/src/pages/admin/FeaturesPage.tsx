@@ -13,6 +13,7 @@ import {
   handleApprovalQueued,
 } from "@/lib/approvalQueue";
 import { usePermissions } from "@/hooks/usePermissions";
+import { resolveEnabled } from "@/hooks/useFeatureModules";
 import { useSessionState } from "@/lib/useSessionState";
 import { cn } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
@@ -143,6 +144,23 @@ export function FeaturesPage() {
     }
     toggleMutation.mutate({ id: m.id, enabled: next });
   };
+
+  // #1068 — every module by id, so a row can look its parents up. Built
+  // from the unfiltered list rather than the active tab's slice: a parent
+  // can sit in a different group from its child (security.dnsbl is under
+  // Security, core.dns under DNS), and on the Integrations tab it would
+  // not be in the slice at all.
+  const byId = useMemo(
+    () => new Map((data ?? []).map((m) => [m.id, m])),
+    [data],
+  );
+
+  // Resolved ancestry, not just the direct parent's own flag. With a
+  // depth-2 chain (A requires B requires C, C off) checking only B's
+  // ``enabled`` reports A as fine, so the row would render a live-looking
+  // toggle that changes nothing. ``resolveEnabled`` is the same function
+  // the sidebar and the server use, so all three agree.
+  const resolved = useMemo(() => resolveEnabled(data ?? []), [data]);
 
   const grouped = useMemo(() => {
     if (!data) return [] as [string, FeatureModuleEntry[]][];
@@ -340,6 +358,18 @@ export function FeaturesPage() {
                 >
                   {modules.map((m) => {
                     const isOverridden = m.enabled !== m.default_enabled;
+                    // #1068 — a module under a disabled parent still reports
+                    // enabled=true (that is its own state), but resolves off
+                    // everywhere it matters. Say so, and make the toggle
+                    // inert: flipping it here would appear to do nothing.
+                    const blockedBy = m.requires.filter(
+                      (parentId) =>
+                        byId.has(parentId) && !resolved.has(parentId),
+                    );
+                    const isBlocked = blockedBy.length > 0;
+                    const blockedLabel = blockedBy
+                      .map((parentId) => byId.get(parentId)?.label ?? parentId)
+                      .join(", ");
                     return (
                       <div
                         key={m.id}
@@ -361,6 +391,14 @@ export function FeaturesPage() {
                                 overridden
                               </span>
                             )}
+                            {isBlocked && (
+                              <span
+                                className="rounded bg-muted px-1 py-px text-[9px] font-medium text-muted-foreground"
+                                title={`${blockedLabel} is disabled, so this feature is off regardless of the toggle.`}
+                              >
+                                requires {blockedLabel}
+                              </span>
+                            )}
                           </div>
                           <p className="mt-0.5 text-xs leading-snug text-muted-foreground">
                             {m.description}
@@ -369,8 +407,8 @@ export function FeaturesPage() {
                         <div className="mt-0.5">
                           <Toggle
                             label={`${m.enabled ? "Disable" : "Enable"} ${m.label}`}
-                            checked={m.enabled}
-                            disabled={toggleMutation.isPending}
+                            checked={m.enabled && !isBlocked}
+                            disabled={toggleMutation.isPending || isBlocked}
                             onChange={(v) => handleToggle(m, v)}
                           />
                         </div>

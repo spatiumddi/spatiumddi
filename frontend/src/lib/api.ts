@@ -1390,9 +1390,9 @@ export const ipamApi = {
 
   listBlocks: (spaceId?: string) =>
     api
-      .get<
-        IPBlock[]
-      >("/ipam/blocks", { params: spaceId ? { space_id: spaceId } : undefined })
+      .get<IPBlock[]>("/ipam/blocks", {
+        params: spaceId ? { space_id: spaceId } : undefined,
+      })
       .then((r) => r.data),
   createBlock: (data: Partial<IPBlock> & { template_id?: string | null }) =>
     api.post<IPBlock>("/ipam/blocks", data).then((r) => r.data),
@@ -1426,9 +1426,9 @@ export const ipamApi = {
   deleteBlock: (id: string) => api.delete(`/ipam/blocks/${id}`),
   availableSubnets: (blockId: string, prefixLen: number) =>
     api
-      .get<
-        string[]
-      >(`/ipam/blocks/${blockId}/available-subnets`, { params: { prefix_len: prefixLen } })
+      .get<string[]>(`/ipam/blocks/${blockId}/available-subnets`, {
+        params: { prefix_len: prefixLen },
+      })
       .then((r) => r.data),
   blockFreeSpace: (blockId: string) =>
     api
@@ -2589,7 +2589,14 @@ export interface FeatureModuleEntry {
   group: string;
   description: string;
   default_enabled: boolean;
+  /**
+   * This module's OWN state. A module whose `requires` chain is broken
+   * resolves disabled everywhere else (routers, sidebar, copilot tools)
+   * while still reporting `enabled: true` here — see #1068.
+   */
   enabled: boolean;
+  /** Module ids this one is meaningless without (#1068). */
+  requires: string[];
 }
 
 // #62 break-glass: force a weakening control change immediately (the 5 kinds
@@ -4810,9 +4817,9 @@ export interface CustomField {
 export const customFieldsApi = {
   list: (resource_type?: string) =>
     api
-      .get<
-        CustomField[]
-      >("/custom-fields", { params: resource_type ? { resource_type } : undefined })
+      .get<CustomField[]>("/custom-fields", {
+        params: resource_type ? { resource_type } : undefined,
+      })
       .then((r) => r.data),
   create: (data: Omit<CustomField, "id">) =>
     api.post<CustomField>("/custom-fields", data).then((r) => r.data),

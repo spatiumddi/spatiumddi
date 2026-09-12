@@ -71,7 +71,7 @@ from app.models.wol_schedule import (
     WolRunTarget,
     WolSchedule,
 )
-from app.services import audit_forward
+from app.services import audit_forward, feature_modules
 from app.services.bgp.hijack_monitor import (
     RPKI_INVALID,
     expected_origin_set,
@@ -5485,6 +5485,49 @@ async def seed_dns_dga_alert_rule() -> None:
         await session.commit()
 
 
+# #1068 — rules that are meaningless without their subsystem. Checked once
+# per pass in ``evaluate_all`` rather than inside 50 evaluators.
+#
+# Mostly this saves work rather than changing outcomes: disabling
+# ``core.dhcp`` is refused while any DHCP server or scope exists, so by the
+# time the module is off these evaluators have no rows to match anyway.
+# Making it explicit keeps a disabled subsystem from running queries on
+# every 60 s tick, and says in one place which rules belong to what.
+#
+# ``rogue_dhcp`` is deliberately NOT listed either, and it is the one
+# entry where that needed arguing. Its subject rows keep arriving —
+# ``/dhcp/agents/dhcp-offers`` is on the ungated agent router — and the
+# rule matters MOST to an install that does not run DHCP, where any
+# server answering DHCP is by definition unauthorised. The drill-down
+# page does 404 with the module off, which is the cost; an alert whose
+# message names the offending IP and MAC is still far better than
+# silence. Revisit if the responders surface is ever lifted out of the
+# gated router.
+#
+# Deliberately NOT listed: ``cluster_dns_degraded`` (CoreDNS inside k3s,
+# nothing to do with the DNS subsystem SpatiumDDI serves),
+# ``server_unreachable`` (one rule spanning dns_server, dhcp_server AND
+# looking_glass_collector, so no single module owns it), and the
+# ``domain_*`` registrar rules (a Domain is a registrar/RDAP record that
+# outlives any zone we serve). The three ``dns_*_suspected`` rules and
+# ``rogue_ra`` are keyed to their own modules, which in turn require the
+# core module — so they resolve off either way.
+_RULE_TYPE_MODULE: dict[str, str] = {
+    RULE_TYPE_DHCP_POOL_EXHAUSTION: "core.dhcp",
+    RULE_TYPE_DHCP_PACKETS_DROPPED: "core.dhcp",
+    RULE_TYPE_VOICE_LEASE_COUNT_BELOW: "core.dhcp",
+    RULE_TYPE_STALE_RESERVATION: "core.dhcp",
+    RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE: "core.dhcp",
+    RULE_TYPE_ROGUE_RA: "ipv6.router_advertisements",
+    RULE_TYPE_DNS_NXDOMAIN_SPIKE: "core.dns",
+    RULE_TYPE_DNS_QUERY_RATE_SPIKE: "core.dns",
+    RULE_TYPE_DNS_RATE_LIMIT_DROPPING: "core.dns",
+    RULE_TYPE_DNS_TUNNELING: "security.dns_threat",
+    RULE_TYPE_DNS_BEACONING: "security.dns_threat",
+    RULE_TYPE_DNS_DGA: "security.dns_threat",
+}
+
+
 async def evaluate_all(db: AsyncSession) -> dict[str, int]:
     """Evaluate every enabled rule; open / resolve events as needed.
 
@@ -5510,6 +5553,9 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
 
     res = await db.execute(select(AlertRule).where(AlertRule.enabled.is_(True)))
     rules = list(res.scalars().all())
+    # #1068 — resolved once per pass, not per rule (it is a cached read, but
+    # the loop can be long and the answer cannot change mid-pass).
+    enabled_modules = await feature_modules.get_enabled_modules(db)
     for rule in rules:
         try:
             # Each match tuple is (subject_id, display, message,
@@ -5518,8 +5564,23 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
             # applies; ``domain_expiring`` overrides per-row based on
             # how close the actual expiry is.
             matches: list[tuple[str, str, str, str | None]] = []
+            subject_type = ""
 
-            if rule.rule_type == RULE_TYPE_SUBNET_UTILIZATION:
+            required = _RULE_TYPE_MODULE.get(rule.rule_type)
+            module_off = required is not None and required not in enabled_modules
+
+            if module_off:
+                # #1068 — deliberately NOT ``continue``. Falling through with
+                # an empty match set lets the common open/resolve logic below
+                # close whatever this rule still has open. A ``continue`` here
+                # skips that too, so a DHCP pool-exhaustion event that was
+                # firing when the operator switched DHCP off would stay open
+                # forever, with no evaluator left that could ever close it —
+                # a permanently red dashboard for a subsystem that is gone.
+                # ``subject_type`` stays unused: it is only read inside the
+                # match loop, which does not run.
+                pass
+            elif rule.rule_type == RULE_TYPE_SUBNET_UTILIZATION:
                 base = await _matching_subnet_subjects(db, rule, settings)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]
                 subject_type = "subnet"
