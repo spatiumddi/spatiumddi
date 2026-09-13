@@ -5,12 +5,12 @@ A navigable reference to the SpatiumDDI database schema. This is a
 domain, names the anchor tables and their key relationships, and
 documents the shared conventions every model follows. For the exact
 column list of any table, read the model source under
-[`backend/app/models/`](../backend/app/models/); each file is the
+[`backend/app/models/`](https://github.com/spatiumddi/spatiumddi/tree/main/backend/app/models); each file is the
 authoritative definition.
 
 All models are SQLAlchemy 2.x async (`Mapped[...]` /
 `mapped_column(...)`) and live in PostgreSQL 16. The Alembic migrations
-under [`backend/alembic/`](../backend/alembic/) are the source of truth
+under [`backend/alembic/`](https://github.com/spatiumddi/spatiumddi/tree/main/backend/alembic) are the source of truth
 for the deployed schema; the model classes are the source of truth for
 what the application reads and writes.
 
@@ -24,7 +24,7 @@ Feature-level behaviour lives in the matching specs —
 ## 1. Shared conventions
 
 These mixins and patterns are defined in
-[`backend/app/models/base.py`](../backend/app/models/base.py) and
+[`backend/app/models/base.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/base.py) and
 reused across the schema.
 
 ### Primary keys
@@ -65,7 +65,7 @@ soft-delete stamps a parent and all its descendants with the same
 atomically.
 
 The query filter lives in
-[`backend/app/db._filter_soft_deleted`](../backend/app/db.py): a
+[`backend/app/db._filter_soft_deleted`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/db.py): a
 SQLAlchemy `do_orm_execute` listener injects `deleted_at IS NULL` into
 every SELECT touching a soft-delete model, unless the caller opts in
 with `execution_options(include_deleted=True)`.
@@ -90,7 +90,7 @@ in the lifecycle instead.
 Credentials at rest (bind passwords, API keys, client secrets, agent
 keys, TSIG secrets, driver admin creds, integration tokens) are
 Fernet-encrypted via
-[`backend/app/core/crypto.py`](../backend/app/core/crypto.py)
+[`backend/app/core/crypto.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/core/crypto.py)
 (`encrypt_str` / `decrypt_str`, AES-128-CBC + HMAC-SHA256 keyed from
 `CREDENTIAL_ENCRYPTION_KEY`). The convention is a `LargeBinary` column
 named `*_encrypted` (or `secrets_encrypted` for a JSONB blob of
@@ -125,10 +125,10 @@ operator-settable lifecycle values
 
 ## 2. IPAM — the address-space tree
 
-Files: [`ipam.py`](../backend/app/models/ipam.py),
-[`vlans.py`](../backend/app/models/vlans.py),
-[`vrf.py`](../backend/app/models/vrf.py),
-[`multicast.py`](../backend/app/models/multicast.py). Feature spec:
+Files: [`ipam.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/ipam.py),
+[`vlans.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/vlans.py),
+[`vrf.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/vrf.py),
+[`multicast.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/multicast.py). Feature spec:
 [IPAM.md](features/IPAM.md).
 
 The core hierarchy is a strict containment tree:
@@ -195,7 +195,7 @@ stream identity), `MulticastGroupPort`, and `MulticastMembership`
 
 ## 3. DNS
 
-File: [`dns.py`](../backend/app/models/dns.py). Feature spec:
+File: [`dns.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/dns.py). Feature spec:
 [DNS.md](features/DNS.md). Drivers:
 [DNS_DRIVERS.md](drivers/DNS_DRIVERS.md).
 
@@ -241,7 +241,7 @@ Supporting / config tables:
 
 ## 4. DHCP
 
-File: [`dhcp.py`](../backend/app/models/dhcp.py). Feature spec:
+File: [`dhcp.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/dhcp.py). Feature spec:
 [DHCP.md](features/DHCP.md). Drivers:
 [DHCP_DRIVERS.md](drivers/DHCP_DRIVERS.md).
 
@@ -283,15 +283,15 @@ Supporting tables:
 
 Logical ownership + WAN/service modeling overlaid on the IPAM/DNS/DHCP
 core. Files:
-[`asn.py`](../backend/app/models/asn.py),
-[`vrf.py`](../backend/app/models/vrf.py),
-[`domain.py`](../backend/app/models/domain.py),
-[`ownership.py`](../backend/app/models/ownership.py),
-[`circuit.py`](../backend/app/models/circuit.py),
-[`network_service.py`](../backend/app/models/network_service.py),
-[`overlay.py`](../backend/app/models/overlay.py),
-[`network.py`](../backend/app/models/network.py),
-[`bgp_looking_glass.py`](../backend/app/models/bgp_looking_glass.py).
+[`asn.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/asn.py),
+[`vrf.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/vrf.py),
+[`domain.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/domain.py),
+[`ownership.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/ownership.py),
+[`circuit.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/circuit.py),
+[`network_service.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/network_service.py),
+[`overlay.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/overlay.py),
+[`network.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/network.py),
+[`bgp_looking_glass.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/bgp_looking_glass.py).
 
 | Model | Table | Notes |
 |---|---|---|
@@ -336,9 +336,9 @@ The `network.py` file holds discovery-side tables: `NetworkDevice`,
 
 ## 6. Auth + RBAC
 
-File: [`auth.py`](../backend/app/models/auth.py),
-[`auth_provider.py`](../backend/app/models/auth_provider.py),
-[`time_bound_grant.py`](../backend/app/models/time_bound_grant.py).
+File: [`auth.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/auth.py),
+[`auth_provider.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/auth_provider.py),
+[`time_bound_grant.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/time_bound_grant.py).
 Permission grammar: [PERMISSIONS.md](PERMISSIONS.md).
 
 <p align="center">
@@ -401,7 +401,7 @@ mirror) and the cloud DNS drivers are documented in
 
 ## 8. Appliance + fleet
 
-File: [`appliance.py`](../backend/app/models/appliance.py). Deployment:
+File: [`appliance.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/appliance.py). Deployment:
 [DNS_AGENT.md](deployment/DNS_AGENT.md).
 
 | Model | Table | Notes |
@@ -420,16 +420,16 @@ pairing-code FK on `Appliance` is `SET NULL` so the code reaper can sweep
 terminal codes without taking down the appliances they provisioned.
 
 System-upgrade state lives in
-[`system_upgrade.py`](../backend/app/models/system_upgrade.py)
+[`system_upgrade.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/system_upgrade.py)
 (`SystemUpgradeRun`, table `system_upgrade_run`).
 
 ---
 
 ## 9. Compliance + governance
 
-Files: [`conformity.py`](../backend/app/models/conformity.py),
-[`alerts.py`](../backend/app/models/alerts.py),
-[`change_request.py`](../backend/app/models/change_request.py).
+Files: [`conformity.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/conformity.py),
+[`alerts.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/alerts.py),
+[`change_request.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/change_request.py).
 
 | Model | Table | Notes |
 |---|---|---|
@@ -465,12 +465,12 @@ gate rows, which carry the policy-derived `risk_reason` instead.
 
 ## 10. Observability + audit
 
-Files: [`audit.py`](../backend/app/models/audit.py),
-[`logs.py`](../backend/app/models/logs.py),
-[`metrics.py`](../backend/app/models/metrics.py),
-[`event_subscription.py`](../backend/app/models/event_subscription.py),
-[`audit_forward.py`](../backend/app/models/audit_forward.py),
-[`diagnostics.py`](../backend/app/models/diagnostics.py). Spec:
+Files: [`audit.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/audit.py),
+[`logs.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/logs.py),
+[`metrics.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/metrics.py),
+[`event_subscription.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/event_subscription.py),
+[`audit_forward.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/audit_forward.py),
+[`diagnostics.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/diagnostics.py). Spec:
 [OBSERVABILITY.md](OBSERVABILITY.md).
 
 ### Audit log (append-only + hash chain)
@@ -482,7 +482,7 @@ trigger blocks `DELETE` as a second guard (issue #73).
 Tamper-evidence is a hash chain: each row carries a monotonic
 `BigInteger seq` (assigned from `audit_log_seq_seq`), a `row_hash`, and a
 `prev_hash` pointing at the previous row's hash. The hash is computed in
-[`app.services.audit_chain`](../backend/app/services/audit_chain.py) via
+[`app.services.audit_chain`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/services/audit_chain.py) via
 a SQLAlchemy `before_flush` listener that takes a Postgres advisory lock
 to serialize "look up previous row → hash → append", so concurrent
 inserts can't interleave and break the chain. `prev_hash` is NULL only on
@@ -545,4 +545,4 @@ include and MCP tools gate on it.
 - [DHCP.md](features/DHCP.md) — scopes, pools, statics, leases, HA
 - [PERMISSIONS.md](PERMISSIONS.md) — the `{action, resource_type, resource_id?}` grammar
 - [OBSERVABILITY.md](OBSERVABILITY.md) — audit chain, logging, metrics, alerting
-- [`backend/alembic/`](../backend/alembic/) — the deployed schema, migration by migration
+- [`backend/alembic/`](https://github.com/spatiumddi/spatiumddi/tree/main/backend/alembic) — the deployed schema, migration by migration

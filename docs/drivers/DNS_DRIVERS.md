@@ -2,7 +2,7 @@
 
 ## Overview
 
-DNS drivers implement the `DNSDriver` abstract base class in [`app/drivers/dns/base.py`](../../backend/app/drivers/dns/base.py). They are responsible for translating SpatiumDDI's internal DNS model into backend-neutral config + per-record ops. The critical constraint: **no DNS driver may restart the DNS daemon** as part of normal record or zone operations.
+DNS drivers implement the `DNSDriver` abstract base class in [`app/drivers/dns/base.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dns/base.py). They are responsible for translating SpatiumDDI's internal DNS model into backend-neutral config + per-record ops. The critical constraint: **no DNS driver may restart the DNS daemon** as part of normal record or zone operations.
 
 The control-plane driver is a *thin* translator (CLAUDE.md non-negotiable #10): it takes SpatiumDDI DB models and emits a canonical `ConfigBundle` (plus per-record `RecordChange` ops) in neutral types. For agent-managed drivers (BIND9, PowerDNS) the actual daemon lifecycle — `nsupdate`, `rndc`, the PowerDNS REST API — runs inside the agent container; the control-plane `apply_record_change` is a formulate-only no-op that logs the op. For agentless drivers (Windows DNS, the cloud providers) `apply_record_change` runs synchronously from the control plane.
 
@@ -10,7 +10,7 @@ The control-plane driver is a *thin* translator (CLAUDE.md non-negotiable #10): 
 
 ## 1. Abstract Base Class
 
-The neutral data shapes and the ABC both live in [`app/drivers/dns/base.py`](../../backend/app/drivers/dns/base.py). The driver speaks only in these frozen dataclasses — `RecordData`, `ZoneData`, `RecordChange`, `RecordChangeResult`, `ConfigBundle`, `ServerOptions`, plus the BIND9 config pieces (`ViewData`, `AclData`, `TsigKey`, `TrustAnchorData`, `DNSSECPolicyData`, `EffectiveBlocklistData`). A couple of the central ones:
+The neutral data shapes and the ABC both live in [`app/drivers/dns/base.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dns/base.py). The driver speaks only in these frozen dataclasses — `RecordData`, `ZoneData`, `RecordChange`, `RecordChangeResult`, `ConfigBundle`, `ServerOptions`, plus the BIND9 config pieces (`ViewData`, `AclData`, `TsigKey`, `TrustAnchorData`, `DNSSECPolicyData`, `EffectiveBlocklistData`). A couple of the central ones:
 
 ```python
 @dataclass(frozen=True)
@@ -337,7 +337,7 @@ dnsdist Deployment fronting the hostNetwork pdns DaemonSet) is a follow-up.
 
 ## 3. Windows DNS Driver
 
-Located at [`app/drivers/dns/windows.py`](../../backend/app/drivers/dns/windows.py). Class: `WindowsDNSDriver`. Two capability tiers coexist on the same driver class; which one applies at runtime depends on whether `DNSServer.credentials_encrypted` is set.
+Located at [`app/drivers/dns/windows.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dns/windows.py). Class: `WindowsDNSDriver`. Two capability tiers coexist on the same driver class; which one applies at runtime depends on whether `DNSServer.credentials_encrypted` is set.
 
 ### 3.1 Path A — RFC 2136 (always available)
 
@@ -383,7 +383,7 @@ Required security group for the service account: `DnsAdmins` on the domain (or a
 
 ### 3.4 Driver registry classification
 
-In [`app/drivers/dns/__init__.py`](../../backend/app/drivers/dns/__init__.py):
+In [`app/drivers/dns/__init__.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dns/__init__.py):
 
 ```python
 AGENTLESS_DRIVERS: frozenset[str] = frozenset(
@@ -407,7 +407,7 @@ If the push fails, the 502 response prevents the DB commit — the Windows DNS s
 
 ### 3.6 Shared AXFR helper
 
-[`drivers/dns/_axfr.py`](../../backend/app/drivers/dns/_axfr.py) extracts the AXFR → `RecordData` logic used by both BIND9 and Windows Path A. Filters SOA + apex NS; absolutises CNAME / NS / PTR / MX / SRV targets.
+[`drivers/dns/_axfr.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dns/_axfr.py) extracts the AXFR → `RecordData` logic used by both BIND9 and Windows Path A. Filters SOA + apex NS; absolutises CNAME / NS / PTR / MX / SRV targets.
 
 ### 3.7 Batched WinRM dispatch
 
@@ -430,7 +430,7 @@ BIND9 + any future driver gets the plural interface for free via the default loo
 
 **Windows batch sizing — length-measured chunks (issue #426).** The real constraint isn't WinRM's envelope cap (`MaxEnvelopeSize` defaults to 500 KB) but the way `pywinrm.run_ps` ships the script: UTF-16-LE → base64 → `powershell.exe -EncodedCommand <b64>` → **single CMD.EXE command line, hard-capped at ~8191 chars by Windows**. Base64 costs ×1.33, UTF-16-LE costs ×2, so each raw script char eats ~2.67 chars of command-line budget.
 
-Rather than a fixed op count, `_pack_record_chunks` greedily packs each chunk and measures the **actual built script** against `MAX_ENCODED_COMMAND` (7800, in [`drivers/_winrm.py`](../../backend/app/drivers/_winrm.py)) via `encoded_command_len`, so a chunk of large TXT (DKIM/SPF/DMARC) records can't silently overflow the cmdline. `_WINRM_MAX_BATCH_OPS = 25` is a coarse sanity cap on top of the length check. A single op that won't fit even alone still ships as a one-op chunk; the dispatcher catches the resulting too-long error and fails just that op. (The previous fixed count of 6 had no length check — a few big TXT records would blow the cap and fail the whole chunk.)
+Rather than a fixed op count, `_pack_record_chunks` greedily packs each chunk and measures the **actual built script** against `MAX_ENCODED_COMMAND` (7800, in [`drivers/_winrm.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/_winrm.py)) via `encoded_command_len`, so a chunk of large TXT (DKIM/SPF/DMARC) records can't silently overflow the cmdline. `_WINRM_MAX_BATCH_OPS = 25` is a coarse sanity cap on top of the length check. A single op that won't fit even alone still ships as a one-op chunk; the dispatcher catches the resulting too-long error and fails just that op. (The previous fixed count of 6 had no length check — a few big TXT records would blow the cap and fail the whole chunk.)
 
 **Script layout.** One invocation carries data-only JSON with short keys (`i/op/z/n/t/v/ttl/pr/w/p`) and a single dispatch wrapper:
 
@@ -455,11 +455,11 @@ $r | ConvertTo-Json -Compress -Depth 3
 
 `$ErrorActionPreference = 'Continue'` ensures a per-op `throw` doesn't abort the enclosing script; the try/catch per op records the error into the result array. Chunk-wide script errors (syntax, base64 decode) still raise from `_run_ps` and propagate to the caller.
 
-**Lifting the ceiling — pypsrp.** Future upgrade path: swap `pywinrm` for `pypsrp`. PSRP uses the WSMan Runspace protocol instead of CMD.EXE and removes the 8K limit entirely — would yield ~100 ops/batch on the same envelope settings. Tracked as a TODO comment in [`drivers/dns/windows.py`](../../backend/app/drivers/dns/windows.py).
+**Lifting the ceiling — pypsrp.** Future upgrade path: swap `pywinrm` for `pypsrp`. PSRP uses the WSMan Runspace protocol instead of CMD.EXE and removes the 8K limit entirely — would yield ~100 ops/batch on the same envelope settings. Tracked as a TODO comment in [`drivers/dns/windows.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dns/windows.py).
 
 **RFC 2136 path — `asyncio.gather`.** The 2136 write path is cheap per-op but was still serial. Record ops now run in parallel via `asyncio.gather`; no batching needed because the dnspython update framing is already compact.
 
-**Dispatch.** `enqueue_record_ops_batch(db, zone, ops)` in [`services/dns/record_ops.py`](../../backend/app/services/dns/record_ops.py) groups pending ops by zone and calls `apply_record_changes` once per group. Zone serial bumps once per batch instead of N times. **State-aware commit**: the caller zips through the returned op rows and keeps the DB row only when the op came back `state == "failed"` — a server rejected the delete, so the record is still published and reporting "deleted" would leave a zombie the next "Sync with server" pulls back. Every other outcome deletes locally: `applied` (agentless, inline), `pending` (agent-based — the agent applies it on its next long-poll; gating on `applied` here was the #950 / #962 defect, which reported every agent-side delete as failed) and `None` (no primary to push to — DB-only cruft, #623).
+**Dispatch.** `enqueue_record_ops_batch(db, zone, ops)` in [`services/dns/record_ops.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/services/dns/record_ops.py) groups pending ops by zone and calls `apply_record_changes` once per group. Zone serial bumps once per batch instead of N times. **State-aware commit**: the caller zips through the returned op rows and keeps the DB row only when the op came back `state == "failed"` — a server rejected the delete, so the record is still published and reporting "deleted" would leave a zombie the next "Sync with server" pulls back. Every other outcome deletes locally: `applied` (agentless, inline), `pending` (agent-based — the agent applies it on its next long-poll; gating on `applied` here was the #950 / #962 defect, which reported every agent-side delete as failed) and `None` (no primary to push to — DB-only cruft, #623).
 
 **Results.**
 
@@ -472,7 +472,7 @@ $r | ConvertTo-Json -Compress -Depth 3
 
 ## 4. PowerDNS Driver
 
-Located at [`app/drivers/dns/powerdns.py`](../../backend/app/drivers/dns/powerdns.py). Class: `PowerDNSDriver`. Shipped in issue #127.
+Located at [`app/drivers/dns/powerdns.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dns/powerdns.py). Class: `PowerDNSDriver`. Shipped in issue #127.
 
 PowerDNS is a second authoritative driver running side-by-side with BIND9. It is **agent-managed** the same way BIND9 is — there is one DNS agent per server, the agent owns the local PowerDNS daemon (`pdns_server`), and the control plane never opens a connection to PowerDNS directly. The agent talks to PowerDNS's REST API on `127.0.0.1:8081`; the control plane talks to the agent through the existing long-poll `/config` channel.
 
@@ -648,7 +648,7 @@ These are infrastructure-DNS drivers, distinct from the *Cloud (AWS / Azure / GC
 
 ### 4A.1 Agentless shape (reuses Windows-DNS Path B)
 
-The shared base [`drivers/dns/_cloud_base.py`](../../backend/app/drivers/dns/_cloud_base.py) (`CloudDNSDriverBase`) mirrors how `windows_dns` Path B already works (§3 above):
+The shared base [`drivers/dns/_cloud_base.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dns/_cloud_base.py) (`CloudDNSDriverBase`) mirrors how `windows_dns` Path B already works (§3 above):
 
 - **No ConfigBundle / long-poll.** The `render_*` methods return `""` and the `reload_*` methods are no-ops — agentless drivers never render daemon config. `validate_config` accepts anything.
 - **Credentials in the existing column.** The per-provider credential dict is Fernet-encrypted in the existing `DNSServer.credentials_encrypted` column — no new credential store. `_load_credentials` decrypts it, raising a clean `CloudDNSError` when unset vs. when the API rejects the key.
@@ -1059,7 +1059,7 @@ A group is single-driver, so servers of the two kinds live in separate groups.
 There is no dedicated driver-exception hierarchy. Drivers raise plain exceptions and let the caller decide how to surface them:
 
 - **BIND9 / Windows DNS** raise stdlib `RuntimeError` / `ValueError` on bad input or a hard failure (e.g. `BIND9Driver.apply_record_change` raises `RuntimeError` when no TSIG key is configured rather than ever sending an unsigned update; the Windows PowerShell helpers `raise ValueError` on an unsupported op / record type).
-- **Cloud drivers** (`CloudDNSDriverBase` and its subclasses) raise `CloudDNSError` ([`drivers/dns/_cloud_base.py`](../../backend/app/drivers/dns/_cloud_base.py)) — each provider's `_unwrap` / `_wrap_errors` / `_wrap_call` helper normalises the raw SDK/HTTP fault into an operator-facing `CloudDNSError` message first (§4A.5).
+- **Cloud drivers** (`CloudDNSDriverBase` and its subclasses) raise `CloudDNSError` ([`drivers/dns/_cloud_base.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dns/_cloud_base.py)) — each provider's `_unwrap` / `_wrap_errors` / `_wrap_call` helper normalises the raw SDK/HTTP fault into an operator-facing `CloudDNSError` message first (§4A.5).
 
 Rules every driver follows:
 
@@ -1069,7 +1069,7 @@ Rules every driver follows:
 
 **Per-op isolation lives in `apply_record_changes`, not in the driver methods.** The default batch loop on `DNSDriver` (§1) catches each per-op exception and records it as `RecordChangeResult(ok=False, error=str(exc))` so one bad record never poisons the rest of the batch. Whole-batch failures (connection refused, auth, a malformed generated script) still propagate by raising from the driver.
 
-The service layer turns those outcomes into persisted state. [`services/dns/record_ops.py`](../../backend/app/services/dns/record_ops.py) writes a `DNSRecordOp` row per op, marking it `state="applied"` (clearing `last_error`) on success or `state="failed"` with the truncated `last_error` on exception, so operators get a per-op audit trail either way. A whole-batch exception marks every row in the batch `failed` with the same error. Retry, where applicable, is the caller's concern (e.g. Celery task retries on the agent push path) — the driver itself does not retry.
+The service layer turns those outcomes into persisted state. [`services/dns/record_ops.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/services/dns/record_ops.py) writes a `DNSRecordOp` row per op, marking it `state="applied"` (clearing `last_error`) on success or `state="failed"` with the truncated `last_error` on exception, so operators get a per-op audit trail either way. A whole-batch exception marks every row in the batch `failed` with the same error. Retry, where applicable, is the caller's concern (e.g. Celery task retries on the agent push path) — the driver itself does not retry.
 
 ---
 

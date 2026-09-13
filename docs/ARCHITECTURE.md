@@ -11,7 +11,7 @@
 > container contract in full), [`deployment/DOCKER.md`](deployment/DOCKER.md),
 > [`deployment/APPLIANCE.md`](deployment/APPLIANCE.md), and
 > [`OBSERVABILITY.md`](OBSERVABILITY.md). The repo-wide conventions
-> and non-negotiables live in [`../CLAUDE.md`](../CLAUDE.md).
+> and non-negotiables live in [`../CLAUDE.md`](https://github.com/spatiumddi/spatiumddi/blob/main/CLAUDE.md).
 
 ![SpatiumDDI architecture](assets/architecture.svg)
 
@@ -29,7 +29,7 @@ deploys, configures, and runs.
 </p>
 
 Three properties define the design and are enforced everywhere
-(see [`../CLAUDE.md`](../CLAUDE.md) "Absolute Non-Negotiables"):
+(see [`../CLAUDE.md`](https://github.com/spatiumddi/spatiumddi/blob/main/CLAUDE.md) "Absolute Non-Negotiables"):
 
 - **API-first** — every UI action is a REST call. The browser SPA, CLI
   tooling, and the MCP surface for the Operator Copilot all share the
@@ -51,8 +51,8 @@ The control plane is five long-lived processes plus two datastores. In
 Docker Compose they are the `frontend`, `api`, `worker`, `beat`,
 `migrate`, `postgres`, and `redis` services
 (`docker-compose.yml`); in Kubernetes they map to the corresponding
-manifests under [`../k8s/base/`](../k8s/base/) and the umbrella chart
-[`../charts/spatiumddi/`](../charts/spatiumddi/).
+manifests under [`../k8s/base/`](https://github.com/spatiumddi/spatiumddi/tree/main/k8s/base) and the umbrella chart
+[`../charts/spatiumddi/`](https://github.com/spatiumddi/spatiumddi/tree/main/charts/spatiumddi).
 
 ### api — FastAPI + uvicorn
 
@@ -93,7 +93,7 @@ The scheduler that *enqueues* periodic tasks (the schedule lives in
 one replica, `Recreate` rollout strategy — because two beats would
 double-enqueue. The deliberate decision not to add leader election is
 documented inline in
-[`../charts/spatiumddi/templates/beat.yaml`](../charts/spatiumddi/templates/beat.yaml):
+[`../charts/spatiumddi/templates/beat.yaml`](https://github.com/spatiumddi/spatiumddi/blob/main/charts/spatiumddi/templates/beat.yaml):
 beat only enqueues, every task is itself idempotent, and the broker
 (Redis) is already HA, so a Redis-backed beat lock would add a
 node-drain-blocking workload for no correctness gain.
@@ -109,7 +109,7 @@ the full port reference and TLS setup.
 ### migrate — one-shot Alembic job
 
 `alembic upgrade head` runs as a short-lived job/container before the
-api becomes ready ([`../k8s/base/migrate-job.yaml`](../k8s/base/migrate-job.yaml)).
+api becomes ready ([`../k8s/base/migrate-job.yaml`](https://github.com/spatiumddi/spatiumddi/blob/main/k8s/base/migrate-job.yaml)).
 On a fresh multi-node install the api deliberately stays **out of the
 Service endpoint set until the schema matches the head its image
 expects**: `/health/ready` reads the bundled Alembic head once and
@@ -154,8 +154,8 @@ control plane, pulls config, and applies it. Available service images
 | `dns-technitium` | Technitium DNS Server | `technitium` |
 | `dhcp-kea` | Kea DHCPv4/DHCPv6 | `kea` |
 
-The DNS agent lives in [`../agent/dns/spatium_dns_agent/`](../agent/dns/spatium_dns_agent/),
-the DHCP agent in [`../agent/dhcp/spatium_dhcp_agent/`](../agent/dhcp/spatium_dhcp_agent/).
+The DNS agent lives in [`../agent/dns/spatium_dns_agent/`](https://github.com/spatiumddi/spatiumddi/tree/main/agent/dns/spatium_dns_agent),
+the DHCP agent in [`../agent/dhcp/spatium_dhcp_agent/`](https://github.com/spatiumddi/spatiumddi/tree/main/agent/dhcp/spatium_dhcp_agent).
 Both are multi-arch (`linux/amd64` + `linux/arm64`).
 
 ### Driver abstraction
@@ -176,7 +176,7 @@ drives directly with no agent on the far side. See
 ### The supervisor (OS appliance only)
 
 On the OS appliance, a per-host **`spatium-supervisor`**
-([`../agent/supervisor/spatium_supervisor/`](../agent/supervisor/spatium_supervisor/))
+([`../agent/supervisor/spatium_supervisor/`](https://github.com/spatiumddi/spatiumddi/tree/main/agent/supervisor/spatium_supervisor))
 owns all appliance-host concerns the service containers used to carry:
 slot telemetry + slot-upgrade/reboot triggers, SNMP / chrony / firewall
 / timezone reload triggers, deployment-kind detection, and role
@@ -350,9 +350,9 @@ serving even when the control plane is unreachable.
 The api, worker, and frontend are stateless and scale horizontally;
 beat stays a singleton (§2). For the datastores you bring HA Postgres
 (Patroni or CloudNativePG) and HA Redis (Sentinel). The umbrella chart
-([`../charts/spatiumddi/`](../charts/spatiumddi/)) ships an in-chart
+([`../charts/spatiumddi/`](https://github.com/spatiumddi/spatiumddi/tree/main/charts/spatiumddi)) ships an in-chart
 Redis Sentinel option; reference HA add-ons live under
-[`../k8s/ha/`](../k8s/ha/) (`postgres-cluster.yaml` for CloudNativePG,
+[`../k8s/ha/`](https://github.com/spatiumddi/spatiumddi/tree/main/k8s/ha) (`postgres-cluster.yaml` for CloudNativePG,
 `redis-sentinel.yaml`, and a Patroni Compose). When Redis is HA the app
 connects via a `sentinel://` URL and the wake bus follows failover
 through the Sentinel-aware Redis client.
@@ -377,7 +377,7 @@ Fleet tab in `/appliance`:
   election; the app runs on `sentinel://`.
 - **MetalLB L2 control-plane VIP** — one stable UI/API address that
   floats across replicas, shipped in its own `metallb-system` namespace
-  ([`../charts/spatiumddi-metallb/`](../charts/spatiumddi-metallb/)).
+  ([`../charts/spatiumddi-metallb/`](https://github.com/spatiumddi/spatiumddi/tree/main/charts/spatiumddi-metallb)).
   The operator sets the pool + VIP from Fleet → Network & Host.
 
 Beat/migrate/audit-chain are singleton-tolerant, and one shared Web UI
@@ -390,7 +390,7 @@ multi-node rolling upgrade orchestrator are described in
 > ⚠️ The HA partition layout (6-partition GPT + Talos `state`
 > partition) is not A/B-upgradeable across the pre-HA layout — older
 > field-test appliances must full-reinstall from the HA ISO. See the
-> appliance release notes in [`../CHANGELOG.md`](../CHANGELOG.md).
+> appliance release notes in [`../CHANGELOG.md`](https://github.com/spatiumddi/spatiumddi/blob/main/CHANGELOG.md).
 
 ---
 
@@ -404,4 +404,4 @@ multi-node rolling upgrade orchestrator are described in
 - RBAC grammar and builtin roles → [`PERMISSIONS.md`](PERMISSIONS.md)
 - Driver internals → [`drivers/DNS_DRIVERS.md`](drivers/DNS_DRIVERS.md), [`drivers/DHCP_DRIVERS.md`](drivers/DHCP_DRIVERS.md)
 - The database model map → [`DATA_MODEL.md`](DATA_MODEL.md); REST API conventions → [`API.md`](API.md)
-- Coding standards, tests, and the CI pipeline → [`DEVELOPMENT.md`](DEVELOPMENT.md); repo-wide conventions and non-negotiables → [`../CLAUDE.md`](../CLAUDE.md)
+- Coding standards, tests, and the CI pipeline → [`DEVELOPMENT.md`](DEVELOPMENT.md); repo-wide conventions and non-negotiables → [`../CLAUDE.md`](https://github.com/spatiumddi/spatiumddi/blob/main/CLAUDE.md)

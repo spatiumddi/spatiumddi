@@ -11,7 +11,7 @@
 For the per-platform install steps, see:
 
 - [`DOCKER.md`](DOCKER.md) — Docker Compose deployment recipes
-- [`../../k8s/README.md`](../../k8s/README.md) — Kubernetes manifests + Helm chart
+- [`../../k8s/README.md`](https://github.com/spatiumddi/spatiumddi/blob/main/k8s/README.md) — Kubernetes manifests + Helm chart
 - [`DNS_AGENT.md`](DNS_AGENT.md) — DNS-agent protocol details
 - [`APPLIANCE.md`](APPLIANCE.md) — OS appliance image
 - [`WINDOWS.md`](WINDOWS.md) — Windows Server-side checklist (WinRM / DnsAdmins / DHCP Users)
@@ -109,7 +109,7 @@ its PSK for a rotating JWT, then long-polls forever. See
 > Pairing` — no hex key to copy. The agent's supervisor registers, the
 > operator approves it on `/appliance → Fleet`, and roles are assigned
 > from the UI. See the README's
-> ["Joining DNS / DHCP agents"](../../README.md#joining-dns--dhcp-agents)
+> ["Joining DNS / DHCP agents"](https://github.com/spatiumddi/spatiumddi/blob/main/README.md#joining-dns--dhcp-agents)
 > section + [`APPLIANCE.md`](APPLIANCE.md).
 
 ---
@@ -261,7 +261,7 @@ dhcpAgents.enabled: true        # spawns the kea StatefulSet (group-centric HA)
 
 Beat is always a single-replica singleton — there's no toggle for it.
 
-See [`../../k8s/README.md`](../../k8s/README.md) for the Helm-vs-raw-manifest
+See [`../../k8s/README.md`](https://github.com/spatiumddi/spatiumddi/blob/main/k8s/README.md) for the Helm-vs-raw-manifest
 walkthrough, the RWX PVC overlay needed for `local_volume` backup
 targets, and the upgrade-flow recipe.
 

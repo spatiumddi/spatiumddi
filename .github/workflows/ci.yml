@@ -245,6 +245,14 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: python3 scripts/lint_ssh_recovery_claims.py
 
+      # #1070 — the published docs site carries docs/ and nothing else, so a
+      # relative link out of it 404s for every reader while still working on
+      # GitHub, where docs/ sits beside the code. There were 92 such links
+      # when this landed. stdlib-only, no database; runs from repo root.
+      - name: Docs link linter
+        working-directory: ${{ github.workspace }}
+        run: python3 scripts/lint_docs_links.py
+
   # The ~4,200-test suite is DB-bound (conftest TRUNCATEs every table per
   # test), so we fan it out across 12 parallel jobs via pytest-split; each
   # job still runs ``-n auto`` (4 xdist workers on a 4-vCPU runner).

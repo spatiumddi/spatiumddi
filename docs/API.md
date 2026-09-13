@@ -29,8 +29,8 @@ All application endpoints are mounted under a single version prefix:
 ```
 
 The version router family is assembled in
-[`backend/app/api/v1/router.py`](../backend/app/api/v1/router.py) and
-mounted by [`backend/app/main.py`](../backend/app/main.py):
+[`backend/app/api/v1/router.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/api/v1/router.py) and
+mounted by [`backend/app/main.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/main.py):
 
 ```python
 app.include_router(api_v1_router, prefix="/api/v1")
@@ -60,7 +60,7 @@ sections A → Z.
 
 The FastAPI app serves the standard interactive docs and the raw
 OpenAPI schema (configured in `create_app()` in
-[`backend/app/main.py`](../backend/app/main.py)):
+[`backend/app/main.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/main.py)):
 
 | Route | What it serves |
 |---|---|
@@ -95,7 +95,7 @@ Reproduce the identical file locally at any tag:
 make openapi VERSION=2026.08.22-1     # writes ./openapi.json
 ```
 
-Both go through [`scripts/export_openapi.py`](../scripts/export_openapi.py),
+Both go through [`scripts/export_openapi.py`](https://github.com/spatiumddi/spatiumddi/blob/main/scripts/export_openapi.py),
 which is the only supported way to generate it. Three things that script
 guarantees and a hand-rolled dump would not:
 
@@ -196,7 +196,7 @@ them, and then rejects the values that have none. A fixed shape removes a
 hand-written workaround from every client. `format: date-time` on the
 property is unchanged, so a generator still emits a date decoder rather
 than a string; only the precision is pinned. See
-[`backend/app/core/json_datetime.py`](../backend/app/core/json_datetime.py).
+[`backend/app/core/json_datetime.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/core/json_datetime.py).
 
 The rule covers every `datetime`-typed field the API returns. It does
 **not** reach a timestamp parked inside an untyped payload — an `Any` /
@@ -293,7 +293,7 @@ differently.
 
 The API authenticates via the HTTP **`Authorization: Bearer <token>`**
 header. Two credential kinds are accepted on the same header, resolved
-in [`backend/app/api/deps.py`](../backend/app/api/deps.py)
+in [`backend/app/api/deps.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/api/deps.py)
 (`get_current_user`):
 
 1. **Session JWT** — a short-lived access token issued by
@@ -377,7 +377,7 @@ Two narrowing mechanisms apply, both enforced in `deps.py`
 *before* RBAC:
 
 - **Scopes** (`scopes: [...]`) — a coarse, closed vocabulary defined in
-  [`backend/app/services/api_token_scopes.py`](../backend/app/services/api_token_scopes.py):
+  [`backend/app/services/api_token_scopes.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/services/api_token_scopes.py):
   `read`, `ipam:write`, `dns:write`, `dhcp:write`, `agent`. An empty
   list means no scope restriction. A non-empty list is checked against
   the request method + path; a request matching none of the token's
@@ -427,7 +427,7 @@ Top-level resource families can be turned off as **feature modules**
 `Depends(require_module("..."))` and returns **`404 Not Found`** — not
 `403` — so the API surface mirrors an air-gapped deployment where the
 feature simply isn't installed
-([`backend/app/services/feature_modules.py`](../backend/app/services/feature_modules.py)):
+([`backend/app/services/feature_modules.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/services/feature_modules.py)):
 
 ```json
 { "detail": "Feature 'network.circuit' is disabled." }
@@ -468,7 +468,7 @@ envelope; the legacy core routers return bare arrays.
 The network-modeling and newer routers (circuits, services, ASNs,
 VRFs, overlays, multicast, TLS certs, …) accept `limit` + `offset`
 query params and return a typed envelope. From
-[`backend/app/api/v1/circuits/router.py`](../backend/app/api/v1/circuits/router.py):
+[`backend/app/api/v1/circuits/router.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/api/v1/circuits/router.py):
 
 ```
 GET /api/v1/circuits?limit=100&offset=0

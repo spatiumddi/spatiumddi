@@ -2,11 +2,11 @@
 
 > Coding standards, the lint/test stack, the CI gate, the migration
 > workflow, and the conventions every change must follow. Read
-> [`CONTRIBUTING.md`](../CONTRIBUTING.md) first for the high-level
+> [`CONTRIBUTING.md`](https://github.com/spatiumddi/spatiumddi/blob/main/CONTRIBUTING.md) first for the high-level
 > contribution flow; this doc is the detailed reference behind it.
 
 The canonical spec for *what* the project is and *why* decisions were
-made lives in [`CLAUDE.md`](../CLAUDE.md). This guide covers *how* to
+made lives in [`CLAUDE.md`](https://github.com/spatiumddi/spatiumddi/blob/main/CLAUDE.md). This guide covers *how* to
 build, test, and ship changes.
 
 ---
@@ -71,7 +71,7 @@ npm run dev
 ```
 
 If you get locked out of the admin account, see the password-reset
-recipe in [`CLAUDE.md`](../CLAUDE.md#development-commands) and
+recipe in [`CLAUDE.md`](https://github.com/spatiumddi/spatiumddi/blob/main/CLAUDE.md#development-commands) and
 [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
 
 ---
@@ -167,7 +167,7 @@ help text in step (#81).
 
 ## 4. The Absolute Non-Negotiables
 
-These rules from [`CLAUDE.md`](../CLAUDE.md#absolute-non-negotiables)
+These rules from [`CLAUDE.md`](https://github.com/spatiumddi/spatiumddi/blob/main/CLAUDE.md#absolute-non-negotiables)
 apply to every change. They are reproduced here as a quick checklist;
 the canonical wording lives in `CLAUDE.md`.
 
@@ -348,7 +348,7 @@ container (no repo root above `backend/` there) and run in CI.
 
 ### What a new endpoint needs
 
-Per [`CONTRIBUTING.md`](../CONTRIBUTING.md), every new API endpoint needs
+Per [`CONTRIBUTING.md`](https://github.com/spatiumddi/spatiumddi/blob/main/CONTRIBUTING.md), every new API endpoint needs
 tests covering the **success**, **unauthorized**, and **validation-error**
 cases.
 
@@ -381,7 +381,7 @@ run the backend tests — use `make test` separately for those.
 
 ### The actual CI jobs
 
-The CI workflow is [`.github/workflows/ci.yml`](../.github/workflows/ci.yml),
+The CI workflow is [`.github/workflows/ci.yml`](https://github.com/spatiumddi/spatiumddi/blob/main/.github/workflows/ci.yml),
 triggered on push to `main` and on every pull request:
 
 | Job | What it does |
@@ -447,7 +447,7 @@ added instead is **per-job** change detection, which keeps the workflow —
 and every check name — unconditional:
 
 1. A `changes` job diffs the PR against its merge base and pipes the file
-   list through [`.github/scripts/ci-backend-relevant.sh`](../.github/scripts/ci-backend-relevant.sh).
+   list through [`.github/scripts/ci-backend-relevant.sh`](https://github.com/spatiumddi/spatiumddi/blob/main/.github/scripts/ci-backend-relevant.sh).
 2. The 12 `backend-test-shard` jobs are gated on its output.
 3. The `Backend — Tests` aggregator treats a skip as a pass — but **only a
    skip that detection asked for**. An empty output (the `changes` job
@@ -482,11 +482,11 @@ than it saves.
 
 ### Nightly builds
 
-[`.github/workflows/nightly.yml`](../.github/workflows/nightly.yml) builds
+[`.github/workflows/nightly.yml`](https://github.com/spatiumddi/spatiumddi/blob/main/.github/workflows/nightly.yml) builds
 and publishes every image from `main` at **20:05 America/New_York**, so
 the pre-release is done by about 21:00 for the evening QA walk. GitHub
 starts scheduled runs in this repository hours late, so a small companion,
-[`nightly-trigger.yml`](../.github/workflows/nightly-trigger.yml), fires
+[`nightly-trigger.yml`](https://github.com/spatiumddi/spatiumddi/blob/main/.github/workflows/nightly-trigger.yml), fires
 early, waits for the instant on the Eastern clock, and dispatches the
 build; `nightly.yml`'s own 03:23 crons are only a fallback for a night
 the trigger never fired. Every nightly is named for the **evening it
@@ -500,7 +500,7 @@ image carrying pytest as root, undetected until the next release cut it.
 The nightly also runs the same Trivy scan CI uses on PRs (HIGH/CRITICAL,
 fix available), *before* anything is pushed, so a base-image CVE surfaces
 the night it lands rather than at the next tag. The verdict comes from
-[`.github/scripts/trivy-gate.sh`](../.github/scripts/trivy-gate.sh),
+[`.github/scripts/trivy-gate.sh`](https://github.com/spatiumddi/spatiumddi/blob/main/.github/scripts/trivy-gate.sh),
 which asks the image's own package index whether each flagged fix is
 installable today: if it is, the image fails (a rebuild would cure it);
 if Alpine has committed the fix but the package has not reached the
@@ -549,7 +549,7 @@ scan, push and prune nothing).
 
 ## 7. Repo Layout
 
-A condensed map (full version in [`CLAUDE.md`](../CLAUDE.md#repo-layout)):
+A condensed map (full version in [`CLAUDE.md`](https://github.com/spatiumddi/spatiumddi/blob/main/CLAUDE.md#repo-layout)):
 
 ```
 backend/app/
@@ -631,12 +631,12 @@ python3 scripts/lint_migrations.py --show       # every finding, baselined or no
 
 Dependabot covers four ecosystems in this repo: `github-actions`,
 `docker` base images in the directories listed in
-[`.github/dependabot.yml`](../.github/dependabot.yml), `pip` and `npm`.
+[`.github/dependabot.yml`](https://github.com/spatiumddi/spatiumddi/blob/main/.github/dependabot.yml), `pip` and `npm`.
 Everything else is invisible to it. It has no Helm ecosystem, and it does
 not read Dockerfile `ARG` values, chart `values.yaml`, action `with:`
 inputs, CI shell-script defaults or the appliance bake arrays.
 
-Those pins are declared in **[`versions.json`](../versions.json)** at the
+Those pins are declared in **[`versions.json`](https://github.com/spatiumddi/spatiumddi/blob/main/versions.json)** at the
 repo root — one entry per component, carrying the canonical `version`,
 every file that holds a copy of it, the `upstream` to check it against,
 and (where a pin is deliberately behind) a `hold` field with the reason.
@@ -746,7 +746,7 @@ on the installer is one that gets deleted.
 
 Every Docker image must support **`linux/amd64` and `linux/arm64`**
 (non-negotiable #11). The release pipeline
-([`.github/workflows/release.yml`](../.github/workflows/release.yml))
+([`.github/workflows/release.yml`](https://github.com/spatiumddi/spatiumddi/blob/main/.github/workflows/release.yml))
 builds each image with `docker/setup-qemu-action` +
 `docker/setup-buildx-action` and `platforms: linux/amd64,linux/arm64`.
 Local `make build` produces single-arch images for your host — the
@@ -763,7 +763,7 @@ multi-arch fan-out happens in CI on a tagged release.
   where `type` ∈ `feat, fix, docs, refactor, perf, test, build, ci,
   chore` and `scope` ∈ `ipam, dns, dhcp, auth, rbac, audit, ui, api, k8s,
   compose, agent-dns, agent-dhcp` (see
-  [`.github/pull_request_template.md`](../.github/pull_request_template.md)).
+  [`.github/pull_request_template.md`](https://github.com/spatiumddi/spatiumddi/blob/main/.github/pull_request_template.md)).
 - **Fill in the PR template** — Summary, Area, Test plan, and
   Migration/deployment notes. Don't leave them blank.
 - **Link issues with the keyword per issue:**
@@ -790,15 +790,15 @@ multi-arch fan-out happens in CI on a tagged release.
 Do **not** file security vulnerabilities as public issues. Use
 [GitHub Security Advisories](https://github.com/spatiumddi/spatiumddi/security/advisories/new)
 for private disclosure, as described in
-[`CONTRIBUTING.md`](../CONTRIBUTING.md).
+[`CONTRIBUTING.md`](https://github.com/spatiumddi/spatiumddi/blob/main/CONTRIBUTING.md).
 
 ---
 
 ## See Also
 
-- [`CONTRIBUTING.md`](../CONTRIBUTING.md) — contribution flow, code
+- [`CONTRIBUTING.md`](https://github.com/spatiumddi/spatiumddi/blob/main/CONTRIBUTING.md) — contribution flow, code
   standards summary, PR process
-- [`CLAUDE.md`](../CLAUDE.md) — the canonical project spec, full
+- [`CLAUDE.md`](https://github.com/spatiumddi/spatiumddi/blob/main/CLAUDE.md) — the canonical project spec, full
   non-negotiables, and cross-cutting patterns
 - [`PERMISSIONS.md`](PERMISSIONS.md) — the RBAC permission grammar enforced
   server-side

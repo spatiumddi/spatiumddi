@@ -1,6 +1,7 @@
 <!doctype html>
 {%- comment -%}
-  Docs page layout — single column, top nav, no sidebar.
+  Docs page layout — single column, top nav, no sidebar. Every page on the
+  site uses it, including the index (#1070 removed the product landing page).
 
   `root` is a relative prefix ("", "../", "../../") computed from the page's
   own depth, used for every asset and nav link.
@@ -34,17 +35,28 @@
   {% include nav.html root=root %}
 
   <main class="doc">
+    {%- comment -%}
+      The index is the site's home, so it gets no crumb pointing at itself.
+    {%- endcomment -%}
+    {%- unless page.url == "/" or page.url == "/index.html" %}
     <div class="doc-crumb">
-      <a href="{{ root }}index.html">Home</a> ›
-      <a href="{{ root }}docs.html">Docs</a>
+      <a href="{{ root }}index.html">Docs</a>
       {%- if page.title %} › {{ page.title }}{%- endif %}
     </div>
+    {%- endunless %}
 
-    <article class="doc-body">
+    {%- comment -%}
+      The index is a card grid, not prose, so it is not held to the 58rem
+      reading measure every other page wants — three columns at that width
+      leaves a third of a desktop viewport empty. Same condition as the
+      breadcrumb above.
+    {%- endcomment -%}
+    <article class="doc-body{% if page.url == "/" or page.url == "/index.html" %} doc-body-wide{% endif %}">
       {{ content }}
     </article>
   </main>
 
+  {% include external-links.html %}
   {% include lightbox.html %}
   {% include footer.html root=root %}
 </body>

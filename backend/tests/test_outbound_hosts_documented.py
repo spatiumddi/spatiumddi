@@ -101,7 +101,7 @@ def test_exactly_one_connection_is_enabled_by_default() -> None:
 
     The headline sentence — "no outbound connection you did not configure,
     with one exception" — is only true while this table has one row in it,
-    and the README, the docs hero and the Settings copy all repeat it. Per
+    and the README and the Settings copy both repeat it. Per
     CLAUDE.md non-negotiable #17 a second default-on connection needs an
     issue and a decision; this makes adding one a deliberate act rather
     than a table edit nobody noticed.
@@ -119,8 +119,8 @@ def test_exactly_one_connection_is_enabled_by_default() -> None:
     # Header row + the single data row.
     assert len(rows) == 2, (
         f"§3.1 has {len(rows) - 1} default-on connection(s), expected 1. Adding one "
-        "is a product decision (CLAUDE.md non-negotiable #17), and the README, the "
-        "docs hero and Settings → Application → Updates all state there is exactly one."
+        "is a product decision (CLAUDE.md non-negotiable #17), and the README and "
+        "Settings → Application → Updates both state there is exactly one."
     )
     # Read the first cell's code span and compare it whole. A substring test
     # would also pass on a row that merely mentions the host in prose — and

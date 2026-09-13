@@ -2,7 +2,7 @@
 
 > **There are no Ansible playbooks and no systemd-native / `.deb` / `.rpm`
 > package install path in this repo today.** A "Bare metal / VM (Ansible)"
-> option appears as **📋 Planned** in the [README deployment table](../../README.md#deployment-options),
+> option appears as **📋 Planned** in the [README deployment table](https://github.com/spatiumddi/spatiumddi/blob/main/README.md#deployment-options),
 > but it is not implemented — do not expect playbooks under `ansible/` or
 > `playbooks/` (there are none). The single `GET /api/v1/ansible/inventory`
 > endpoint in the codebase is an Ansible **dynamic-inventory** source for
@@ -47,7 +47,7 @@ For a single-host stack the bundled `postgres` service is enough. If you want th
 database to survive a node failure on a bare-metal/VM deployment, the repo ships a
 **reference** Patroni overlay:
 
-- **[`k8s/ha/postgres-docker-compose.yaml`](../../k8s/ha/postgres-docker-compose.yaml)**
+- **[`k8s/ha/postgres-docker-compose.yaml`](https://github.com/spatiumddi/spatiumddi/blob/main/k8s/ha/postgres-docker-compose.yaml)**
   — a 3-node Patroni PostgreSQL cluster (1 leader + 2 replicas) with a 3-node etcd
   cluster for consensus and an HAProxy front-end. The application connects to
   HAProxy on port **5000** (read/write → primary) with **5001** for read-only
@@ -135,5 +135,5 @@ Build a local ISO with `make appliance-dev-iso`.
   including the HA control plane (Topology 4) that the Patroni overlay above
   belongs to.
 - **[`KUBERNETES.md`](KUBERNETES.md)** — the umbrella Helm chart walkthrough for
-  Kubernetes / Helm deployments, backed by [`k8s/README.md`](../../k8s/README.md)
-  and the chart's own [`charts/spatiumddi/README.md`](../../charts/spatiumddi/README.md).
+  Kubernetes / Helm deployments, backed by [`k8s/README.md`](https://github.com/spatiumddi/spatiumddi/blob/main/k8s/README.md)
+  and the chart's own [`charts/spatiumddi/README.md`](https://github.com/spatiumddi/spatiumddi/blob/main/charts/spatiumddi/README.md).

@@ -5,9 +5,9 @@ title: DHCP Drivers
 
 # DHCP Driver Specification
 
-DHCP drivers are the backend-specific layer that turns SpatiumDDI's internal DHCP model into operations on real DHCP servers. The service layer only ever speaks to [`DHCPDriver`](../../backend/app/drivers/dhcp/base.py) (CLAUDE.md non-negotiable #10) — no Kea / PowerShell specifics leak above this line.
+DHCP drivers are the backend-specific layer that turns SpatiumDDI's internal DHCP model into operations on real DHCP servers. The service layer only ever speaks to [`DHCPDriver`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dhcp/base.py) (CLAUDE.md non-negotiable #10) — no Kea / PowerShell specifics leak above this line.
 
-The driver registry ([`registry.py`](../../backend/app/drivers/dhcp/registry.py)) classifies drivers along two axes:
+The driver registry ([`registry.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dhcp/registry.py)) classifies drivers along two axes:
 
 | Axis | Values | What it means |
 |---|---|---|
@@ -33,7 +33,7 @@ The abstract base (`DHCPDriver`) has methods for both halves. Read-only agentles
 
 ## 2. Abstract base class
 
-Key methods on [`DHCPDriver`](../../backend/app/drivers/dhcp/base.py):
+Key methods on [`DHCPDriver`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dhcp/base.py):
 
 ```python
 class DHCPDriver(ABC):
@@ -81,7 +81,7 @@ Neutral data classes (`ScopeDef`, `PoolDef`, `StaticAssignmentDef`, `ClientClass
 
 ## 3. Kea driver (agented + write)
 
-Located at [`app/drivers/dhcp/kea.py`](../../backend/app/drivers/dhcp/kea.py). Agent image: [`agent/dhcp/`](../../agent/dhcp/).
+Located at [`app/drivers/dhcp/kea.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dhcp/kea.py). Agent image: [`agent/dhcp/`](https://github.com/spatiumddi/spatiumddi/tree/main/agent/dhcp).
 
 ### Update strategy
 
@@ -228,7 +228,7 @@ Identical pattern to the DNS agent ([`DNS_AGENT.md`](../deployment/DNS_AGENT.md)
 
 ## 4. Windows DHCP driver (agentless + read-only, Path A)
 
-Located at [`app/drivers/dhcp/windows.py`](../../backend/app/drivers/dhcp/windows.py). Class: `WindowsDHCPReadOnlyDriver`.
+Located at [`app/drivers/dhcp/windows.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dhcp/windows.py). Class: `WindowsDHCPReadOnlyDriver`.
 
 ### Capabilities
 
@@ -288,7 +288,7 @@ WinRM transport is `pywinrm` (`winrm.Session`), wrapped in `asyncio.to_thread` b
 
 ### Lease → IPAM mirror
 
-Leases drive a scheduled Celery beat task ([`app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases`](../../backend/app/tasks/dhcp_pull_leases.py)). Beat fires every 60s; the task gates on `PlatformSettings.dhcp_pull_leases_enabled` / `dhcp_pull_leases_interval_seconds`, so the UI can change cadence without restarting beat.
+Leases drive a scheduled Celery beat task ([`app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/tasks/dhcp_pull_leases.py)). Beat fires every 60s; the task gates on `PlatformSettings.dhcp_pull_leases_enabled` / `dhcp_pull_leases_interval_seconds`, so the UI can change cadence without restarting beat.
 
 Per poll cycle:
 
@@ -346,7 +346,7 @@ class DHCPDriver(ABC):
 
 Default ABC impls call the singular method in a loop — Kea inherits the plural interface without changes.
 
-**Windows batch size — 30 ops per chunk.** `pywinrm.run_ps` ships the script as a single CMD.EXE command line (8191-char cap, see [DNS_DRIVERS.md §3.7](DNS_DRIVERS.md#37-batched-winrm-dispatch) for the full math). DHCP payloads are leaner than DNS — each reservation / exclusion op is ~60 raw chars of JSON vs. DNS's ~160 — so the cmdline limit is farther away, but capped at 30 to stay comfortably inside it. Documented in `_WINRM_BATCH_SIZE` in [`drivers/dhcp/windows.py`](../../backend/app/drivers/dhcp/windows.py).
+**Windows batch size — 30 ops per chunk.** `pywinrm.run_ps` ships the script as a single CMD.EXE command line (8191-char cap, see [DNS_DRIVERS.md §3.7](DNS_DRIVERS.md#37-batched-winrm-dispatch) for the full math). DHCP payloads are leaner than DNS — each reservation / exclusion op is ~60 raw chars of JSON vs. DNS's ~160 — so the cmdline limit is farther away, but capped at 30 to stay comfortably inside it. Documented in `_WINRM_BATCH_SIZE` in [`drivers/dhcp/windows.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dhcp/windows.py).
 
 **Dispatcher.** `push_statics_bulk_delete` groups by `(server, scope)` so the IPAM purge-orphans path went from N×M WinRM calls to one per server. Unlike the DNS side there is no state-aware commit here: the dispatcher returns nothing and the caller deletes the `DHCPStaticAssignment` rows regardless — the push is best-effort, and the next lease poll / config bundle reconciles the server.
 
@@ -354,7 +354,7 @@ Default ABC impls call the singular method in a loop — Kea inherits the plural
 
 ## 5. FortiGate driver (agentless + cloud push)
 
-[`fortigate.py`](../../backend/app/drivers/dhcp/fortigate.py) is the first **cloud** agentless DHCP driver: the control plane drives a FortiGate's per-interface DHCP server directly over the FortiOS REST API with an API-admin **Bearer token**, VDOM-scoped, no co-located agent. It subclasses [`AgentlessDHCPDriverBase`](../../backend/app/drivers/dhcp/_cloud_base.py) (the shared cloud base) rather than rendering a daemon config.
+[`fortigate.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dhcp/fortigate.py) is the first **cloud** agentless DHCP driver: the control plane drives a FortiGate's per-interface DHCP server directly over the FortiOS REST API with an API-admin **Bearer token**, VDOM-scoped, no co-located agent. It subclasses [`AgentlessDHCPDriverBase`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dhcp/_cloud_base.py) (the shared cloud base) rather than rendering a daemon config.
 
 ### Model mapping
 
@@ -362,7 +362,7 @@ One SpatiumDDI `DHCPServer(driver="fortigate")` = one FortiGate device + VDOM. A
 
 ### Write unit
 
-The whole DHCP-server object per scope: any scope / pool / static / option edit rebuilds the full desired object from the DB and PUTs it (create-if-absent). The cloud write-through ([`services/dhcp/cloud_writethrough.py`](../../backend/app/services/dhcp/cloud_writethrough.py)) runs **synchronously, before commit**, so a REST failure raises `CloudPushError` (502) and rolls the transaction back — keeping the DB and the FortiGate in sync. `push_cloud_scope_upsert` fans a scope out to every cloud member of its group; cascade / group / restore paths reach it through the shared `windows_writethrough` seam.
+The whole DHCP-server object per scope: any scope / pool / static / option edit rebuilds the full desired object from the DB and PUTs it (create-if-absent). The cloud write-through ([`services/dhcp/cloud_writethrough.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/services/dhcp/cloud_writethrough.py)) runs **synchronously, before commit**, so a REST failure raises `CloudPushError` (502) and rolls the transaction back — keeping the DB and the FortiGate in sync. `push_cloud_scope_upsert` fans a scope out to every cloud member of its group; cascade / group / restore paths reach it through the shared `windows_writethrough` seam.
 
 **Child-table id stability.** FortiOS applies a parent PUT to child tables (`reserved-address` / `ip-range` / `exclude-range` / `options`) **per entry id**, not as an atomic replace. Positionally renumbered ids therefore break deletion: removing a non-last reservation shifts every later entry onto a different id, the per-id update transiently duplicates a MAC still present at the next id, and FortiOS aborts mid-apply — the wrong entries end up deleted and the push errors out. Before an update PUT, `_reconcile_child_ids` pins each desired entry to the id its logical match (by MAC / range / option code) already holds on the device, assigns new entries ids above every id in play, and removes stale device entries via explicit child-endpoint `DELETE`s (excludes before the ranges they depend on; a 404 counts as already-gone). Fresh POSTs keep the positional ids — there is no device state to pin to.
 

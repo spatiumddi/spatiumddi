@@ -7,7 +7,7 @@ title: Getting Started
 
 SpatiumDDI has a few internal dependencies between modules (records need zones, scopes need subnets, etc.). This guide walks you through the **recommended order** to get from a fresh install to a useful working system — whether your DNS/DHCP servers are the built-in Kea + BIND9 containers, a Windows Server DC, or a mix.
 
-> If you haven't installed SpatiumDDI yet, start with the [Docker Compose quick start](deployment/DOCKER.md) or [README Quick start](../README.md#quick-start-with-docker-compose), then come back here.
+> If you haven't installed SpatiumDDI yet, start with the [Docker Compose quick start](deployment/DOCKER.md) or [README Quick start](https://github.com/spatiumddi/spatiumddi/blob/main/README.md#quick-start-with-docker-compose), then come back here.
 
 ---
 
@@ -65,7 +65,7 @@ The analogy stops there; desks don't expire, but DHCP [leases](#dhcp-lease) do.
 
 Have these in hand before step 1:
 
-- **A Docker host.** Docker Engine 25+ and Docker Compose v2.20+, 2 GB RAM minimum (4 GB recommended), ports 8077 (frontend) and optionally 8000 (API) free — see the [Docker prerequisites](deployment/DOCKER.md#prerequisites). Kubernetes and the OS appliance ISO are alternatives; see the [deployment topologies](deployment/TOPOLOGIES.md).
+- **A running SpatiumDDI.** The quickest path is the [OS appliance ISO](deployment/APPLIANCE_INSTALL.md): boot it, answer the installer, and the full stack is on HTTPS a few minutes after the reboot with nothing to install by hand. Prefer containers you manage yourself? A Docker host with Docker Engine 25+ and Docker Compose v2.20+, 2 GB RAM minimum (4 GB recommended), ports 8077 (frontend) and optionally 8000 (API) free — see the [Docker prerequisites](deployment/DOCKER.md#prerequisites). Kubernetes is the third option; see the [deployment topologies](deployment/TOPOLOGIES.md).
 - **Admin access** to that host, and credentials to log in to SpatiumDDI (`admin` / `admin` on first boot; you will be forced to change it).
 - **Your list of subnets and [VLANs](#vlan)**, even a rough one, in [CIDR](#cidr) notation (`10.20.21.0/24`). You will enter these in steps 6–8, and a written plan beats improvising in the create form.
 - **Whether you have existing Windows DNS or DHCP.** This decides your backend choice in steps 3 and 5. If yes, you will need [WinRM](#winrm) enabled and a service account on the Windows side — read [WINDOWS.md](deployment/WINDOWS.md) first, since those prerequisites need Windows-admin time. If no, the built-in [agent](#agent-and-agentless) containers cover everything.

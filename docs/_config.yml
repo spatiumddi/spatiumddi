@@ -4,7 +4,7 @@ title: SpatiumDDI
 # below). The domain is configured as a CNAME on the org-site repo, so it
 # fronts both Pages sites.
 url: https://www.spatiumddi.com
-description: Self-hosted DNS, DHCP and IP Address Management — one control plane, real servers underneath.
+description: Documentation for SpatiumDDI, the open-source self-hosted DNS, DHCP and IP Address Management platform.
 
 # Kramdown with GFM input is what GitHub Pages actually uses. The previous
 # `markdown: GFM` was not a valid Jekyll setting at all: Pages silently
@@ -31,7 +31,9 @@ plugins:
   - jekyll-optional-front-matter
   - jekyll-relative-links
 
-# Every page gets the docs chrome unless it opts out (index.md uses `home`).
+# Every page gets the docs chrome. There is no other layout: this site is
+# documentation only — the product / company site is a separate project, and
+# the landing page that used to live at index.html was removed in #1070.
 defaults:
   - scope:
       path: ""
@@ -39,6 +41,10 @@ defaults:
       layout: default
 
 links:
+  # The company / product site. This docs site deliberately carries no
+  # marketing (#1070); the link is how a reader gets from the reference
+  # material to the product pages.
+  company: https://spatiumnorth.com
   github: https://github.com/spatiumddi/spatiumddi
   releases: https://github.com/spatiumddi/spatiumddi/releases
   issues: https://github.com/spatiumddi/spatiumddi/issues

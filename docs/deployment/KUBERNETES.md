@@ -6,8 +6,8 @@
 > deploy managed DNS (BIND9 / PowerDNS / Technitium) and DHCP (Kea) agent StatefulSets
 > alongside it. This page is the operator-facing walkthrough; the two
 > reference docs it leans on are
-> [`charts/spatiumddi/README.md`](../../charts/spatiumddi/README.md) (full
-> values surface) and [`k8s/README.md`](../../k8s/README.md) (raw manifests +
+> [`charts/spatiumddi/README.md`](https://github.com/spatiumddi/spatiumddi/blob/main/charts/spatiumddi/README.md) (full
+> values surface) and [`k8s/README.md`](https://github.com/spatiumddi/spatiumddi/blob/main/k8s/README.md) (raw manifests +
 > HA prototypes). Read those for the exhaustive option tables — this page
 > avoids duplicating them.
 
@@ -28,7 +28,7 @@ The umbrella chart is a single self-contained `application` chart — it has
 `postgres:16-alpine` and `redis:8.10.1-alpine` images (the same ones
 `docker-compose.yml` uses). The Bitnami subcharts the chart used historically
 were dropped after Bitnami pruned its public Docker Hub namespace in late 2025;
-the rationale is in [`Chart.yaml`](../../charts/spatiumddi/Chart.yaml).
+the rationale is in [`Chart.yaml`](https://github.com/spatiumddi/spatiumddi/blob/main/charts/spatiumddi/Chart.yaml).
 
 | Workload | Kind | Default replicas | Notes |
 |---|---|---|---|
@@ -79,7 +79,7 @@ Secret carrying key `secret-key`, or pin `auth.secretKey` directly.
 > `SECRET_KEY`.** Always `helm install` / `helm upgrade` against the same
 > release name, or pre-create the Secret and set `auth.existingSecret` — see
 > the chart README's
-> [Troubleshooting](../../charts/spatiumddi/README.md#troubleshooting) section.
+> [Troubleshooting](https://github.com/spatiumddi/spatiumddi/blob/main/charts/spatiumddi/README.md#troubleshooting) section.
 
 ### Exposing the UI
 
@@ -122,7 +122,7 @@ resolver is auto-detected from `/etc/resolv.conf` at container start. Override
 `frontend.apiUpstream.{host,port}` and `frontend.nginxLocalResolvers` only for
 non-default topologies (separate namespace, custom api Service name, or a
 pinned external resolver). Full details:
-[chart README → Exposing the UI](../../charts/spatiumddi/README.md#exposing-the-ui).
+[chart README → Exposing the UI](https://github.com/spatiumddi/spatiumddi/blob/main/charts/spatiumddi/README.md#exposing-the-ui).
 
 ### External Postgres / Redis
 
@@ -215,7 +215,7 @@ Technitium keeps its own config + zone store. The agent reads `CONTROL_PLANE_URL
 (set by the chart to the in-cluster api Service), exchanges its PSK for a
 rotating JWT, and long-polls the config bundle — the full bootstrap +
 registration flow is in [`DNS_AGENT.md`](DNS_AGENT.md) and summarised in
-[`k8s/README.md` → How servers register](../../k8s/README.md#how-servers-register).
+[`k8s/README.md` → How servers register](https://github.com/spatiumddi/spatiumddi/blob/main/k8s/README.md#how-servers-register).
 
 > **DHCPv4 needs broadcast reception on the client LAN.** Run the pod with
 > `hostNetwork: true`, or front it with a DHCP relay (option 82). The static
@@ -223,7 +223,7 @@ registration flow is in [`DNS_AGENT.md`](DNS_AGENT.md) and summarised in
 
 Per-server entry fields (`name`, `role`, `group`, `storage.*`, `service.type`,
 `hostNetwork`, `resources`) are documented in the
-[chart README → Agents](../../charts/spatiumddi/README.md#agents) table.
+[chart README → Agents](https://github.com/spatiumddi/spatiumddi/blob/main/charts/spatiumddi/README.md#agents) table.
 
 ---
 
@@ -237,7 +237,7 @@ Postgres accepts connections, then runs `alembic upgrade head`. The
 `api`, `worker`, and `beat` pods each carry a matching `wait-for-migrate` init
 container so they don't roll out before the schema lands. Completed Jobs
 self-clean via `ttlSecondsAfterFinished` (default 600 s). The full rationale is
-in the [migrate-job template](../../charts/spatiumddi/templates/migrate-job.yaml)
+in the [migrate-job template](https://github.com/spatiumddi/spatiumddi/blob/main/charts/spatiumddi/templates/migrate-job.yaml)
 header.
 
 Alembic is idempotent, so re-running the migrate Job is always safe.
@@ -247,7 +247,7 @@ Alembic is idempotent, so re-running the migrate Job is always safe.
 ## 5. Replicas, resources, and autoscaling
 
 Every workload has `resources.requests`/`limits` defaults in
-[`values.yaml`](../../charts/spatiumddi/values.yaml) (see the per-workload
+[`values.yaml`](https://github.com/spatiumddi/spatiumddi/blob/main/charts/spatiumddi/values.yaml) (see the per-workload
 blocks) and a per-component `nodeSelector` / `tolerations` / `affinity` /
 `podAnnotations`. Override them under the matching key.
 
@@ -330,7 +330,7 @@ CNPG creates `<cluster>-rw` (read/write, always the current primary),
 pods point at `<cluster>-rw` — no extra wiring. The chart sets short
 NoExecute `tolerationSeconds` (20 s) on the instance pods so a hard node loss
 fails over in ~1 minute instead of the default ~5; the reasoning is inline in
-[`values.yaml`](../../charts/spatiumddi/values.yaml) under
+[`values.yaml`](https://github.com/spatiumddi/spatiumddi/blob/main/charts/spatiumddi/values.yaml) under
 `postgresql.tolerations`.
 
 `postgresql.cnpg.podAntiAffinityType` is `required` on the appliance so
@@ -346,8 +346,8 @@ whose PVC is already bound to an occupied node (`Pending`). The one-time
 repair is the same shape as Redis but stricter — **only ever delete a
 REPLICA's PVC, never the primary's** (that destroys the database);
 confirm the role via the `cnpg.io/instanceRole=primary` label first. Full
-steps in [`k8s/README.md`](../../k8s/README.md) and
-[`charts/spatiumddi/README.md`](../../charts/spatiumddi/README.md).
+steps in [`k8s/README.md`](https://github.com/spatiumddi/spatiumddi/blob/main/k8s/README.md) and
+[`charts/spatiumddi/README.md`](https://github.com/spatiumddi/spatiumddi/blob/main/charts/spatiumddi/README.md).
 
 ### Redis — Sentinel
 
@@ -393,7 +393,7 @@ goes `Pending` — loud, but the alternative is a cluster that silently
 isn't HA. The one-time repair is to delete the stranded **replica's**
 PVC so it re-provisions on a free node; that data is expendable and
 resyncs from the master. Exact commands are in
-[`k8s/README.md`](../../k8s/README.md).
+[`k8s/README.md`](https://github.com/spatiumddi/spatiumddi/blob/main/k8s/README.md).
 
 ### Multi-node control-plane HA
 
@@ -435,7 +435,7 @@ place control-plane pods anywhere. The appliance's firstboot flips
 `global.controlPlaneNodeSelector` to `{ spatium.io/role-control-plane: "true" }`
 so control-plane pods only land on nodes carrying that per-role label —
 the `controlPlaneNodeSelector` helper is in
-[`_helpers.tpl`](../../charts/spatiumddi/templates/_helpers.tpl).
+[`_helpers.tpl`](https://github.com/spatiumddi/spatiumddi/blob/main/charts/spatiumddi/templates/_helpers.tpl).
 
 Per-role node-label gating for the **managed-service workloads**
 (`spatium.io/role-dns-bind9`, `spatium.io/role-dns-powerdns`,
@@ -595,7 +595,7 @@ un-migrated database.
 
 If you're running the raw `k8s/base/` manifests instead of the chart, pin the
 new tag on every Deployment and re-run the migrate Job by hand — see
-[`k8s/README.md` → Upgrading](../../k8s/README.md#upgrading).
+[`k8s/README.md` → Upgrading](https://github.com/spatiumddi/spatiumddi/blob/main/k8s/README.md#upgrading).
 
 ---
 
@@ -620,7 +620,7 @@ The Kubernetes-specific shape:
   **both** the api and worker Deployments (the worker runs the scheduled sweep,
   so it must write the files the api lists back). RWO will reject the second
   mount. The kustomize-overlay recipe is in
-  [`k8s/README.md` → Backup](../../k8s/README.md#backup). The umbrella chart
+  [`k8s/README.md` → Backup](https://github.com/spatiumddi/spatiumddi/blob/main/k8s/README.md#backup). The umbrella chart
   doesn't ship a `backup.localVolume` value yet — patch the rendered manifests
   with a kustomize overlay, or use a remote destination (recommended on K8s
   anyway).
@@ -629,9 +629,9 @@ The Kubernetes-specific shape:
 
 ## See also
 
-- [`charts/spatiumddi/README.md`](../../charts/spatiumddi/README.md) — full
+- [`charts/spatiumddi/README.md`](https://github.com/spatiumddi/spatiumddi/blob/main/charts/spatiumddi/README.md) — full
   values reference, troubleshooting, and a `helm template` dev loop
-- [`k8s/README.md`](../../k8s/README.md) — raw `k8s/base/` manifests, the
+- [`k8s/README.md`](https://github.com/spatiumddi/spatiumddi/blob/main/k8s/README.md) — raw `k8s/base/` manifests, the
   `k8s/ha/` prototypes, the static DNS/DHCP StatefulSets, and TLS/Ingress notes
 - [`TOPOLOGIES.md`](TOPOLOGIES.md) — reference production topologies + sizing
 - [`APPLIANCE.md`](APPLIANCE.md) — the self-contained OS appliance (k3s-based,

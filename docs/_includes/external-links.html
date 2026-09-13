@@ -1,0 +1,28 @@
+<script>
+  // Send off-site links to a new tab (#1070).
+  //
+  // The chrome's own external links carry target/rel in the markup, because
+  // they are hand-written and should not depend on script. Everything else on
+  // this site comes out of markdown — the specs link to GitHub, RFCs, vendor
+  // docs and the issue tracker constantly — and Jekyll on GitHub Pages cannot
+  // run a plugin to rewrite them at build time, so it happens here.
+  //
+  // Matching on hostname rather than on a leading "http" is what keeps the
+  // project site working: pages there are served under
+  // www.spatiumddi.com/spatiumddi/, and an absolute same-host link is still
+  // internal navigation.
+  (function () {
+    var here = window.location.hostname;
+    var links = document.querySelectorAll('a[href^="http://"], a[href^="https://"]');
+    for (var i = 0; i < links.length; i++) {
+      var a = links[i];
+      if (a.hostname === here) continue;
+      if (a.getAttribute("target")) continue;
+      a.setAttribute("target", "_blank");
+      // Without this the opened page gets a handle on window.opener. Modern
+      // browsers imply it for target=_blank, older ones do not.
+      var rel = a.getAttribute("rel");
+      a.setAttribute("rel", rel ? rel + " noopener" : "noopener");
+    }
+  })();
+</script>
