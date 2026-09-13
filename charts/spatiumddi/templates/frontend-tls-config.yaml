@@ -108,9 +108,33 @@ data:
             try_files /_starting.html =503;
         }
 
+        # JSON for JSON routes (#1083). The ``/api/`` locations send their
+        # 502/504 here instead of to @starting: a client polling a JSON route
+        # while the api Service has no ready endpoint (a CNPG failover empties
+        # it -- /health/ready needs the database) gets a JSON body with the
+        # status it can retry on, never the initialising page's HTML. A
+        # ``return`` has no method to refuse, so a POST that trips the 60 s
+        # proxy_read_timeout gets this too instead of the 405 nginx answers
+        # when error_page redirects a POST to a static file (#1080). The
+        # upstream status is preserved (502 = no ready endpoint / connect
+        # refused, 504 = upstream timeout) the way @starting preserves it,
+        # so the SPA's per-status handling holds.
+        location @api_unavailable {
+            default_type application/json;
+            add_header Cache-Control "no-store, no-cache, must-revalidate" always;
+            add_header Retry-After 2 always;
+            add_header X-Upstream-Status $upstream_status always;
+            add_header X-Content-Type-Options "nosniff" always;
+            if ($upstream_status ~ "504") {
+                return 504 '{"detail":"The api did not answer in time; retry shortly."}';
+            }
+            return 502 '{"detail":"The api is not reachable right now; retry shortly."}';
+        }
+
         # Large request bodies for the backup endpoint — keep the
         # same shape the default template uses.
         location /api/v1/backup/ {
+            error_page 502 504 @api_unavailable;
             set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
             proxy_pass               $api_upstream;
             proxy_set_header         Host $http_host;
@@ -131,6 +155,7 @@ data:
         # nginx's default body-size limit 413s the upload before
         # FastAPI's own size-check ever runs.
         location /api/v1/appliance/upgrade-images {
+            error_page 502 504 @api_unavailable;
             set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
             proxy_pass               $api_upstream;
             proxy_set_header         Host $http_host;
@@ -146,6 +171,7 @@ data:
         }
 
         location /api/ {
+            error_page 502 504 @api_unavailable;
             set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
             proxy_pass         $api_upstream;
             proxy_set_header   Host $http_host;

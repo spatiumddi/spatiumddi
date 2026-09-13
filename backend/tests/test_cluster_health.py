@@ -605,3 +605,47 @@ def test_transport_all_direct_is_false_when_nothing_was_probed(monkeypatch) -> N
         cluster_health.cluster_unavailable("kubeapi down")["kubelet_transport"]["all_direct"]
         is False
     )
+
+
+# ── #1083 — the kube snapshot survives a database that is failing over ─────
+
+
+class _DeadDB:
+    """A session whose every query times out — what a checkout looks like
+    while CNPG promotes a new primary (asyncpg's connect timeout, raised bare)."""
+
+    async def execute(self, *_args, **_kwargs):
+        raise TimeoutError("connect timed out")
+
+    async def rollback(self):
+        return None
+
+
+async def test_health_endpoint_keeps_the_kube_snapshot_when_the_db_fails(monkeypatch) -> None:
+    """During a CNPG failover the host-state decoration cannot be read; the
+    nodes/pods answer that came from kubeapi must still be served, with every
+    node's ``host_storage`` left as "not reported" (None)."""
+    from app.api.v1.appliance import cluster as cluster_router
+
+    _patch_kube(monkeypatch)
+    out = await cluster_router.cluster_health(db=_DeadDB())  # type: ignore[arg-type]
+    assert out.available is True
+    assert out.nodes_total == 1 and out.nodes_ready == 1
+    assert out.nodes[0].host_storage is None
+    assert out.nodes[0].host_disk_partitions == []
+
+
+async def test_host_state_merge_failure_is_logged_not_raised(monkeypatch) -> None:
+    from app.api.v1.appliance import cluster as cluster_router
+
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        cluster_router.logger,
+        "warning",
+        lambda event, **kw: events.append((event, kw)),
+    )
+    snap = {"available": True, "nodes": [{"name": "ddi1", "host_storage": None}]}
+    await cluster_router._merge_host_state_best_effort(_DeadDB(), snap)  # type: ignore[arg-type]
+    assert snap["nodes"][0]["host_storage"] is None
+    assert events and events[0][0] == "cluster_health_host_state_unavailable"
+    assert events[0][1]["error_class"] == "TimeoutError"
