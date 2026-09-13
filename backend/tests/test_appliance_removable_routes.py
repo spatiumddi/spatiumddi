@@ -225,8 +225,12 @@ async def test_eject_removes_the_mount_and_audits_it(
     r = await client.delete(f"{BASE}/{row.id}/removable/usb1", headers=h)
     assert r.status_code == 200
     assert r.json()["mounts"] == []
-    # Ejecting again is a 404, not a silent success.
-    assert (await client.delete(f"{BASE}/{row.id}/removable/usb1", headers=h)).status_code == 404
+    # Ejecting again is a 404, not a silent success. The request is made
+    # OUTSIDE the assert: `python -O` strips assert statements, so a call
+    # inside one silently stops happening and the test passes by not
+    # running.
+    again = await client.delete(f"{BASE}/{row.id}/removable/usb1", headers=h)
+    assert again.status_code == 404
     rows = (
         (
             await db_session.execute(
