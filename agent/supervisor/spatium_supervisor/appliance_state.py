@@ -48,6 +48,10 @@ log = structlog.get_logger(__name__)
 # control plane's). Falling back to None on read failure keeps the
 # heartbeat payload clean across non-appliance deploys.
 _HOST_ROLE_CONFIG = Path("/etc/spatiumddi-host/role-config")
+#: #1017 — what spatium-etc-render actually applied to the network
+#: profile at this boot. Same bind mount role-config arrives through, so
+#: reading it needs no chart change and no new hostPath.
+_HOST_NETWORK_STATUS = Path("/etc/spatiumddi-host/network-status")
 _HOST_RELEASE = Path("/etc/spatiumddi-host/appliance-release")
 _HOST_GRUBENV = Path("/boot/efi-host/grub/grubenv")
 _HOST_SLOT_STATE = Path(
@@ -3232,6 +3236,68 @@ def _multipath_maps() -> list[dict[str, object]]:
     return maps
 
 
+def read_network_state() -> dict[str, object] | None:
+    """Effective interface MTU for the fleet-consistency check (#1017).
+
+    Shape::
+
+        {"interface": "eth0", "mode": "static", "mtu": 1400,
+         "mtu_requested": 1400, "mtu_applied": "applied"}
+
+    ``None`` when the sidecar is absent — a slot too old to write it, or
+    a non-appliance host. That is UNKNOWN and never "this node is at the
+    default", because the whole point upstream is comparing nodes
+    against each other: an unknown read scored as 1500 would report a
+    genuine mismatch as agreement on exactly the nodes whose supervisor
+    could not answer.
+
+    **The value is what was APPLIED, not what STATE asked for**, and the
+    distinction is load-bearing. ``spatium-etc-render`` drops a
+    requested MTU that is out of range, or that would break a pinned
+    IPv6 address (RFC 8200), or that has no keyfile to live in (DHCP
+    with no pinned port). Reporting the request would have the control
+    plane agree that a node running 9000 and a node that asked for 9000
+    and had it refused are consistent — which is the mixed-MTU black
+    hole the check exists to catch, reported as healthy.
+
+    Read from a sidecar rather than from the kernel because the
+    supervisor pod is not ``hostNetwork``: its own ``/sys/class/net``
+    shows pod veths, so the host's real MTU is not visible to it. Same
+    reason ``host_network_interfaces`` goes via udev.
+    """
+    try:
+        text = _HOST_NETWORK_STATUS.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            fields[key.strip()] = value.strip()
+
+    def _int(name: str) -> int | None:
+        raw = fields.get(name, "")
+        return int(raw) if raw.isdigit() else None
+
+    return {
+        "interface": fields.get("INTERFACE") or None,
+        "mode": fields.get("MODE") or None,
+        "mtu": _int("MTU"),
+        # Carried as the RAW string, unlike ``mtu`` above, because its
+        # whole job is to show the operator what they configured — and
+        # the case it exists for is the one where that value was not a
+        # number. Parsed with the same digit test, "+1400" and "1400abc"
+        # become None precisely when the renderer dropped them for being
+        # unparseable, and every surface then reports "MTU None was
+        # configured but not applied".
+        "mtu_requested": fields.get("MTU_REQUESTED") or None,
+        # "applied" / "default" / "dropped" / "n/a" — see the renderer.
+        # Absent from a sidecar written by an older slot, which is why
+        # this is not defaulted to anything meaningful.
+        "mtu_applied": fields.get("MTU_APPLIED") or None,
+    }
+
+
 def read_storage_health() -> dict[str, object]:
     """Storage-redundancy snapshot for the fleet surfaces (#999 Part A).
 
@@ -3520,6 +3586,15 @@ def collect() -> dict[str, object]:
             **(cluster_health or {}),
             "storage": read_storage_health(),
         }
+        # #1017 — the effective MTU, folded into the same dict for the
+        # same reason (#402: stored verbatim by the backend, no schema
+        # change). Shipped only when the sidecar was readable: absent
+        # means UNKNOWN, and the fleet check upstream must be able to
+        # tell that apart from "this node is at the default", or a
+        # supervisor that could not answer reads as agreeing.
+        _network = read_network_state()
+        if _network is not None:
+            cluster_health = {**(cluster_health or {}), "network": _network}
     k3s_version = read_k3s_version() if is_appliance else None
     kubeconfig = read_kubeconfig() if is_appliance else None
     k3s_api_cert_expires_at = read_k3s_api_cert_expiry() if is_appliance else None

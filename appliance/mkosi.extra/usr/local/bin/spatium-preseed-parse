@@ -828,6 +828,54 @@ if ssh_nopw is not None:
         env["SSH_DISABLE_PASSWORD"] = "yes" if val else "no"
 
 # ── Network ───────────────────────────────────────────────────────────
+
+
+def _check_mtu(raw: object, *, ip6: str = "") -> str:
+    """Validate ``network.mtu`` and return it as a string ("" when unset).
+
+    #1017. The same rule the wizard's ``_mtu_error`` applies and that
+    ``spatium-etc-render`` re-checks over a hand-edited STATE — three
+    doors, one rule, because a value this parser accepts and the renderer
+    then drops is a setting the operator was told took effect and did
+    not.
+
+    576 is the IPv4 minimum reassembly buffer (RFC 791) and 9000 the
+    conventional jumbo ceiling. Below 1280 IPv6 cannot run on the link at
+    all (RFC 8200), so a static v6 address there is refused outright
+    rather than warned about — that appliance is broken by
+    specification. With v6 left on its RA / SLAAC default nothing is
+    configured to break, so a 1200-byte tunnel (the case the setting
+    exists for) is allowed.
+    """
+    mtu_s = as_str(raw if raw is not None else "")
+    if not mtu_s:
+        return ""
+    # ``int()`` tolerates a leading '+', surrounding whitespace and
+    # PEP-515 underscores; NetworkManager tolerates none of them, and the
+    # renderer's POSIX-shell digit test would drop the value silently at
+    # boot. Same trap as network.prefix6 forty lines down — parse
+    # strictly, then store the canonical form.
+    if not mtu_s.isdigit():
+        fail(f"network.mtu {mtu_s!r} must be a whole number")
+        return ""
+    mtu = int(mtu_s)
+    if not 576 <= mtu <= 9000:
+        fail(
+            f"network.mtu {mtu} must be between 576 and 9000 (1500 is the "
+            "Ethernet default; smaller values are for tunnelled or "
+            "reduced-MTU links)"
+        )
+        return ""
+    if ip6 and mtu < 1280:
+        fail(
+            f"network.mtu {mtu} is below 1280, the IPv6 minimum link MTU "
+            f"(RFC 8200), and network.ip6 pins {ip6}. IPv6 cannot run on "
+            "that link — raise the MTU or drop the static IPv6 address"
+        )
+        return ""
+    return str(mtu)
+
+
 static_subnet = ""  # feeds the k3s LAN-overlap check below
 net = ps.get("network")
 if net is not None:
@@ -862,6 +910,29 @@ if net is not None:
             dhcp_iface = as_str(net.get("interface"))
             if dhcp_iface:
                 env["NET_INTERFACE"] = dhcp_iface
+            # #1017 — an MTU on DHCP needs a pinned interface, and this is
+            # a REFUSAL rather than a note.
+            #
+            # etc-render writes a keyfile for a DHCP install only when one
+            # is named; with no interface NetworkManager uses its own auto
+            # profile and there is no [ethernet] section for the MTU to
+            # live in. Accepting the key would store it in STATE, show it
+            # on every surface, and have it reach nothing — the "written,
+            # never read" shape, on the one setting whose absence presents
+            # as large transfers hanging days later rather than as an
+            # error. No v6 to weigh here: this branch has already refused
+            # ip6 outright.
+            dhcp_mtu = _check_mtu(net.get("mtu"))
+            if dhcp_mtu and not dhcp_iface:
+                fail(
+                    "network.mtu requires network.interface on a DHCP "
+                    "install — with no interface pinned the appliance uses "
+                    "NetworkManager's own profile, which carries no MTU "
+                    "from SpatiumDDI, so the value would be stored and "
+                    "never applied"
+                )
+            elif dhcp_mtu:
+                env["NET_MTU"] = dhcp_mtu
             env["PRESEED_HAS_NETWORK"] = "1"
         else:  # static
             ip = as_str(net.get("ip"))
@@ -995,9 +1066,17 @@ if net is not None:
                     "— without an address they configure nothing"
                 )
 
+            # #1017 — after the v6 block, so the 1280 refusal can see the
+            # address it is refused against. A static install always names
+            # an interface (required above), so the DHCP branch's
+            # "nowhere to put it" case cannot arise here.
+            static_mtu = _check_mtu(net.get("mtu"), ip6=ip6)
+
             if static_ok:
                 env["NET_MODE"] = "static"
                 env["NET_INTERFACE"] = iface
+                if static_mtu:
+                    env["NET_MTU"] = static_mtu
                 env["NET_IP"] = ip
                 env["NET_PREFIX"] = prefix
                 env["NET_GATEWAY"] = gateway

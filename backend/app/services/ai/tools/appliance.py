@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import is_effective_superadmin
 from app.models.appliance import (
+    APPLIANCE_STATE_APPROVED,
     APPLIANCE_STATE_PENDING_APPROVAL,
     Appliance,
     ApplianceUpgradeImage,
@@ -43,6 +44,12 @@ from app.models.auth import User
 from app.services.ai import operations
 from app.services.ai.tools.base import register_tool
 from app.services.ai.tools.proposals import _persist_proposal, _proposal_result
+from app.services.appliance.network_mtu import (
+    fleet_summary as mtu_fleet_summary,
+)
+from app.services.appliance.network_mtu import (
+    network_report,
+)
 
 
 def _superadmin_gate(user: User) -> dict[str, Any] | None:
@@ -90,6 +97,12 @@ def _row_to_dict(row: Appliance) -> dict[str, Any]:
         "paired_at": row.paired_at.isoformat(),
         "approved_at": (row.approved_at.isoformat() if row.approved_at else None),
         "last_seen_at": (row.last_seen_at.isoformat() if row.last_seen_at else None),
+        # #1017 — the interface MTU etc-render actually APPLIED, not what
+        # STATE asked for. None means the supervisor never reported one,
+        # which is UNKNOWN and is not the same as "at the link default" —
+        # ``mtu_applied`` is what tells them apart.
+        "mtu": (network_report(row.cluster_health) or {}).get("mtu"),
+        "mtu_applied": (network_report(row.cluster_health) or {}).get("mtu_applied"),
         "last_seen_ip": row.last_seen_ip,
         "cert_serial": row.cert_serial,
         "cert_expires_at": (row.cert_expires_at.isoformat() if row.cert_expires_at else None),
@@ -202,6 +215,14 @@ async def find_appliance_fleet(
     if args.state is not None:
         stmt = stmt.where(Appliance.state == args.state)
     rows = list((await db.execute(stmt)).scalars().all())
+    # Kept before the filters below, for the fleet-wide MTU verdict: it
+    # is a statement about the CLUSTER, so it must not narrow with the
+    # caller's filters. Re-queried only when ``state`` narrowed the SQL
+    # itself.
+    if args.state is None:
+        all_rows = rows
+    else:
+        all_rows = list((await db.execute(select(Appliance))).scalars().all())
 
     # Role + tag filters are JSONB — easier to filter in Python than
     # to fold them into the SQL with @> operators (the role filter
@@ -215,10 +236,30 @@ async def find_appliance_fleet(
         else:
             rows = [r for r in rows if args.tag_key in (r.tags or {})]
 
+    # #1017 — the fleet MTU verdict, computed over every APPROVED
+    # appliance rather than over the filtered + truncated page. A
+    # consistency answer that changed with the caller's ``role`` filter
+    # or ``limit`` would be worse than none: the whole claim is about the
+    # cluster, and "consistent" derived from three of nine nodes is a
+    # green light nobody should act on.
+    mtu = mtu_fleet_summary(
+        [
+            (r.hostname, r.cluster_health)
+            for r in all_rows
+            if r.state == APPLIANCE_STATE_APPROVED and r.revoked_at is None
+        ]
+    )
+
     rows = rows[: args.limit]
     return {
         "appliances": [_row_to_dict(r) for r in rows],
         "count": len(rows),
+        "mtu_fleet": {
+            "reported": mtu.reported,
+            "answers": mtu.answers,
+            "consistent": mtu.consistent,
+            "detail": mtu.detail,
+        },
     }
 
 
@@ -581,7 +622,6 @@ async def find_cluster_health(
     if (err := _superadmin_gate(user)) is not None:
         return err
     from app.models.appliance import (  # noqa: PLC0415
-        APPLIANCE_STATE_APPROVED,
         CLUSTER_ROLE_MEMBER,
         CLUSTER_ROLE_PRIMARY,
     )

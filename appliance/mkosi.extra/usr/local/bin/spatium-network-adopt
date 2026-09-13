@@ -26,13 +26,24 @@ This tool closes the gap in the two ways the issue settled on:
               anything that later wants a drift chip.
 
 **Adoption is bounded to what STATE models, and says so.**  A keyfile
-setting with no field in ``spatium-config.yaml`` — an MTU, a static
-route, a bond or bridge — cannot be adopted, because etc-render would
-not render it back.  Those are reported as ``unadoptable`` rather than
-quietly dropped: an operator told "adopted 4 changes" while their MTU
-silently stayed revertible is worse off than one who was told nothing.
-That is why the console still warns *before* launching nmtui rather than
-relying on this tool afterwards.
+setting with no field in ``spatium-config.yaml`` — a static route, a
+bond or bridge — cannot be adopted, because etc-render would not render
+it back.  Those are reported as ``unadoptable`` rather than quietly
+dropped: an operator told "adopted 4 changes" while a setting silently
+stayed revertible is worse off than one who was told nothing.  That is
+why the console still warns *before* launching nmtui rather than relying
+on this tool afterwards.
+
+``ethernet.mtu`` used to be the headline example here and is now
+adoptable (#1017): STATE models it as ``network_mtu`` and etc-render
+writes it into the ``[ethernet]`` section of whichever keyfile applies.
+It is the one adoptable key whose ABSENCE carries meaning — NetworkManager
+omits a property at its default rather than writing ``mtu=0``, so "the
+operator cleared the MTU in nmtui" and "there was never an MTU" reach
+this tool as the same missing line.  ``_state_from_keyfile`` therefore
+reports ``network_mtu`` unconditionally for a managed profile, as ``""``
+when unset, so clearing it is drift that can be adopted rather than a
+change that silently reverts at the next boot.
 
 Deliberately NOT what this does: it does not stop etc-render owning the
 profile (that is option 3 in the issue, and it forfeits what #276 built
@@ -74,8 +85,14 @@ class AdoptReport(TypedDict):
     drift: dict[str, DriftEntry]
     unadoptable: list[str]
     extra_profiles: list[str]
+    #: Things worth saying that are neither drift nor unadoptable —
+    #: today, an MTU the RENDERER refused. See ``_mtu_suppression``.
+    notes: list[str]
 
 STATE_CONFIG = Path("/var/lib/spatium-state/spatium-config.yaml")
+#: What spatium-etc-render recorded about the last boot's network render
+#: (#1017). Read here for one reason only — see ``_mtu_suppression``.
+NETWORK_STATUS = Path("/etc/spatiumddi/network-status")
 NM_DIR = Path("/etc/NetworkManager/system-connections")
 STATIC_KEYFILE = NM_DIR / "10-spatium-static.nmconnection"
 DHCP_KEYFILE = NM_DIR / "10-spatium-dhcp.nmconnection"
@@ -96,6 +113,8 @@ _MANAGED_KEYS = {
     ("ipv4", "dns"),
     ("ipv6", "method"),
     ("ipv6", "address1"),
+    # #1017 — STATE models this as ``network_mtu``.
+    ("ethernet", "mtu"),
 }
 
 
@@ -272,6 +291,25 @@ def _state_from_keyfile(kf: dict[str, dict[str, str]]) -> dict[str, str]:
     if conn.get("interface-name"):
         out["network_interface"] = conn["interface-name"]
 
+    # #1017 — reported UNCONDITIONALLY, unlike every other key here, and
+    # that asymmetry is the point.
+    #
+    # NetworkManager's keyfile writer omits a property sitting at its
+    # default, and ``mtu``'s default is 0 — so an operator who clears the
+    # MTU in nmtui leaves exactly what an appliance that never had one
+    # leaves: no line at all. Emitted only when present, clearing it
+    # would be invisible to ``drift_for`` (which walks the live keys),
+    # the console would report nothing to adopt, and the next boot would
+    # quietly restore the old value. That is the #1016 failure this file
+    # exists to close, reintroduced through the one setting whose revert
+    # is hardest to spot.
+    #
+    # ``mtu=0`` is normalised to "" as well: NM accepts an explicit zero
+    # and means "default" by it, and adopting a literal 0 into STATE
+    # would be refused by the renderer's 576 floor on every boot after.
+    mtu = kf.get("ethernet", {}).get("mtu", "").strip()
+    out["network_mtu"] = "" if mtu in {"", "0"} else mtu
+
     v4_method = v4.get("method", "")
     if v4_method == "manual":
         out["network_mode"] = "static"
@@ -306,11 +344,17 @@ def _state_from_keyfile(kf: dict[str, dict[str, str]]) -> dict[str, str]:
 #: etc-render never renders and which carry no operator intent.
 #:
 #: Without this every nmtui save would list NM's own boilerplate on the
-#: "these WILL revert" panel — on every single visit — and the one entry
-#: that matters (``ethernet.mtu``) would be buried in it. This file
-#: already argues the principle for ``network6_mode`` forty lines up: an
-#: alarm that always fires is one operators learn to dismiss, which costs
-#: more than the feature is worth.
+#: "these WILL revert" panel — on every single visit — and the entries
+#: that matter (a static route, a bond, a bridge) would be buried in it.
+#: This file already argues the principle for ``network6_mode`` forty
+#: lines up: an alarm that always fires is one operators learn to
+#: dismiss, which costs more than the feature is worth.
+#:
+#: ``ethernet.mtu`` was the example this comment used to give. It is
+#: adoptable since #1017 and so is filtered by ``_MANAGED_KEYS``
+#: instead — it must NOT be listed here, or a genuine MTU edit would be
+#: dropped from both panels at once: not offered for adoption, and not
+#: named as reverting either.
 _NM_DEFAULT_KEYS = {
     ("connection", "timestamp"),
     ("connection", "permissions"),
@@ -405,6 +449,7 @@ def compare(state: dict[str, str] | None = None) -> AdoptReport:
             "drift": {},
             "unadoptable": [],
             "extra_profiles": _extra_profiles(),
+            "notes": [],
         }
     if not keyfile.exists():
         return {
@@ -414,10 +459,19 @@ def compare(state: dict[str, str] | None = None) -> AdoptReport:
             "drift": {},
             "unadoptable": [],
             "extra_profiles": _extra_profiles(),
+            "notes": [],
         }
     kf = parse_keyfile(keyfile)
     live = _state_from_keyfile(kf)
     drift = drift_for(state, live)
+    notes: list[str] = []
+    # #1017 — a missing mtu= that the RENDERER caused is not the
+    # operator's edit, and adopting it would erase their value.
+    if "network_mtu" in drift and not drift["network_mtu"]["live"]:
+        suppression = _mtu_suppression()
+        if suppression is not None:
+            del drift["network_mtu"]
+            notes.append(suppression)
     return {
         "managed": True,
         "keyfile": str(keyfile),
@@ -425,7 +479,60 @@ def compare(state: dict[str, str] | None = None) -> AdoptReport:
         "drift": drift,
         "unadoptable": _unadoptable(kf),
         "extra_profiles": _extra_profiles(),
+        "notes": notes,
     }
+
+
+def _mtu_suppression(path: Path = NETWORK_STATUS) -> str | None:
+    """Why a missing ``mtu=`` must NOT be adopted, or None.
+
+    #1017. ``network_mtu`` drift is normally the operator's doing and is
+    safe to adopt. But etc-render REFUSES a value it cannot apply — out
+    of range, or below 1280 with a static IPv6 address (RFC 8200) — and
+    writes no ``mtu=`` line when it does. To this tool that is
+    indistinguishable from the operator clearing the field, so the drift
+    reads ``state=1200 live=""`` and adopting it would overwrite the
+    operator's configured value with an empty one. They would then have
+    lost the setting AND the record of what it was, from a prompt that
+    said "save your nmtui changes".
+
+    That is reachable without hand-editing anything: set 1200 while IPv6
+    is on its RA/SLAAC default (allowed — nothing to break), later adopt
+    a static IPv6 address from nmtui, and the next boot starts refusing
+    the MTU.
+
+    So the sidecar is consulted, and a missing line is only treated as
+    the operator's when the renderer says it applied what it was given.
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        # No sidecar: an older slot, or a non-appliance host. Nothing is
+        # known about why the line is missing, so nothing is suppressed —
+        # this is the pre-#1017 behaviour and it is the safe default only
+        # because STATE had no network_mtu to lose on those images.
+        return None
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            fields[key.strip()] = value.strip()
+    applied = fields.get("MTU_APPLIED")
+    requested = fields.get("MTU_REQUESTED") or "the configured value"
+    if applied == "dropped":
+        return (
+            f"MTU {requested} is in STATE but was REFUSED at the last boot "
+            "(outside 576-9000, or below 1280 with a static IPv6 address). "
+            "It is left in STATE rather than adopted away — see "
+            "/var/log/spatiumddi/etc-render.log."
+        )
+    if applied == "n/a":
+        return (
+            f"MTU {requested} is in STATE but this install shape writes no "
+            "connection profile (DHCP with no pinned interface), so it "
+            "applies to nothing. Left in STATE rather than adopted away."
+        )
+    return None
 
 
 def _extra_profiles() -> list[str]:
@@ -476,6 +583,11 @@ def _render(report: AdoptReport) -> str:
         lines.append("whether or not you adopt:")
         for key in unadoptable:
             lines.append(f"  {key}")
+    notes = report.get("notes") or []
+    if notes:
+        lines.append("")
+        for note in notes:
+            lines.append(f"NOTE: {note}")
     extra = report["extra_profiles"]
     if extra:
         lines.append("")

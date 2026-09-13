@@ -130,6 +130,69 @@ _render_ipv6_block() {
     fi
 }
 
+# #1017 — the [ethernet] section's optional ``mtu=``.
+#
+# Unset is the normal case and means "NetworkManager's default", which
+# is the link's own MTU; the key is simply not written. The setting
+# exists for links that need a MTU *below* 1500 — a WireGuard / IPsec /
+# GRE tunnel, PPPoE, a provider underlay — where the failure mode is
+# that ping and small requests work while large TCP hangs, and reads as
+# an application fault. It is NOT a throughput knob: SpatiumDDI's own
+# traffic is small UDP and small JSON, and raising the MTU on a
+# DHCP-served segment is actively hazardous because PXE ROMs are 1500.
+#
+# Validated HERE as well as at the two doors that write it (the wizard
+# and the preseed parser), because this file is hand-editable on STATE
+# and is the last thing between a typo and NetworkManager. A value that
+# is not a plain integer in range is DROPPED with a warning rather than
+# written through: an unparseable ``mtu=`` risks NM rejecting the
+# profile, and a box that comes up with no network at all is a far worse
+# outcome than one that comes up at the default MTU. The warning lands
+# in the render log, which the support bundle collects.
+_effective_mtu() {
+    _mtu="$(get_cfg network_mtu)"
+    [ -n "$_mtu" ] || return 0
+    # POSIX-shell integer test: reject anything with a non-digit,
+    # including a leading '+'/'-' and a decimal point.
+    case "$_mtu" in
+        ''|*[!0-9]*)
+            echo "WARN: network_mtu '$_mtu' is not a whole number — ignoring" >&2
+            return 0
+            ;;
+    esac
+    # Bound the LENGTH before comparing the value, because the shell's
+    # ``[ -lt ]`` does not fail safe: given a digit string too long for a
+    # signed 64-bit integer, dash and bash both print "Illegal number"
+    # and exit NON-ZERO, which reads as "not out of range" and falls
+    # through to writing the value. ``set -e`` does not catch it either —
+    # the test is inside an ``if`` condition. So a 20-digit MTU landed in
+    # the keyfile, NetworkManager rejected the profile, and every surface
+    # reported the MTU as applied. 4 digits covers the whole legal range
+    # (9000); 5 is allowed through to the numeric check so an operator
+    # who typed 99999 still gets the range message rather than this one.
+    if [ "${#_mtu}" -gt 5 ]; then
+        echo "WARN: network_mtu '$_mtu' is far outside 576-9000 — ignoring" >&2
+        return 0
+    fi
+    if [ "$_mtu" -lt 576 ] || [ "$_mtu" -gt 9000 ]; then
+        echo "WARN: network_mtu $_mtu is outside 576-9000 — ignoring" >&2
+        return 0
+    fi
+    # RFC 8200 makes 1280 the IPv6 minimum link MTU, so a static v6
+    # address on a link below it is broken by specification. Both doors
+    # refuse that combination outright; reaching it here means STATE was
+    # hand-edited, and the MTU is what gets dropped rather than the
+    # address — dropping the address would take the appliance off the
+    # network the operator reaches it on.
+    if [ "$NET6_MODE_VAL" = "static" ] && [ "$_mtu" -lt 1280 ] \
+        && [ -n "$(get_cfg network6_ip)" ]; then
+        echo "WARN: network_mtu $_mtu is below the RFC 8200 IPv6 minimum of 1280" >&2
+        echo "      and this appliance pins a static IPv6 address — ignoring the MTU" >&2
+        return 0
+    fi
+    echo "$_mtu"
+}
+
 # ── Network (NetworkManager keyfile) ─────────────────────────────────
 # Runs Before=NetworkManager.service so the profile is in place before
 # NM reads its connections. dhcp mode = no keyfile (NM auto-DHCPs every
@@ -137,6 +200,17 @@ _render_ipv6_block() {
 # connection. Remove a stale keyfile when the mode flips back to dhcp.
 NET_MODE_VAL="$(get_cfg network_mode)"
 NET6_MODE_VAL="$(get_cfg network6_mode)"
+# #1017 — resolved once. Both keyfile branches and the status sidecar at
+# the end of this block read this variable rather than re-invoking the
+# helper, so the file the supervisor reports upward cannot claim an MTU
+# the keyfile does not carry.
+NET_MTU_EFFECTIVE="$(_effective_mtu)"
+# Set to yes by whichever branch below actually writes a keyfile. The
+# status sidecar keys off this rather than re-deriving the condition:
+# a static stanza with no interface is skipped too, and a sidecar that
+# re-tested "mode = static" would report an MTU in force on a box whose
+# keyfile was never written.
+NET_KEYFILE_WRITTEN=no
 NM_KEYFILE=/etc/NetworkManager/system-connections/10-spatium-static.nmconnection
 # #995 item 19 — a DHCP install can now pin ONE port. NetworkManager's
 # default is to DHCP every ethernet interface, so on a multi-NIC server
@@ -178,6 +252,7 @@ autoconnect=true
 autoconnect-priority=100
 
 [ethernet]
+${NET_MTU_EFFECTIVE:+mtu=$NET_MTU_EFFECTIVE}
 
 [ipv4]
 method=manual
@@ -200,6 +275,7 @@ EOF
             rm -f "$NM_DHCP_KEYFILE"
             echo "  removed the stale pinned-DHCP keyfile"
         fi
+        NET_KEYFILE_WRITTEN=yes
         echo "network → static $NET_IP_VAL/$NET_PREFIX_VAL on $NET_IFACE_VAL"
     else
         echo "WARN: network_mode=static but ip/interface missing — skipping keyfile"
@@ -231,6 +307,7 @@ autoconnect=true
 autoconnect-priority=100
 
 [ethernet]
+${NET_MTU_EFFECTIVE:+mtu=$NET_MTU_EFFECTIVE}
 
 [ipv4]
 method=auto
@@ -239,12 +316,65 @@ method=auto
 $(_render_ipv6_block)
 EOF
         chmod 0600 "$NM_DHCP_KEYFILE"
+        NET_KEYFILE_WRITTEN=yes
         echo "network → dhcp pinned to $NET_IFACE_VAL"
     elif [ -f "$NM_DHCP_KEYFILE" ]; then
         rm -f "$NM_DHCP_KEYFILE"
         echo "network → dhcp on any port (removed stale pinned keyfile)"
     fi
 fi
+
+# ── Network status sidecar (#1017) ───────────────────────────────────
+#
+# What this boot actually applied, for the supervisor to report upward.
+# /etc/spatiumddi is already bind-mounted into the supervisor pod
+# read-only as /etc/spatiumddi-host, so this needs no chart change and
+# no new hostPath — the same route role-config takes.
+#
+# Why a sidecar at all, rather than the supervisor reading STATE or the
+# live kernel: the supervisor pod is not hostNetwork, so /sys/class/net
+# shows pod veths and the host's real MTU is not visible to it; and STATE
+# says what was REQUESTED, which is not the same thing — this script
+# drops a value that is out of range or that would break a pinned IPv6
+# address. The fleet-consistency check upstream has to compare what is
+# in force, or it reports agreement between a node running 9000 and one
+# that asked for 9000 and had it refused.
+#
+# APPLIED distinguishes the three outcomes a single number cannot:
+#   default   no MTU configured — NetworkManager's own, the normal case
+#   applied   the requested value is in the keyfile
+#   dropped   a value was requested and this script refused it
+#   n/a       no keyfile is written for this install shape (DHCP with no
+#             pinned port), so there is nowhere for an MTU to go
+_mtu_requested="$(get_cfg network_mtu)"
+if [ "$NET_KEYFILE_WRITTEN" = yes ]; then
+    if [ -n "$NET_MTU_EFFECTIVE" ]; then
+        _mtu_applied=applied
+    elif [ -n "$_mtu_requested" ]; then
+        _mtu_applied=dropped
+    else
+        _mtu_applied=default
+    fi
+else
+    _mtu_applied="n/a"
+    # Nothing is in force when no keyfile was written, whatever STATE
+    # asked for. MTU_REQUESTED below still carries the operator's value
+    # so the mismatch is diagnosable; MTU is what is ACTUALLY applied,
+    # and reporting 1400 here would have the fleet-consistency check
+    # upstream agree that two nodes match when one of them is running
+    # the link default.
+    NET_MTU_EFFECTIVE=""
+fi
+mkdir -p /etc/spatiumddi
+{
+    echo "INTERFACE=$(get_cfg network_interface)"
+    echo "MODE=$NET_MODE_VAL"
+    echo "MTU=$NET_MTU_EFFECTIVE"
+    echo "MTU_REQUESTED=$_mtu_requested"
+    echo "MTU_APPLIED=$_mtu_applied"
+} > /etc/spatiumddi/network-status
+chmod 0644 /etc/spatiumddi/network-status
+echo "network-status rendered (MTU=${NET_MTU_EFFECTIVE:-default} $_mtu_applied)"
 
 # ── Supervisor identity on STATE ─────────────────────────────────────
 # The spatium-supervisor pod's persistent identity (Ed25519 keypair,

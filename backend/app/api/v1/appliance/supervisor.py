@@ -103,6 +103,17 @@ from app.services.appliance.ca import (
 )
 from app.services.appliance.firewall import firewall_bundle
 from app.services.appliance.lldp import lldp_bundle
+from app.services.appliance.network_mtu import (
+    MtuFleetSummary,
+    has_network_report,
+    network_report,
+)
+from app.services.appliance.network_mtu import (
+    evaluate_node as evaluate_node_mtu,
+)
+from app.services.appliance.network_mtu import (
+    fleet_summary as mtu_fleet_summary,
+)
 from app.services.appliance.ntp import ntp_bundle
 from app.services.appliance.resolver import resolver_bundle
 from app.services.appliance.slot_image_target import (
@@ -2762,6 +2773,29 @@ class ApplianceRow(BaseModel):
     storage_findings: list[dict[str, str]] = []
     storage_worst_severity: str | None = None
     storage_reported: bool = False
+    # #1017 — the interface MTU spatium-etc-render actually APPLIED at
+    # this node's last boot, not what STATE asked for: the renderer drops
+    # a value that is out of range, that would break a pinned IPv6
+    # address, or that has no keyfile to live in. ``mtu_requested``
+    # carries the operator's value so the difference is diagnosable.
+    #
+    # All three are None on a supervisor too old to report, which is
+    # UNKNOWN and must not render like "at the default" —
+    # ``mtu_reported`` separates them.
+    mtu: int | None = None
+    # A string, not an int: the value it reports is the operator's, and
+    # the case it exists for is the one where that value was not a
+    # number (the renderer dropped it). Typing it as an int makes it
+    # null exactly when it is needed.
+    mtu_requested: str | None = None
+    #: ``applied`` / ``default`` / ``dropped`` / ``n/a``.
+    mtu_applied: str | None = None
+    mtu_reported: bool = False
+    #: Per-node findings only. The fleet-consistency verdict is on
+    #: ``ApplianceList`` — it needs every row, and a finding that showed
+    #: up on the list response but not on the drilldown would be a
+    #: per-endpoint inconsistency the UI would have to paper over.
+    mtu_findings: list[dict[str, str]] = []
     # Issue #183 Phase 5 — installed k3s version (plain text, public).
     # NULL on legacy compose appliances / pre-#183 supervisors.
     k3s_version: str | None
@@ -2795,8 +2829,24 @@ class ApplianceRow(BaseModel):
     created_at: datetime
 
 
+class MtuFleet(BaseModel):
+    """#1017 — whether every node is on the same interface MTU.
+
+    Computed over the rows the list endpoint already holds, so it costs
+    no extra query. ``consistent`` is True when nobody reported: the
+    absence of a reading is not a fault, and every appliance installed
+    before this feature reports nothing.
+    """
+
+    reported: int = 0
+    answers: dict[str, list[str]] = {}
+    consistent: bool = True
+    detail: str | None = None
+
+
 class ApplianceList(BaseModel):
     appliances: list[ApplianceRow]
+    mtu_fleet: MtuFleet = MtuFleet()
 
 
 def _require_superadmin(user: CurrentUser) -> None:
@@ -2815,6 +2865,51 @@ def _storage_findings(row: Appliance) -> list[StorageFinding]:
 
 def _storage_worst_severity(row: Appliance) -> str | None:
     return worst_severity(_storage_findings(row))
+
+
+def _mtu_fields(row: Appliance) -> dict[str, Any]:
+    """#1017 — the MTU half of one appliance row.
+
+    Its own function so the reading and the findings are derived from the
+    same report: reading ``cluster_health`` twice at the call site is how
+    a row ends up showing a value with no finding attached to it.
+    """
+    report = network_report(row.cluster_health) or {}
+    return {
+        "mtu": report.get("mtu"),
+        "mtu_requested": (
+            str(report["mtu_requested"]) if report.get("mtu_requested") is not None else None
+        ),
+        "mtu_applied": report.get("mtu_applied"),
+        "mtu_reported": has_network_report(row.cluster_health),
+        "mtu_findings": [
+            {"severity": f.severity, "kind": f.kind, "detail": f.detail}
+            for f in evaluate_node_mtu(row.cluster_health)
+        ],
+    }
+
+
+def _mtu_fleet(rows: list[Appliance]) -> MtuFleet:
+    """The fleet verdict over the rows a list endpoint already loaded.
+
+    Only APPROVED appliances are compared. A pending or rejected node is
+    not in the k3s cluster, so its MTU cannot black-hole anything — and
+    including one would report a mismatch the operator has no way to act
+    on short of approving the node first.
+    """
+    summary: MtuFleetSummary = mtu_fleet_summary(
+        [
+            (r.hostname, r.cluster_health)
+            for r in rows
+            if r.state == APPLIANCE_STATE_APPROVED and r.revoked_at is None
+        ]
+    )
+    return MtuFleet(
+        reported=summary.reported,
+        answers=summary.answers,
+        consistent=summary.consistent,
+        detail=summary.detail,
+    )
 
 
 def _row_to_schema(row: Appliance) -> ApplianceRow:
@@ -2882,6 +2977,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         ],
         storage_worst_severity=_storage_worst_severity(row),
         storage_reported=has_storage_report(row.cluster_health),
+        **_mtu_fields(row),
         k3s_version=row.k3s_version,
         kubeconfig_set=row.kubeconfig_encrypted is not None,
         k3s_api_cert_expires_at=row.k3s_api_cert_expires_at,
@@ -2907,7 +3003,10 @@ async def list_appliances(current_user: CurrentUser, db: DB) -> ApplianceList:
     rows = (
         (await db.execute(select(Appliance).order_by(Appliance.paired_at.desc()))).scalars().all()
     )
-    return ApplianceList(appliances=[_row_to_schema(r) for r in rows])
+    return ApplianceList(
+        appliances=[_row_to_schema(r) for r in rows],
+        mtu_fleet=_mtu_fleet(list(rows)),
+    )
 
 
 @router.get(

@@ -22,6 +22,79 @@ the formatter handles the rest.
 
 ## Unreleased
 
+### Added
+
+- **Interface MTU (#1017).** The appliance could not set one anywhere:
+  not in the installer, not in the preseed schema, not in STATE, not in
+  the host-config plane. The only route was `nmtui`, and per #1016 an
+  edit there reverts at the next boot. Now `network_mtu` in
+  `spatium-config.yaml`, asked for by the wizard in **both** network
+  modes, accepted as `network.mtu` in a #549 answer file, round-tripped
+  by the #995 answers export, and rendered into the `[ethernet]` section
+  of whichever NetworkManager keyfile applies.
+  **The case for it is not jumbo frames**, and the docs say so rather
+  than leaving it to be inferred. SpatiumDDI's own traffic is small UDP
+  and small JSON — post-flag-day EDNS0 buffers sit at 1232 precisely to
+  avoid fragmentation — and raising the MTU on a DHCP-served segment is
+  actively hazardous because PXE ROMs are 1500. The gap is the other
+  direction: an appliance reached over a WireGuard / IPsec / GRE tunnel,
+  PPPoE, or a reduced-MTU provider underlay needs an MTU *below* 1500,
+  and that failure is nasty and common — ping and small requests work,
+  large TCP hangs, and it reads as an application fault.
+  **One rule, three doors**, because a value one door accepts and
+  another drops is a setting the operator was told took effect and did
+  not. 576-9000; below 1280 is **refused** alongside a pinned static
+  IPv6 address rather than warned about, since RFC 8200 makes 1280 the
+  IPv6 minimum link MTU and such a node is broken by specification —
+  while IPv6 on its RA / SLAAC default has no configured address to
+  break, so the 1200-byte tunnel this feature exists for is allowed. The
+  renderer validates too and **drops** a value it cannot trust with a
+  reason in `etc-render.log`: STATE is hand-editable, an unparseable
+  `mtu=` risks NetworkManager rejecting the profile, and a box with no
+  network at all is far worse than one at the default. A test drives all
+  three doors and asserts they reach the same verdict; it caught the
+  wizard accepting `+1400` — which `int()` takes and the other two
+  refuse — before it shipped.
+  **DHCP with no pinned interface is refused, not accepted-and-ignored.**
+  etc-render writes no keyfile in that shape, so there is no `[ethernet]`
+  section for the value to live in; the wizard does not offer the field
+  and the parser fails the key rather than storing something that reaches
+  nothing.
+  **Mixed-MTU clusters are the appliance-specific hazard**, so this is a
+  fleet check and not a per-node one — the #1013 lesson applied before
+  the fact. k3s runs `flannel-backend: host-gw`, which writes plain
+  routes instead of encapsulating, so the pod network inherits the node
+  MTU with **no tunnel headroom**: one node at 9000 and two at 1500
+  black-holes pod-to-pod traffic and presents as random timeouts with
+  nothing in the UI explaining it. The supervisor reports what was
+  *applied* — not what STATE asked for, or the control plane would call a
+  node running 9000 and a node that asked for 9000 and was refused
+  consistent — through a sidecar in the bind mount `role-config` already
+  uses, so **no chart change, no heartbeat field, no migration**. A
+  warning on **Appliance → Fleet** names the nodes on each side; the
+  per-node value shows in the drilldown and, when there is something to
+  say, on the console.
+  **"Unset" is compared as itself, never as 1500.** Scoring an
+  unconfigured node at the Ethernet default is a guess about hardware
+  nobody read, and would tell an operator whose switches are genuinely
+  all-9000 that their cluster disagrees when it does not — so the banner
+  states the default was not read from the node. A node that has not
+  reported is excluded rather than assumed, or a genuine mismatch would
+  read as agreement on exactly the nodes that could not answer. Every
+  appliance installed before this reports `default`, one distinct answer,
+  so the check is silent on the existing estate.
+  **`ethernet.mtu` becomes adoptable**, closing the gap #1016 shipped
+  with — it was that issue's headline *un*adoptable setting. It is the
+  one adoptable key whose absence carries meaning, since NetworkManager
+  omits a property at its default rather than writing `mtu=0`: clearing
+  one in nmtui and never having had one arrive identically, so
+  `spatium-network-adopt` reports `network_mtu` unconditionally for a
+  managed profile and clearing it is drift you can adopt. No new MCP tool
+  (explicit decision per non-negotiable #13 — `find_appliance_fleet`
+  answers exactly this and gained the field plus the fleet verdict) and
+  not a feature module (#14 — it extends an existing resource). Applied
+  at boot, and every surface says so.
+
 ### Changed
 
 - **Docs site is documentation only (#1070).** `www.spatiumddi.com`

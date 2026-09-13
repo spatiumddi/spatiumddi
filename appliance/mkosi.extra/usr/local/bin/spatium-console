@@ -1362,6 +1362,43 @@ _FLANNEL_IFACES = ("cni0", "flannel.")
 _FLANNEL_V4_PREFIX = "10.42."
 
 
+def network_mtu_chip() -> tuple[str, str] | None:
+    """#1017 — the interface MTU, for the identity row. None = say nothing.
+
+    Reads what ``spatium-etc-render`` recorded at this boot rather than
+    the live kernel, so the console agrees with the Fleet UI (which sees
+    the same sidecar through the supervisor) instead of offering a second
+    opinion an operator then has to reconcile.
+
+    **Silent on the normal case**, which is every appliance that set no
+    MTU: this row is already dense, and a chip reading "MTU default" on
+    every console would be noise on the screen an operator reaches for
+    when something is wrong. It speaks only when a value is in force —
+    worth confirming, because the setting exists for links where a wrong
+    MTU shows up as large transfers hanging — or when one was asked for
+    and refused, which is the case nothing else on this screen would
+    explain.
+    """
+    try:
+        text = Path("/etc/spatiumddi/network-status").read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        return None
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            fields[key.strip()] = value.strip()
+    applied = fields.get("MTU_APPLIED")
+    if applied == "applied" and fields.get("MTU"):
+        return (f"MTU {fields['MTU']}", "bright_cyan")
+    if applied == "dropped":
+        requested = fields.get("MTU_REQUESTED") or "?"
+        return (f"MTU {requested} REFUSED — running link default", "bold bright_yellow")
+    return None
+
+
 def host_ips() -> tuple[list[str], list[str]]:
     """Return ``(ipv4_addresses, ipv6_addresses)``. Splits the two
     families so the header can render the IPv4 list inline + a
@@ -2684,6 +2721,11 @@ def render_header(
             identity.append(f" +{len(v6_ips) - 1} IPv6", style="dim")
     else:
         identity.append("—", style="dim")
+    # #1017 — only when there is something to say; see network_mtu_chip.
+    mtu_chip = network_mtu_chip()
+    if mtu_chip is not None:
+        identity.append("   ·   ", style="dim")
+        identity.append(mtu_chip[0], style=mtu_chip[1])
     identity.append("   ·   ", style="dim")
     identity.append("Build ", style="dim")
     identity.append(build)
@@ -5239,7 +5281,13 @@ def _offer_network_adopt(console: Console, tty: str) -> None:
         return
     drift = report.get("drift") or {}
     unadoptable = report.get("unadoptable") or []
-    if not drift and not unadoptable:
+    # #1017 — an MTU the RENDERER refused. Neither drift (adopting it
+    # would erase the operator's STATE value) nor unadoptable (STATE
+    # models it fine), so it needs saying on its own or the tool
+    # suppresses it silently and nothing anywhere explains why the MTU
+    # is not in force.
+    notes = report.get("notes") or []
+    if not drift and not unadoptable and not notes:
         return
 
     if drift:
@@ -5273,6 +5321,11 @@ def _offer_network_adopt(console: Console, tty: str) -> None:
                 "[yellow]Not saved — these changes revert at the next boot.[/yellow]"
             )
             time.sleep(3)
+
+    for note in notes:
+        console.print(f"[yellow]{note}[/yellow]")
+    if notes:
+        time.sleep(4)
 
     if unadoptable:
         # Said whether or not anything was adopted: these revert either
