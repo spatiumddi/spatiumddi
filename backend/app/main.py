@@ -938,6 +938,51 @@ def create_app() -> FastAPI:
             headers={"Retry-After": "1"},
         )
 
+    # A dependency that did not answer (issue #1083). asyncpg raises the
+    # bare ``TimeoutError`` for a connect or a command that ran past the
+    # ``connect_args`` bounds db.py sets (5 s / 30 s), and SQLAlchemy's
+    # asyncpg adapter re-raises anything that is not an asyncpg error class
+    # untranslated — so the handler above never sees it. During a CNPG
+    # failover (the primary's node partitioned or lost) every request whose
+    # session lookup or query needed a fresh connection answered ``500
+    # Internal Server Error`` for the 60-90 s the promotion took, beside the
+    # 503s the connection-closed shape of the same outage already got, and a
+    # client could not tell the failover from a bug. A dependency that did
+    # not answer in time is the 503 case: same Retry-After. The same holds
+    # for the connect a fresh checkout makes while the new primary's socket
+    # is not yet listening (``ConnectionError``) and for the pool's own
+    # checkout timeout (``sqlalchemy.exc.TimeoutError`` — every pooled
+    # connection parked on a dead peer).
+    #
+    # Not captured to the diagnostics surface on purpose: the capture opens
+    # a database session, and during the outage that is another 5 s connect
+    # timeout in front of the 503. The warning line carries the route.
+    from sqlalchemy.exc import TimeoutError as SAPoolTimeoutError  # noqa: PLC0415
+
+    @app.exception_handler(TimeoutError)
+    @app.exception_handler(ConnectionError)
+    @app.exception_handler(SAPoolTimeoutError)
+    async def _dependency_unavailable(request: Request, exc: Exception) -> Response:
+        from fastapi.responses import JSONResponse  # noqa: PLC0415
+
+        logger.warning(
+            "dependency_unavailable",
+            method=request.method,
+            path=request.url.path,
+            error_class=type(exc).__name__,
+            error=str(exc)[:200],
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": (
+                    "A backend dependency did not answer in time "
+                    "(database failover or restart in progress). Retry."
+                )
+            },
+            headers={"Retry-After": "2"},
+        )
+
     from sqlalchemy.exc import DBAPIError as SADBAPIError  # noqa: PLC0415
     from sqlalchemy.exc import IntegrityError as SAIntegrityError  # noqa: PLC0415
 
