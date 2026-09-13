@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -31,6 +31,7 @@ import {
   dhcpApi,
   dnsApi,
   type ApplianceRow,
+  type ApplianceListResponse,
   type ApplianceWorkload,
   type ApplianceState,
   type ApplianceUpgradeStep,
@@ -345,6 +346,22 @@ function ClusterStatusChip({ row }: { row: ApplianceRow }) {
 // nginx pod, briefly closing :443) all happen after. Without this the
 // operator sees a silent success, then a dead page, with no idea a reload
 // fixes it. Polls the fleet so it can say WHEN it's safe to reload.
+/**
+ * Hoisted so their identity is stable across renders.
+ *
+ * React Query v5 reuses a cached selector result only while
+ * `options.select` keeps the same REFERENCE. An inline arrow is a fresh
+ * identity every render, so `select` re-runs and its result is re-walked
+ * by `replaceEqualDeep` — a deep compare of every appliance row's
+ * `cluster_health`, `role_health`, `firewall_state`, `capabilities` and
+ * the rest. Before the fleet block was added the query returned the
+ * array directly with no `select` at all, so that cost was zero; these
+ * are the only `select:` usages in the frontend, so this file sets the
+ * pattern.
+ */
+const selectApplianceRows = (d: ApplianceListResponse) => d.appliances;
+const selectMtuFleet = (d: ApplianceListResponse) => d.mtu_fleet;
+
 function PromotionProgressModal({
   promoted,
   onClose,
@@ -358,7 +375,12 @@ function PromotionProgressModal({
   // cert regenerates and the frontend nginx pod rolls.
   const { data, error } = useQuery({
     queryKey: ["appliance", "fleet"],
-    queryFn: applianceApprovalApi.list,
+    // #1017 — the response now carries a fleet-level MTU verdict as well
+    // as the rows. `select` hands this caller the rows it already
+    // expected; React Query still issues one request per key, so the
+    // banner below shares this fetch rather than adding another.
+    queryFn: applianceApprovalApi.listFleet,
+    select: selectApplianceRows,
     refetchInterval: 3000,
     retry: true,
   });
@@ -738,9 +760,13 @@ export function FleetTab({
 
   const { data, isLoading, isFetching, refetch, error } = useQuery({
     queryKey: ["appliance", "fleet"],
-    queryFn: applianceApprovalApi.list,
+    queryFn: applianceApprovalApi.listFleet,
+    select: selectApplianceRows,
     refetchInterval: (query) => {
-      const rows = query.state.data ?? [];
+      // `query.state.data` is the RAW response, before `select` — so the
+      // rows live under `.appliances` here even though every consumer of
+      // `data` below sees the array.
+      const rows = query.state.data?.appliances ?? [];
       // #410 — also fast-poll while any appliance has an upgrade or
       // reboot in flight, so the drilldown's UpgradeStatusPanel shows
       // download progress within ~2 s instead of the 15 s idle cadence.
@@ -1419,6 +1445,12 @@ export function FleetTab({
                   </button>
                 </div>
               </div>
+
+              {/* No `enabled` gate: FleetTab early-returns for a
+                  non-superadmin, and `enabled: false` would not gate the
+                  banner anyway — a sibling observer on this key fills the
+                  cache, and `enabled` only suppresses fetching. */}
+              <MtuFleetAdvisory />
 
               {showVipAdvisory && (
                 <div className="mb-4 rounded-md border border-amber-500/50 bg-amber-500/10 p-4">
@@ -2538,6 +2570,28 @@ function ApplianceDrilldownModal({
               }
             />
             <FactRow label="Storage" value={caps.storage_type} />
+            {/* #1017 — what the node is ACTUALLY running, not what STATE
+                asked for. Absent entirely on a supervisor too old to
+                report, which is UNKNOWN rather than "at the default". */}
+            <FactRow label="MTU" value={mtuFactValue(row)} />
+            {/* The refusal reason, and where to read the rest of it.
+                Without this the row says an MTU "was refused" and the
+                only explanation lives in a log file on the node.
+
+                `?? []` for the same reason the storage block keeps one:
+                during a rolling upgrade the frontend and api pods do not
+                flip together, so a new bundle can meet a pre-#1017 api
+                and get `undefined` here — a bare `.map` unmounts the
+                whole drilldown instead of degrading. Coloured by
+                `f.severity` rather than hardcoded amber, so a severity
+                this build does not understand is not rendered as the
+                mildest one. */}
+            {(row.mtu_findings ?? []).map((f, i) => (
+              <Fragment key={`mtu-finding-${i}`}>
+                <dt className="text-muted-foreground">&nbsp;</dt>
+                <dd className={storageSeverityClass(f.severity)}>{f.detail}</dd>
+              </Fragment>
+            ))}
             <FactRow
               label="Host NICs"
               value={
@@ -2701,6 +2755,100 @@ function CapRow({ label, on }: { label: string; on: boolean }) {
       <span className={cn(!on && "text-muted-foreground")}>{label}</span>
     </div>
   );
+}
+
+/**
+ * #1017 — the cluster is not all on one interface MTU.
+ *
+ * k3s runs flannel in host-gw mode, which writes plain routes instead of
+ * encapsulating, so the pod network inherits the node MTU with no tunnel
+ * headroom. A mixed-MTU cluster black-holes pod-to-pod traffic and
+ * presents as random timeouts — with nothing anywhere else in the UI that
+ * would explain it, which is the whole reason this banner exists.
+ *
+ * Shares the roster's query key, so it costs no extra request: React
+ * Query dedupes by key and `select` gives each caller the slice it wants.
+ * Renders nothing when consistent, including when nobody reported — the
+ * absence of a reading is not a fault, and every appliance installed
+ * before #1017 reports nothing.
+ */
+/**
+ * The amber callout the Fleet tab uses for cluster-level advisories.
+ *
+ * Extracted because the MTU banner reproduced this exact six-element
+ * shape verbatim, twelve lines above the VIP advisory that already had
+ * it — two copies of one banner on one screen, which diverge the first
+ * time either is restyled.
+ */
+function FleetAdvisory({
+  title,
+  children,
+}: {
+  title: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="mb-4 rounded-md border border-amber-500/50 bg-amber-500/10 p-4">
+      <div className="flex items-start gap-3">
+        <AlertCircle className="mt-0.5 h-5 w-5 flex-shrink-0 text-amber-700 dark:text-amber-400" />
+        <div className="min-w-0 flex-1">
+          <p className="font-semibold text-amber-700 dark:text-amber-400">
+            {title}
+          </p>
+          {children}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MtuFleetAdvisory() {
+  const { data: fleet } = useQuery({
+    queryKey: ["appliance", "fleet"],
+    queryFn: applianceApprovalApi.listFleet,
+    select: selectMtuFleet,
+  });
+  if (!fleet || fleet.consistent || !fleet.detail) return null;
+  return (
+    <FleetAdvisory title="Nodes are not on the same interface MTU">
+      <p className="mt-1 text-sm text-muted-foreground">{fleet.detail}</p>
+      <p className="mt-2 text-xs text-muted-foreground">
+        The MTU is set at install and applied at boot. Change it with{" "}
+        <code className="rounded bg-muted px-1 py-0.5">nmtui</code> on the node,
+        then save it into STATE when the console offers to — an edit that is not
+        adopted reverts at the next boot.
+      </p>
+    </FleetAdvisory>
+  );
+}
+
+/** #1017 — one node's MTU, for the drilldown. Null when it never reported. */
+function mtuFactValue(row: ApplianceRow): string | null {
+  if (!row.mtu_reported) return null;
+  switch (row.mtu_applied) {
+    case "applied":
+      // `mtu` is read out of an unvalidated JSONB blob, so a torn or
+      // malformed sidecar can leave it null while `mtu_applied` still
+      // says "applied" — without this the row rendered the string
+      // "null".
+      return row.mtu == null ? null : `${row.mtu}`;
+    case "dropped":
+      // Deliberately not just "default": the operator asked for something
+      // and is not getting it, and a row reading "default" would hide
+      // that behind a word that looks deliberate.
+      return `link default — ${row.mtu_requested ?? "the configured value"} was refused`;
+    case "n/a":
+      // Same reasoning as "dropped" when a value was configured: no
+      // profile was written, so it applies to nothing, and rendering a
+      // flat "link default" would read as though nothing was ever set.
+      return row.mtu_requested
+        ? `link default — ${row.mtu_requested} applies to nothing (no managed profile)`
+        : "link default (no managed profile)";
+    case "default":
+      return "link default";
+    default:
+      return null;
+  }
 }
 
 function FactRow({

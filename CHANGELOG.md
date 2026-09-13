@@ -22,6 +22,154 @@ the formatter handles the rest.
 
 ## Unreleased
 
+### Added
+
+- **Interface MTU (#1017).** The appliance could not set one anywhere:
+  not in the installer, not in the preseed schema, not in STATE, not in
+  the host-config plane. The only route was `nmtui`, and per #1016 an
+  edit there reverts at the next boot. Now `network_mtu` in
+  `spatium-config.yaml`, asked for by the wizard in **both** network
+  modes, accepted as `network.mtu` in a #549 answer file, round-tripped
+  by the #995 answers export, and rendered into the `[ethernet]` section
+  of whichever NetworkManager keyfile applies.
+  **The case for it is not jumbo frames**, and the docs say so rather
+  than leaving it to be inferred. SpatiumDDI's own traffic is small UDP
+  and small JSON — post-flag-day EDNS0 buffers sit at 1232 precisely to
+  avoid fragmentation — and raising the MTU on a DHCP-served segment is
+  actively hazardous because PXE ROMs are 1500. The gap is the other
+  direction: an appliance reached over a WireGuard / IPsec / GRE tunnel,
+  PPPoE, or a reduced-MTU provider underlay needs an MTU *below* 1500,
+  and that failure is nasty and common — ping and small requests work,
+  large TCP hangs, and it reads as an application fault.
+  **One rule, three doors**, because a value one door accepts and
+  another drops is a setting the operator was told took effect and did
+  not. 576-9000; below 1280 is **refused** alongside a pinned static
+  IPv6 address rather than warned about, since RFC 8200 makes 1280 the
+  IPv6 minimum link MTU and such a node is broken by specification —
+  while IPv6 on its RA / SLAAC default has no configured address to
+  break, so the 1200-byte tunnel this feature exists for is allowed. The
+  renderer validates too and **drops** a value it cannot trust with a
+  reason in `etc-render.log`: STATE is hand-editable, an unparseable
+  `mtu=` risks NetworkManager rejecting the profile, and a box with no
+  network at all is far worse than one at the default. A test drives all
+  three doors and asserts they reach the same verdict; it caught the
+  wizard accepting `+1400` — which `int()` takes and the other two
+  refuse — before it shipped.
+  **DHCP with no pinned interface is refused, not accepted-and-ignored.**
+  etc-render writes no keyfile in that shape, so there is no `[ethernet]`
+  section for the value to live in; the wizard does not offer the field
+  and the parser fails the key rather than storing something that reaches
+  nothing.
+  **Mixed-MTU clusters are the appliance-specific hazard**, so this is a
+  fleet check and not a per-node one — the #1013 lesson applied before
+  the fact. k3s runs `flannel-backend: host-gw`, which writes plain
+  routes instead of encapsulating, so the pod network inherits the node
+  MTU with **no tunnel headroom**: one node at 9000 and two at 1500
+  black-holes pod-to-pod traffic and presents as random timeouts with
+  nothing in the UI explaining it. The supervisor reports what was
+  *applied* — not what STATE asked for, or the control plane would call a
+  node running 9000 and a node that asked for 9000 and was refused
+  consistent — through a sidecar in the bind mount `role-config` already
+  uses, so **no chart change, no heartbeat field, no migration**. A
+  warning on **Appliance → Fleet** names the nodes on each side; the
+  per-node value shows in the drilldown and, when there is something to
+  say, on the console.
+  **"Unset" is compared as itself, never as 1500.** Scoring an
+  unconfigured node at the Ethernet default is a guess about hardware
+  nobody read, and would tell an operator whose switches are genuinely
+  all-9000 that their cluster disagrees when it does not — so the banner
+  states the default was not read from the node. A node that has not
+  reported is excluded rather than assumed, or a genuine mismatch would
+  read as agreement on exactly the nodes that could not answer. Every
+  appliance installed before this reports `default`, one distinct answer,
+  so the check is silent on the existing estate.
+  **`ethernet.mtu` becomes adoptable**, closing the gap #1016 shipped
+  with — it was that issue's headline *un*adoptable setting. It is the
+  one adoptable key whose absence carries meaning, since NetworkManager
+  omits a property at its default rather than writing `mtu=0`: clearing
+  one in nmtui and never having had one arrive identically, so
+  `spatium-network-adopt` reports `network_mtu` unconditionally for a
+  managed profile and clearing it is drift you can adopt. No new MCP tool
+  (explicit decision per non-negotiable #13 — `find_appliance_fleet`
+  answers exactly this and gained the field plus the fleet verdict) and
+  not a feature module (#14 — it extends an existing resource). Applied
+  at boot, and every surface says so.
+  **A ten-angle /code-review found the design right and the plumbing
+  wrong. Every confirmed finding is fixed; the ones worth knowing:**
+  **The fleet comparison spanned the wrong nodes** — it filtered on
+  *approved*, and approved is not "in the k3s cluster": an un-promoted
+  Additional node has `cluster_role IS NULL` and runs its own
+  single-node k3s, which APPLIANCE.md says outright. So this feature's
+  own headline deployment — a branch DNS appliance on a 1400-MTU tunnel
+  beside a control plane at the default — raised a permanent,
+  unclearable banner claiming flannel would black-hole traffic between
+  two boxes sharing no pod network. Membership is `cluster_role` now, in
+  one predicate both the REST list and the copilot call.
+  **The wizard validated one value and stored another.** It checked a
+  stripped copy and wrote the raw string, so a pasted `" 1400"` was
+  accepted, shown on Confirm, written to STATE and dropped at boot —
+  this feature's own failure mode, inside the feature. Leading zeros
+  were worse: `01400` is a fine `int` to both writing doors and is
+  refused by the renderer, and written through, NetworkManager
+  normalises it on its next save and the adopt tool then offers phantom
+  drift forever.
+  **The rule was transcribed instead of shared.** #995 built
+  `--check-field` precisely so the wizard carries no second copy of a
+  validator, and the two copies had already drifted at birth. There is
+  one `validate_mtu` now, which also closes the `isdigit()`/`int()`
+  domain gap in both directions (`'٤'` converts, so it would be stored
+  then dropped; `'²'` raises, which on the parse path was an uncaught
+  traceback) and applies the "DHCP needs a pinned interface" rule at
+  every door rather than one.
+  **`echo` is not `printf`.** The sidecar is written by `/bin/sh` =
+  dash, whose `echo` expands backslash escapes, so a hand-edited
+  `network_mtu` containing one emitted a SECOND `MTU=` line — and every
+  reader assigns while iterating, so the last wins. The supervisor would
+  report 9000 on a node at the link default: the one invariant the
+  sidecar exists to hold, defeated downstream of the validation that
+  exists because STATE is hand-editable.
+  **A skipped keyfile left the previous boot's MTU in force** while the
+  sidecar said `n/a`, so a node genuinely running 1400 was compared as
+  the link default. The stale profile is removed now.
+  **`--adopt` was a fourth door with no rule** — an nmtui `mtu=500` is
+  legal to NetworkManager and below our floor, so the console printed
+  "Adopted 1 setting(s)" and the next boot dropped it. And a suppressed
+  difference made `--check` print "Live profile matches STATE" directly
+  above the note contradicting it and exit 0 against a documented
+  exit-code contract, while `--adopt` dropped the note entirely.
+  Refusals are a field on the drift entry now, so every surface sees
+  them.
+  **The 576-9000 guard was bypassed by an over-long digit string.** The
+  shell's `[ -lt ]` does not fail safe — dash and bash both print
+  "Illegal number" and exit non-zero, which reads as "not out of range"
+  — so a 20-digit MTU reached the keyfile, NM rejected the profile, and
+  every surface reported it applied. `set -e` does not catch it inside
+  an `if`.
+  **The static-network loop had flipped from exit status to
+  output-emptiness** while both validators merge stderr into stdout, so
+  one `DeprecationWarning` from a future image's python would have made
+  a valid config permanently unacceptable and trapped the operator on
+  the screen with no way forward.
+  **The console chip ran a file read on the 0.5 s render tick**,
+  breaking an invariant that file documents twice, and sat ahead of
+  `Build` on a no-wrap line — so a refused MTU pushed the running
+  version off an 80-column serial console, on exactly the screen an
+  operator opens when something is wrong.
+  **Plus:** unvalidated JSONB reached a typed response model, so one
+  malformed heartbeat would have 500'd the appliance list for the whole
+  fleet; the copilot row did the double-read its REST sibling's
+  docstring forbids and shipped two of five fields; the tool description
+  never mentioned MTU, so the capability #13 compliance rests on was
+  unroutable; and the banner asserted flannel host-gw as a constant
+  while `Appliance.dataplane_backend` already records it per node.
+  **The tests changed too, and one change paid for itself.** The parity
+  test drove two doors while the claim was three, and compared what the
+  operator typed rather than what the wizard stores — it executes all
+  three on the stored value now, and that is what caught the
+  leading-zero divergence. The adopt-suppression tests called the helper
+  directly, so deleting the wiring inside `compare()` left them green;
+  they go through `compare()` now.
+
 ### Changed
 
 - **Docs site is documentation only (#1070).** `www.spatiumddi.com`

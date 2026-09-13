@@ -205,14 +205,22 @@ Since #1016 the console brackets nmtui with two things:
 2. **An offer when you leave it** to write what you changed back into
    `spatium-config.yaml`, so the next boot renders it. This is bounded to
    the fields STATE models — mode, interface, address, prefix, gateway,
-   DNS, and their IPv6 equivalents.
+   DNS, their IPv6 equivalents, and (since #1017) the interface MTU.
 
-Anything outside that set (an MTU, a static route, ethernet options, a bond
-or bridge) **cannot** be adopted, because etc-render would not render it
-back. Those are listed explicitly rather than quietly dropped: being told
-"adopted 4 changes" while your MTU stays revertible is worse than being told
+Anything outside that set (a static route, other ethernet options, a bond or
+bridge) **cannot** be adopted, because etc-render would not render it back.
+Those are listed explicitly rather than quietly dropped: being told "adopted
+4 changes" while a setting stays revertible is worse than being told
 nothing. That is also why the warning in (1) exists rather than relying on
 the adopt-back alone.
+
+> The MTU is the one adoptable field whose **absence** carries meaning.
+> NetworkManager omits a property sitting at its default rather than
+> writing `mtu=0`, so "the operator cleared the MTU in nmtui" and "there
+> was never an MTU" arrive as the same missing line. `spatium-network-adopt`
+> therefore reports `network_mtu` unconditionally for a managed profile,
+> empty when unset, so clearing one is drift you can adopt rather than a
+> change that silently reverts.
 
 The same reconciliation is available directly:
 
@@ -228,6 +236,113 @@ what #276 built the render path *for* — surviving a `/var` factory reset —
 and would strand an appliance whose STATE says one thing and whose `/etc`
 overlay says another. STATE stays the single source of truth; the adopt-back
 changes what STATE says rather than who owns the file.
+
+### Interface MTU (#1017)
+
+`network_mtu` in `spatium-config.yaml` sets the MTU on the connection
+profile etc-render writes. It is asked for by the installer (both network
+modes), accepted as `network.mtu` in a #549 answer file, and rendered into
+the `[ethernet]` section of whichever keyfile applies.
+
+**Set it to match your segment, not to make things faster.** This is not a
+throughput knob and should not be reached for as one:
+
+- DNS is small UDP, and post-flag-day EDNS0 buffers sit at 1232
+  *specifically* to avoid fragmentation, so the wire size is capped well
+  under 1500 whatever the link does. DHCP is small. The API, the UI and the
+  agent long-polls are small JSON and latency-bound.
+- Raising the MTU on a DHCP-served segment is **actively hazardous**: PXE
+  ROMs and ordinary clients are 1500.
+- The only genuine bulk transfers are intra-cluster (CNPG replication and
+  base backups, the #296 slot-image mirror), both bursty and both already
+  fine at 1500. The classic jumbo win is 10G+ iSCSI / NFS / SAN, which is
+  not this appliance's profile — storage is local-path.
+
+**The real use is the other direction:** an appliance reached over a tunnel
+(WireGuard, IPsec, GRE) or on a PPPoE or provider underlay needs an MTU
+*below* 1500. That failure is nasty and common — ping and small requests
+work, large TCP hangs, and it reads as an application fault rather than a
+network one. Jumbo becomes *possible* on a genuinely all-9000 L2; it is not
+advertised and no benefit is claimed for it.
+
+Three things constrain it, and each fails in a different direction:
+
+1. **576–9000, and 1280 is a hard floor alongside static IPv6.** RFC 8200
+   makes 1280 the IPv6 minimum link MTU, so a pinned static v6 address on a
+   link below it is broken by specification — that combination is refused at
+   the installer, refused by `--check-preseed`, and dropped by the renderer.
+   With IPv6 left on its RA / SLAAC default there is no configured address
+   to break, so a 1200-byte tunnel is allowed.
+2. **DHCP with no pinned interface has nowhere to put it.** etc-render writes
+   no keyfile in that shape — NetworkManager uses its own auto profile — so
+   the wizard does not offer the field and the preseed parser refuses the
+   key. Accepting it would store a value that reaches nothing.
+3. **It applies at boot, not live.** etc-render runs
+   `Before=NetworkManager.service`, and flannel reads the interface MTU when
+   k3s starts, so a change reaches `cni0` only after a reboot. A
+   half-applied MTU — host changed, pod network not — is the mixed-MTU
+   failure below, confined to one node.
+
+The renderer validates as well as the two doors that write the value,
+because STATE is a hand-editable file on a partition an operator can mount.
+A value it cannot trust is **dropped with a reason in
+`/var/log/spatiumddi/etc-render.log`**, never written through: an
+unparseable `mtu=` risks NetworkManager rejecting the profile, and a box
+that comes up with no network at all is far worse than one at the default.
+
+#### Why a mixed-MTU cluster is the thing to watch
+
+k3s here runs `flannel-backend: host-gw`, which writes plain Linux routes
+instead of encapsulating — so the pod network inherits the node MTU with
+**no tunnel headroom**. A cluster with one node at 9000 and two at 1500
+black-holes pod-to-pod traffic and presents as random timeouts, with nothing
+else in the UI that would explain it.
+
+So the MTU is compared across the cluster rather than treated as a
+per-node detail. The supervisor reports what etc-render *applied* (from
+`/etc/spatiumddi/network-status`, read through the bind mount role-config
+already uses — no chart change), and the control plane raises a warning on
+**Appliance → Fleet** naming the nodes on each side. The per-node value
+appears in the Fleet drilldown and, when there is something to say, on the
+console's identity row.
+
+**Only control-plane cluster members are compared**, not every approved
+appliance. An Additional node that has not been promoted runs its *own*
+single-node k3s and shares no flannel network with the control plane, so
+its MTU cannot black-hole anything there — and comparing it would put a
+permanent, unclearable warning on the commonest reason to set an MTU at
+all: a branch DNS appliance reached over a reduced-MTU tunnel. Promote it
+and it joins the comparison, which is exactly when it starts to matter.
+
+Three more properties of that check are deliberate:
+
+- **"Unset" is compared as itself, never as 1500.** Scoring an unconfigured
+  node at the Ethernet default is a guess about hardware nobody read: an
+  operator whose switches are genuinely all-9000 would be told their cluster
+  disagrees when it does not. The banner says plainly that the default was
+  not read from the node.
+- **A node that has not reported is excluded, not assumed.** A supervisor
+  too old to write the sidecar ships no reading. Folding that in as
+  "default" would report a genuine mismatch as agreement on exactly the
+  nodes that could not answer. A *stale* sidecar counts as not reported
+  too: `/etc` is an overlay shared across the A/B slots, so a trial boot
+  that rolls back leaves a file the running slot never wrote, and the
+  reading carries the boot id it was written under.
+- **Anything else is compared rather than dropped.** Every applied-state
+  the renderer can record except a real measurement means "the link
+  default", so an unrecognised one — from a newer slot, or a truncated
+  field — is folded in rather than silently removed from the comparison.
+  A wrong warning is recoverable; a node quietly missing from the check
+  is the black hole it exists to catch.
+
+What is reported is what was **applied**, not what STATE asked for — the
+renderer drops a value it refuses, and reporting the request would have the
+control plane call a node running 9000 and a node that asked for 9000 and
+was refused "consistent".
+
+Out of scope: per-pod / CNI MTU tuning (if the node MTU is right, flannel
+host-gw follows), and bonds, bridges and VLANs, which nmtui creates as
+separate profiles that STATE does not model.
 
 ### Cluster DNS (CoreDNS)
 

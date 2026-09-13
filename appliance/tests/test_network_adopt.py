@@ -20,8 +20,13 @@ pin the parts that would be wrong in a way nobody would notice:
   nothing, and claiming otherwise would warn on the one install shape
   that does not have the problem;
 * **the unadoptable list** — a setting STATE cannot store reverts
-  whatever the operator does, and silently adopting "4 of 5" while the
-  MTU stays revertible is worse than adopting nothing;
+  whatever the operator does, and silently adopting "4 of 5" while a
+  static route stays revertible is worse than adopting nothing;
+* **the MTU**, which #1017 moved from that list into STATE as
+  ``network_mtu``, and which is the one adoptable key whose ABSENCE
+  carries meaning — NetworkManager omits a property at its default, so
+  clearing an MTU in nmtui and never having had one arrive here
+  identically;
 * **the write** — etc-render's reader takes the FIRST match for a key, so
   appending a duplicate would look like a successful adopt and change
   nothing at all.
@@ -255,16 +260,202 @@ def test_unpinned_dhcp_manages_nothing():
 # ── unadoptable settings ──────────────────────────────────────────────
 
 
-def test_settings_state_cannot_store_are_reported(keyfile):
-    """An MTU is the issue's own example, and the nastiest: pings and
-    small requests keep working while large TCP hangs, so it does not
-    even read as "my network config vanished".
+def test_an_mtu_is_adoptable_since_1017(keyfile):
+    """#1016 shipped with the MTU as its headline UNadoptable setting —
+    the nastiest one, because pings and small requests keep working while
+    large TCP hangs, so it does not even read as "my network config
+    vanished".
+
+    #1017 gave STATE a ``network_mtu`` field and etc-render an
+    ``[ethernet] mtu=`` line, so it is now adoptable. This test is the
+    inverse of the one it replaces, and it is here rather than deleted
+    because the regression it guards is the MTU falling between the two
+    lists: filtered out of ``unadoptable`` by ``_MANAGED_KEYS`` while
+    nothing projects it into STATE, leaving a setting that is neither
+    offered for adoption nor named as reverting.
     """
+    keyfile.write_text(
+        STATIC_KEYFILE.replace("[ethernet]\n", "[ethernet]\nmtu=1400\n"), encoding="utf-8"
+    )
+    kf = sna.parse_keyfile(keyfile)
+    assert "ethernet.mtu" not in sna._unadoptable(kf)
+    assert sna._state_from_keyfile(kf)["network_mtu"] == "1400"
+
+
+def test_clearing_an_mtu_in_nmtui_is_drift_not_silence(keyfile):
+    """The asymmetry that makes the MTU unlike every other adoptable key.
+
+    NetworkManager's keyfile writer omits a property sitting at its
+    default, and ``mtu``'s default is 0 — so an operator who clears the
+    field in nmtui leaves behind exactly what a box that never had one
+    leaves: no line at all. Projected only when present, that clearing
+    would be invisible to ``drift_for`` (which walks the LIVE keys), the
+    console would report nothing to adopt, and the next boot would
+    restore the old value. That is #1016's own failure, reintroduced
+    through the setting whose revert is hardest to spot.
+    """
+    keyfile.write_text(STATIC_KEYFILE, encoding="utf-8")  # no mtu= line
+    live = sna._state_from_keyfile(sna.parse_keyfile(keyfile))
+    assert live["network_mtu"] == ""
+    drift = sna.drift_for({"network_mtu": "9000"}, live)
+    assert drift["network_mtu"]["state"] == "9000"
+    assert drift["network_mtu"]["live"] == ""
+
+
+def test_an_mtu_of_zero_means_default_not_a_value(keyfile):
+    """NM accepts an explicit ``mtu=0`` and means "default" by it.
+    Adopted literally, STATE would carry a 0 that the renderer's 576
+    floor then drops on every boot — a value the operator can see in
+    the config and can never make take effect.
+    """
+    keyfile.write_text(
+        STATIC_KEYFILE.replace("[ethernet]\n", "[ethernet]\nmtu=0\n"), encoding="utf-8"
+    )
+    live = sna._state_from_keyfile(sna.parse_keyfile(keyfile))
+    assert live["network_mtu"] == ""
+
+
+def test_an_mtu_the_renderer_refused_is_not_adopted_away(tmp_path):
+    """#1017 — the one case where a missing ``mtu=`` is OUR doing.
+
+    etc-render refuses a value it cannot apply (out of range, or below
+    1280 with a static IPv6 address) and writes no ``mtu=`` line. To this
+    tool that is identical to the operator clearing the field, so the
+    drift reads ``state=1200 live=""`` — and adopting it would overwrite
+    their configured value with an empty one, from a prompt that said
+    "save your nmtui changes". They would lose the setting AND the record
+    of what it was.
+
+    Reachable with no hand-editing: set 1200 while IPv6 is on its
+    RA/SLAAC default (allowed — nothing to break), later adopt a static
+    IPv6 address from nmtui, and the next boot starts refusing the MTU.
+    """
+    status = tmp_path / "network-status"
+    status.write_text(
+        "INTERFACE=eth0\nMODE=static\nMTU=\nMTU_REQUESTED=1200\nMTU_APPLIED=dropped\n",
+        encoding="utf-8",
+    )
+    note = sna._mtu_suppression(status)
+    assert note is not None
+    assert "1200" in note and "REFUSED" in note
+
+
+def test_an_mtu_with_no_profile_to_live_in_is_not_adopted_away(tmp_path):
+    status = tmp_path / "network-status"
+    status.write_text(
+        "INTERFACE=\nMODE=dhcp\nMTU=\nMTU_REQUESTED=9000\nMTU_APPLIED=n/a\n",
+        encoding="utf-8",
+    )
+    note = sna._mtu_suppression(status)
+    assert note is not None
+    assert "9000" in note
+
+
+@pytest.mark.parametrize("applied", ["applied", "default"])
+def test_a_normally_rendered_mtu_is_still_adoptable(tmp_path, applied):
+    """The complement, and the one that keeps the suppression honest: if
+    the renderer applied what it was given, a missing ``mtu=`` really IS
+    the operator clearing it, and clearing must stay adoptable.
+    """
+    status = tmp_path / "network-status"
+    status.write_text(
+        f"INTERFACE=eth0\nMODE=static\nMTU=1400\nMTU_REQUESTED=1400\nMTU_APPLIED={applied}\n",
+        encoding="utf-8",
+    )
+    assert sna._mtu_suppression(status) is None
+
+
+def test_compare_marks_a_refused_mtu_unadoptable(keyfile, monkeypatch, tmp_path):
+    """Through ``compare()``, not the helper.
+
+    The first cut tested ``_mtu_suppression`` directly, so the wiring
+    inside ``compare()`` was never executed: deleting it entirely left
+    all the tests green while ``--adopt`` silently overwrote the
+    operator's configured MTU with an empty one — the exact scenario the
+    wiring exists to stop. This is the same argument the module makes for
+    extracting ``drift_for``.
+    """
+    status = tmp_path / "network-status"
+    status.write_text(
+        "INTERFACE=eth0\nMODE=static\nMTU=\nMTU_REQUESTED=1200\nMTU_APPLIED=dropped\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sna, "NETWORK_STATUS", status)
+    monkeypatch.setattr(sna, "STATIC_KEYFILE", keyfile)
+    keyfile.write_text(STATIC_KEYFILE, encoding="utf-8")  # no mtu= line
+
+    report = sna.compare(
+        {"network_mode": "static", "network_interface": "eth0", "network_mtu": "1200"}
+    )
+    entry = report["drift"]["network_mtu"]
+    # Still REPORTED as drift — it genuinely is one, and the exit code
+    # contract says 10 — but explicitly not adoptable, with the reason.
+    assert entry["adoptable"] is False
+    assert "REFUSED" in entry["reason"]
+
+
+def test_compare_refuses_to_adopt_an_mtu_the_renderer_would_drop(
+    keyfile, config, monkeypatch, tmp_path
+):
+    """The other direction: nmtui accepts an MTU the renderer will not.
+
+    500 is legal to NetworkManager (the Ethernet minimum is 68) and below
+    SpatiumDDI's 576 floor. Without this, ``--adopt`` was a fourth door
+    with no rule: the console printed "Adopted 1 setting(s) into STATE:
+    network_mtu = 500" and the next boot dropped it.
+    """
+    status = tmp_path / "network-status"
+    status.write_text("MTU=1400\nMTU_REQUESTED=1400\nMTU_APPLIED=applied\n", encoding="utf-8")
+    monkeypatch.setattr(sna, "NETWORK_STATUS", status)
+    monkeypatch.setattr(sna, "STATIC_KEYFILE", keyfile)
+    keyfile.write_text(
+        STATIC_KEYFILE.replace("[ethernet]\n", "[ethernet]\nmtu=500\n"), encoding="utf-8"
+    )
+
+    entry = sna.compare(
+        {"network_mode": "static", "network_interface": "eth0"}
+    )["drift"]["network_mtu"]
+    assert entry["live"] == "500"
+    assert entry["adoptable"] is False
+    assert "576" in entry["reason"]
+
+
+def test_an_ordinary_mtu_edit_stays_adoptable(keyfile, monkeypatch, tmp_path):
+    """The complement, and what keeps the two refusals honest."""
+    status = tmp_path / "network-status"
+    status.write_text("MTU=1400\nMTU_REQUESTED=1400\nMTU_APPLIED=applied\n", encoding="utf-8")
+    monkeypatch.setattr(sna, "NETWORK_STATUS", status)
+    monkeypatch.setattr(sna, "STATIC_KEYFILE", keyfile)
     keyfile.write_text(
         STATIC_KEYFILE.replace("[ethernet]\n", "[ethernet]\nmtu=9000\n"), encoding="utf-8"
     )
-    unadoptable = sna._unadoptable(sna.parse_keyfile(keyfile))
-    assert "ethernet.mtu" in unadoptable
+
+    entry = sna.compare(
+        {"network_mode": "static", "network_interface": "eth0"}
+    )["drift"]["network_mtu"]
+    assert entry["live"] == "9000"
+    assert entry["adoptable"] is True
+    assert entry["reason"] == ""
+
+
+def test_no_sidecar_suppresses_nothing(tmp_path):
+    """An older slot, or a non-appliance host. Nothing is known about why
+    the line is missing, so nothing is suppressed — which is the
+    pre-#1017 behaviour.
+    """
+    assert sna._mtu_suppression(tmp_path / "absent") is None
+
+
+def test_an_unchanged_appliance_reports_no_mtu_drift(keyfile):
+    """The complement of the two above, and the one that keeps them
+    honest: neither STATE nor the keyfile carrying an MTU is the normal
+    case on every appliance installed to date, and it must produce no
+    drift at all. An alarm that always fires is one operators learn to
+    dismiss.
+    """
+    keyfile.write_text(STATIC_KEYFILE, encoding="utf-8")
+    live = sna._state_from_keyfile(sna.parse_keyfile(keyfile))
+    assert "network_mtu" not in sna.drift_for({"network_mode": "static"}, live)
 
 
 def test_a_static_route_is_reported_unadoptable(keyfile):
@@ -307,13 +498,28 @@ def test_the_managed_key_set_covers_what_etc_render_actually_renders():
                 continue
             if line.startswith("$("):
                 continue  # a shell substitution emitting its own lines
+            # #1017 — a conditional expansion, ``${VAR:+key=value}``, is
+            # how an OPTIONAL key is rendered: present when the variable
+            # is set, gone entirely when it is not. Resolved to its key
+            # rather than skipped, so the guard actually covers those
+            # lines. Skipping them would have been the easy fix and
+            # would have quietly exempted every optional key anyone adds
+            # from here on — which is the class of key most likely to be
+            # forgotten in ``_MANAGED_KEYS``.
+            m = re.fullmatch(r"\$\{[A-Za-z_][A-Za-z_0-9]*:\+(.*)\}", line)
+            if m:
+                line = m.group(1)
+                if "=" not in line:
+                    continue
             rendered_keys.add(line.split("=", 1)[0])
     managed_names = {k for _, k in sna._MANAGED_KEYS}
     missing = rendered_keys - managed_names
     assert not missing, f"etc-render renders keys _MANAGED_KEYS does not know: {missing}"
     # And the interesting keys really were found, or an empty set would
-    # pass this test forever.
-    assert {"interface-name", "method", "address1"} <= rendered_keys
+    # pass this test forever. ``mtu`` is in the list because it is
+    # rendered through the conditional form above — if the resolution
+    # breaks, this catches it rather than letting the key vanish.
+    assert {"interface-name", "method", "address1", "mtu"} <= rendered_keys
 
 
 # ── writing back into STATE ───────────────────────────────────────────

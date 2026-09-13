@@ -1362,6 +1362,43 @@ _FLANNEL_IFACES = ("cni0", "flannel.")
 _FLANNEL_V4_PREFIX = "10.42."
 
 
+NETWORK_STATUS_FILE = Path("/etc/spatiumddi/network-status")
+
+
+def network_mtu_chip() -> tuple[str, str] | None:
+    """#1017 — the interface MTU, for the identity row. None = say nothing.
+
+    Reads what ``spatium-etc-render`` recorded at this boot rather than
+    the live kernel, so the console agrees with the Fleet UI (which sees
+    the same sidecar through the supervisor) instead of offering a second
+    opinion an operator then has to reconcile.
+
+    **Silent on the normal case**, which is every appliance that set no
+    MTU: this row is already dense, and a chip reading "MTU default" on
+    every console would be noise on the screen an operator reaches for
+    when something is wrong. It speaks only when a value is in force —
+    worth confirming, because the setting exists for links where a wrong
+    MTU shows up as large transfers hanging — or when one was asked for
+    and refused, which is the case nothing else on this screen explains.
+
+    Must NOT be called from the 0.5 s render path: it is a file read, and
+    ``DashboardState`` collects it on the 5 s data tier into
+    ``state.mtu_chip`` the way ``host_ips`` and ``storage_chips`` are
+    collected. ``read_env`` rather than a private parser — same format,
+    same `errors="replace"` hardening, one reader.
+    """
+    fields = read_env(NETWORK_STATUS_FILE)
+    if not fields:
+        return None
+    applied = fields.get("MTU_APPLIED")
+    if applied == "applied" and fields.get("MTU"):
+        return (f"MTU {fields['MTU']}", "bright_cyan")
+    if applied == "dropped":
+        requested = fields.get("MTU_REQUESTED") or "?"
+        return (f"MTU {requested} REFUSED", "bold bright_yellow")
+    return None
+
+
 def host_ips() -> tuple[list[str], list[str]]:
     """Return ``(ipv4_addresses, ipv6_addresses)``. Splits the two
     families so the header can render the IPv4 list inline + a
@@ -2687,6 +2724,17 @@ def render_header(
     identity.append("   ·   ", style="dim")
     identity.append("Build ", style="dim")
     identity.append(build)
+    # #1017 — AFTER Build, and only when there is something to say.
+    #
+    # This Text is ``no_wrap`` + ``overflow="ellipsis"``, so anything past
+    # the frame is DROPPED rather than wrapped. Inserted before Build, a
+    # refused-MTU chip pushed the running build — which CLAUDE.md calls
+    # the first thing asked when an install misbehaves — and the #556
+    # control-plane reachability chip off an 80-column serial console, on
+    # exactly the screen an operator opens when something is wrong.
+    if state.mtu_chip is not None:
+        identity.append("   ·   ", style="dim")
+        identity.append(state.mtu_chip[0], style=state.mtu_chip[1])
     # #556 — control-plane reachability chip (appliance role only; the probe
     # returns None on control-plane, so this stays off there). Lets an
     # operator distinguish "unapproved" from "can't reach the control plane".
@@ -4408,6 +4456,10 @@ class DashboardState:
         self.k3s_state: tuple[str, str] | None = None
         self.ip_v4: list[str] = []
         self.ip_v6: list[str] = []
+        # P0.5 / #1017 — the MTU chip. A file read, so it belongs on the
+        # data tier like every other header input; the sidecar cannot
+        # change without a reboot, so even 5 s is generous.
+        self.mtu_chip: tuple[str, str] | None = None
         # P0.5 — host-config apply health rollup, refreshed on the 5 s
         # data tier (pure file reads; must NOT be called on the 0.5 s
         # render path). ``{}``/``ok`` until the first refresh.
@@ -4512,6 +4564,7 @@ class DashboardState:
             # the capacity numbers it sits next to.
             self.storage_chips = storage_summary()
             self.ip_v4, self.ip_v6 = host_ips()
+            self.mtu_chip = network_mtu_chip()
         # Data tier (5 s, DATA_REFRESH_EVERY) — k3s pods / nodes / kubelet
         # metrics + the etcd/api/cnpg health fetches + env re-read.
         if force or (now - self._last_data_refresh) >= DATA_REFRESH_EVERY:
@@ -5231,15 +5284,23 @@ def _offer_network_adopt(console: Console, tty: str) -> None:
     """After nmtui exits, offer to save its changes into STATE (#1016).
 
     Bounded to the settings STATE models, and it says which ones it
-    cannot take: an operator told "adopted 4 changes" while their MTU
-    silently stayed revertible is worse off than one told nothing at all.
+    cannot take: an operator told "adopted 4 changes" while a static
+    route silently stayed revertible is worse off than one told nothing
+    at all. Since #1017 a drift entry can also be present but NOT
+    adoptable — an MTU the renderer refused, or one it would refuse —
+    which is reported rather than silently skipped.
     """
     report = _network_adopt_report()
     if report is None or not report.get("managed"):
         return
     drift = report.get("drift") or {}
     unadoptable = report.get("unadoptable") or []
-    if not drift and not unadoptable:
+    # #1017 — a difference that is real but must not be written back.
+    # ``adoptable`` defaults True for every entry drift_for builds, so an
+    # older tool on an older slot still behaves.
+    refused = {k: e for k, e in drift.items() if not e.get("adoptable", True)}
+    drift = {k: e for k, e in drift.items() if e.get("adoptable", True)}
+    if not drift and not unadoptable and not refused:
         return
 
     if drift:
@@ -5273,6 +5334,42 @@ def _offer_network_adopt(console: Console, tty: str) -> None:
                 "[yellow]Not saved — these changes revert at the next boot.[/yellow]"
             )
             time.sleep(3)
+
+    if refused:
+        # Its own screen, like the unadoptable panel below, rather than a
+        # bare print over nmtui's leftover output: this is the only place
+        # an operator learns their MTU is being refused every boot, and on
+        # an 80x24 serial console a loose paragraph lands at whatever row
+        # the cursor happens to be on and is repainted seconds later.
+        #
+        # Text(), not console.print(markup) — the reason embeds
+        # MTU_REQUESTED, copied verbatim from the hand-editable
+        # spatium-config.yaml, and Rich parses "[...]" as markup and
+        # raises MarkupError on an unmatched closing tag. A STATE value of
+        # "[/x]" would turn this screen into an exception.
+        console.clear()
+        body = [
+            Text(
+                "These differences are real but cannot be saved to STATE — "
+                "they are refused at boot, not by nmtui:",
+                style="bold",
+            ),
+            Text(""),
+        ]
+        for key in sorted(refused):
+            body.append(Text(f"  {key}", style="bold bright_yellow"))
+            body.append(Text(f"    {refused[key].get('reason', '')}"))
+        console.print(
+            Align.center(
+                Panel(
+                    Group(*body),
+                    title="[bold yellow] Not saved to STATE [/bold yellow]",
+                    border_style="yellow",
+                    padding=(1, 3),
+                )
+            )
+        )
+        _wait_for_key(tty)
 
     if unadoptable:
         # Said whether or not anything was adopted: these revert either

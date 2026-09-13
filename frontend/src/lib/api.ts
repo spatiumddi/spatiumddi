@@ -12214,6 +12214,25 @@ export interface ApplianceRow {
   // False = the supervisor never looked (too old to collect it), which is
   // UNKNOWN — distinct from "looked and found no arrays".
   storage_reported: boolean;
+  // #1017 — the interface MTU spatium-etc-render actually APPLIED at this
+  // node's last boot, which is not what STATE asked for: the renderer
+  // drops a value that is out of range, that would break a pinned IPv6
+  // address (RFC 8200), or that has no keyfile to live in.
+  // `mtu_requested` carries the operator's value so the difference is
+  // diagnosable on screen instead of only in the render log.
+  mtu: number | null;
+  // A string, not a number: what it reports is the operator's configured
+  // value, and the case it exists for is the one where that value was
+  // not a number and the renderer dropped it.
+  mtu_requested: string | null;
+  // "applied" | "default" | "dropped" | "n/a" — null on a supervisor too
+  // old to report, which is UNKNOWN and must not render like "default".
+  mtu_applied: string | null;
+  mtu_reported: boolean;
+  // Per-node findings only (a value the renderer refused). The
+  // fleet-consistency verdict needs every row and rides on the list
+  // response as `mtu_fleet`.
+  mtu_findings: MtuFinding[];
   // Issue #183 Phase 5 — installed k3s version (e.g. ``v1.36.4+k3s1``).
   // Null on legacy compose / pre-#183 supervisors.
   k3s_version: string | null;
@@ -12253,11 +12272,54 @@ export interface ApplianceRolesUpdate {
   firewall_extra?: string | null;
 }
 
+export interface MtuFinding {
+  severity: string;
+  kind: string;
+  detail: string;
+}
+
+/**
+ * #1017 — whether every approved node is on the same interface MTU.
+ *
+ * k3s runs flannel in host-gw mode, so the pod network inherits the node
+ * MTU with no tunnel headroom: a mixed-MTU cluster black-holes pod-to-pod
+ * traffic and presents as random timeouts, with nothing else in the UI
+ * explaining it.
+ *
+ * `consistent` is true when nobody reported — the absence of a reading is
+ * not a fault, and every appliance installed before #1017 reports
+ * nothing. `answers` maps each distinct answer ("1400", or the literal
+ * "default") to the hostnames giving it; "default" is deliberately not
+ * the number 1500, because that would be a guess about hardware nobody
+ * read.
+ */
+export interface ApplianceMtuFleet {
+  reported: number;
+  answers: Record<string, string[]>;
+  consistent: boolean;
+  detail: string | null;
+}
+
+export interface ApplianceListResponse {
+  appliances: ApplianceRow[];
+  mtu_fleet: ApplianceMtuFleet;
+}
+
 export const applianceApprovalApi = {
   list: () =>
     api
       .get<{ appliances: ApplianceRow[] }>("/appliance/appliances")
       .then((r) => r.data.appliances),
+  /**
+   * The same endpoint, keeping the fleet-level block the row list drops.
+   *
+   * A separate method rather than widening `list()`: ten callers expect
+   * an `ApplianceRow[]` and only the Fleet tab needs the verdict. Callers
+   * that want rows pass `select: (d) => d.appliances`, so React Query
+   * still issues ONE request per key and existing usages are unchanged.
+   */
+  listFleet: () =>
+    api.get<ApplianceListResponse>("/appliance/appliances").then((r) => r.data),
   get: (id: string) =>
     api.get<ApplianceRow>(`/appliance/appliances/${id}`).then((r) => r.data),
   approve: (id: string) =>

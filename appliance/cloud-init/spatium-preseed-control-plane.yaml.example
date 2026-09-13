@@ -134,6 +134,26 @@ spatium_preseed:
     # ip6: 2001:db8:1::10
     # prefix6: 64
     # gateway6: fe80::1
+    #
+    # Optional interface MTU (#1017). Blank / absent means
+    # NetworkManager's default, which is what every install has had so
+    # far and is almost always right.
+    #
+    # Set it to MATCH a link that needs a SMALLER MTU: a WireGuard /
+    # IPsec / GRE tunnel, PPPoE, or a provider underlay. That failure is
+    # nasty and common — ping and small requests work, large TCP hangs,
+    # and it reads as an application fault. This is NOT a performance
+    # knob: SpatiumDDI's own traffic is small UDP and small JSON, and
+    # raising the MTU on a DHCP-served segment is actively hazardous
+    # because PXE ROMs are 1500.
+    #
+    # Range 576-9000. Below 1280 is REFUSED alongside a static ip6 —
+    # IPv6 cannot run on such a link at all (RFC 8200). In dhcp mode it
+    # REQUIRES `interface`: with no port pinned the appliance uses
+    # NetworkManager's own profile, which carries no MTU from
+    # SpatiumDDI, so the value would be stored and never applied.
+    # Applied at boot, not live.
+    # mtu: 1400
 
   # ── k3s pod + service CIDRs (#302) ──────────────────────────────────
   # Defaults match k3s upstream. Override only if your LAN already uses
