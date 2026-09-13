@@ -71,7 +71,12 @@ def _request_dir() -> Path:
 
 def storage_loop_forever(cfg: SupervisorConfig, identity: Identity) -> None:
     """Run the storage long-poll loop until the process exits."""
-    with httpx.Client(timeout=_POLL_TIMEOUT_S + 10.0, verify=cfg.verify_tls) as client:
+    # No ``verify=`` argument, exactly like the k8s / nettool / pcap loops:
+    # httpx verifies by default, and ``SupervisorConfig`` has no TLS field
+    # to read. The previous ``verify=cfg.verify_tls`` raised AttributeError
+    # on this line — ABOVE the guard below — and ended the thread at boot
+    # on every appliance (#1072).
+    with httpx.Client(timeout=_POLL_TIMEOUT_S + 10.0) as client:
         while True:
             try:
                 _storage_once(cfg, identity, client)
