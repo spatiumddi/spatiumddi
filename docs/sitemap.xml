@@ -2,6 +2,7 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url><loc>https://www.spatiumddi.com/</loc><changefreq>weekly</changefreq><priority>1.0</priority></url>
   <url><loc>https://www.spatiumddi.com/GETTING_STARTED</loc><changefreq>monthly</changefreq><priority>0.9</priority></url>
+  <url><loc>https://www.spatiumddi.com/deployment/APPLIANCE_INSTALL</loc><changefreq>monthly</changefreq><priority>0.9</priority></url>
   <url><loc>https://www.spatiumddi.com/TROUBLESHOOTING</loc><changefreq>monthly</changefreq><priority>0.8</priority></url>
   <url><loc>https://www.spatiumddi.com/deployment/WINDOWS</loc><changefreq>monthly</changefreq><priority>0.6</priority></url>
   <url><loc>https://www.spatiumddi.com/ARCHITECTURE</loc><changefreq>monthly</changefreq><priority>0.9</priority></url>
