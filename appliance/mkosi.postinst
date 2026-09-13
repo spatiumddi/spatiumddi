@@ -61,6 +61,8 @@ for unit in chrony.service ssh.service \
             spatiumddi-verbose-boot-reload.path \
             spatiumddi-pcap.path \
             spatiumddi-storage-action.path \
+            spatiumddi-removable-reload.path \
+            spatiumddi-removable-boot.service \
             spatium-firewall-reload.path \
             spatiumddi-firewall-revert.timer \
             spatiumddi-image-prune.timer \
@@ -255,6 +257,11 @@ chmod 0755 "$BUILDROOT/usr/local/bin/spatium-grub-render"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-esp-sync"
 # #999 Part B — md / multipath management runner + its .path trigger.
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-storage-action"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-removable-reload.path"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-removable-reload.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-removable-prepare.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-removable-boot.service"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-removable-reload"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-storage-action.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-storage-action.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-host-migrate"

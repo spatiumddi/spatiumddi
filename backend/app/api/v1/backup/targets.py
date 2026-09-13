@@ -303,6 +303,14 @@ async def create_target(
         keep_days=body.retention_keep_days,
     )
 
+    # #989 item 3 — a removable-disk destination is node-local, so
+    # derive which node from the fleet rather than asking the operator
+    # to type a Kubernetes node name into a generic text box. No-op for
+    # every other path and every other kind.
+    from app.services.appliance.removable import stamp_node_name  # noqa: PLC0415
+
+    body.config = await stamp_node_name(db, body.config)
+
     # Encrypt any ``secret=True`` fields before they hit the
     # JSONB column. Driver got plaintext for validation; storage
     # gets ciphertext.
@@ -404,6 +412,11 @@ async def update_target(
         # the secret (or sends the redaction sentinel). Validation
         # runs on the merged dict so shape checks see all fields.
         merged = merge_config_for_update(driver, incoming=payload["config"], existing=row.config)
+        # #989 item 3 — same derivation as create. No-op unless the path
+        # moved under the removable root and no node was set by hand.
+        from app.services.appliance.removable import stamp_node_name  # noqa: PLC0415
+
+        merged = await stamp_node_name(db, merged)
         try:
             driver.validate_config(merged)
             await driver.validate_config_network(merged)

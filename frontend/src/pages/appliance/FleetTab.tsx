@@ -36,6 +36,8 @@ import {
   type ApplianceState,
   type ApplianceUpgradeStep,
   type ControlPlaneReplaceResult,
+  type RemovableDisk,
+  type RemovableMount,
   type StorageActionRequest,
   type StorageActionResult,
   type SupervisorCapabilities,
@@ -56,6 +58,7 @@ import {
   storageChipClass,
   storageSeverityClass,
 } from "@/lib/storage-health";
+import { fmtDiskBytes } from "./clusterShared";
 import { LLDPTab } from "./LLDPTab";
 import { AptTab } from "./AptTab";
 import { NTPTab } from "./NTPTab";
@@ -2647,6 +2650,8 @@ function ApplianceDrilldownModal({
 
         {row.state === "approved" && <ApplianceStorageSection row={row} />}
 
+        {row.state === "approved" && <ApplianceRemovableSection row={row} />}
+
         {row.state === "approved" &&
           Object.keys(row.host_config_health ?? {}).length > 0 && (
             <ApplianceHostConfigHealthSection row={row} />
@@ -3223,6 +3228,397 @@ function StorageActionModal({
   );
 }
 
+// ── #989 item 3 — removable (USB) backup disks ──────────────────────
+//
+// The single-appliance operator with no NAS and no cloud account backs
+// up to a USB disk. This is where they plug one in and point a backup
+// destination at it.
+
+const REMOVABLE_STATE_CLS: Record<string, string> = {
+  mounted: "border-emerald-500/40 bg-emerald-500/10 text-emerald-600",
+  // `waiting` is amber-but-benign; `present` is a real fault — the disk
+  // is in the port and the mount did not take.
+  waiting: "border-amber-500/40 bg-amber-500/10 text-amber-600",
+  present: "border-rose-500/40 bg-rose-500/10 text-rose-600",
+  blind: "border-rose-500/40 bg-rose-500/10 text-rose-600",
+  unreported: "border-border bg-muted/40 text-muted-foreground",
+};
+
+/** Why a mount is in the state it is, in words the operator can act on. */
+const REMOVABLE_STATE_HELP: Record<string, string> = {
+  mounted: "The disk is plugged in and the filesystem is live.",
+  waiting:
+    "Configured and armed. The disk is not plugged in — it will mount by itself when it is.",
+  present:
+    "The disk IS plugged in and did not mount. Check the filesystem (a disk yanked without ejecting can come back dirty) and journalctl -u spatiumddi-removable-reload on the node.",
+  blind:
+    "This node cannot read its removable directory at all — the hostPath mount is missing or lost its propagation. Backups to it will fail even if the disk is fine.",
+  unreported: "This node has not reported yet.",
+};
+
+function MountDiskModal({
+  applianceId,
+  disk,
+  taken,
+  pathTemplate,
+  nodeName,
+  onClose,
+}: {
+  applianceId: string;
+  disk: RemovableDisk;
+  taken: string[];
+  pathTemplate: string;
+  nodeName: string | null;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  // Pre-filled from the disk's own label, because that is what the
+  // operator wrote on it — but SANITISED, since a label is set on the
+  // disk and is neither unique nor constrained to a safe character set,
+  // while this name becomes a directory and part of a systemd unit
+  // filename.
+  const suggested = (disk.label || disk.model || "usb")
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 32);
+  const [name, setName] = useState(suggested || "usb1");
+  const [error, setError] = useState<string | null>(null);
+  const valid = /^[a-z0-9][a-z0-9_-]{0,31}$/.test(name);
+  const collides = taken.includes(name);
+
+  const mutation = useMutation({
+    mutationFn: () =>
+      applianceApi.mountRemovable(applianceId, { fs_uuid: disk.fs_uuid, name }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["appliance-removable", applianceId] });
+      // ["appliance", "fleet"], not ["appliances"] — the latter matches
+      // no query in the codebase, so the fleet row (and its
+      // host-config chip) stayed stale until the next 15 s tick.
+      qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
+      onClose();
+    },
+    onError: (err: unknown) => {
+      // Matched on the FastAPI detail, never on err.message — on an
+      // AxiosError that is always "Request failed with status code 422"
+      // and never the reason (#1009).
+      const detail = (err as { response?: { data?: { detail?: string } } })
+        ?.response?.data?.detail;
+      setError(detail ?? "Could not mount the disk.");
+    },
+  });
+
+  return (
+    <Modal onClose={onClose} title="Mount removable disk">
+      <div className="space-y-3 text-sm">
+        <div className="rounded-md border bg-muted/30 px-3 py-2 text-xs">
+          <div className="font-medium">
+            {[disk.vendor, disk.model].filter(Boolean).join(" ") || disk.device}
+          </div>
+          <div className="mt-0.5 text-muted-foreground">
+            {disk.fstype} · {fmtDiskBytes(disk.size_bytes)}
+            {disk.label ? ` · label “${disk.label}”` : ""} · UUID {disk.fs_uuid}
+          </div>
+        </div>
+        <label className="block">
+          <span className="text-xs font-medium">Name</span>
+          <input
+            className="mt-1 w-full rounded-md border bg-background px-2 py-1.5 text-sm"
+            value={name}
+            onChange={(e) => setName(e.target.value.toLowerCase())}
+            autoFocus
+          />
+          <span className="mt-1 block text-[11px] text-muted-foreground">
+            Lowercase letters, digits, <code>-</code> or <code>_</code>. It
+            becomes a directory on the appliance, so pick something you will
+            recognise — you will type it into the backup destination.
+          </span>
+        </label>
+        {valid && !collides && (
+          <div className="rounded-md border bg-muted/30 px-3 py-2 text-[11px]">
+            <div className="text-muted-foreground">
+              Point a <strong>Local volume</strong> backup destination at:
+            </div>
+            <code className="mt-1 block break-all">
+              {pathTemplate.replace("{name}", name)}
+            </code>
+            {nodeName && (
+              <div className="mt-1.5 text-muted-foreground">
+                Set the destination&apos;s <strong>Kubernetes node</strong> to{" "}
+                <code>{nodeName}</code> — a removable disk is node-local, and
+                that is what makes a run scheduled elsewhere say where the disk
+                is instead of just &ldquo;nothing is mounted&rdquo;.
+              </div>
+            )}
+          </div>
+        )}
+        {!valid && name.length > 0 && (
+          <p className="text-xs text-destructive">
+            Use lowercase letters, digits, <code>-</code> or <code>_</code>,
+            starting with a letter or digit, at most 32 characters.
+          </p>
+        )}
+        {collides && (
+          <p className="text-xs text-destructive">
+            This appliance already has a mount named “{name}”.
+          </p>
+        )}
+        {error && <p className="text-xs text-destructive">{error}</p>}
+        <div className="flex justify-end gap-2 pt-1">
+          <HeaderButton variant="secondary" onClick={onClose}>
+            Cancel
+          </HeaderButton>
+          <HeaderButton
+            variant="primary"
+            disabled={!valid || collides || mutation.isPending}
+            onClick={() => {
+              setError(null);
+              mutation.mutate();
+            }}
+          >
+            {mutation.isPending ? "Mounting…" : "Mount"}
+          </HeaderButton>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function ApplianceRemovableSection({ row }: { row: ApplianceRow }) {
+  const qc = useQueryClient();
+  const [mounting, setMounting] = useState<RemovableDisk | null>(null);
+  const [ejecting, setEjecting] = useState<RemovableMount | null>(null);
+
+  const { data, isLoading } = useQuery({
+    queryKey: ["appliance-removable", row.id],
+    queryFn: () => applianceApi.listRemovable(row.id),
+    // Polled rather than live: the reading rides the node's heartbeat,
+    // so a disk plugged in a moment ago appears on the next tick. This
+    // is what makes that arrive without the operator hunting for a
+    // Refresh button that could not have helped anyway.
+    refetchInterval: 20_000,
+  });
+
+  const [ejectError, setEjectError] = useState<string | null>(null);
+  const eject = useMutation({
+    mutationFn: (name: string) => applianceApi.ejectRemovable(row.id, name),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["appliance-removable", row.id] });
+      qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
+      setEjecting(null);
+    },
+    // Without this a 503 (maintenance mode 503s every mutation), a 404
+    // from a second tab, or any 5xx left the modal sitting there with
+    // the spinner stopped and no message — after telling the operator
+    // "safe to pull once this finishes". Matched on the FastAPI detail,
+    // never on err.message, which on an AxiosError is always "Request
+    // failed with status code N" (#1009).
+    onError: (err: unknown) => {
+      const detail = (err as { response?: { data?: { detail?: string } } })
+        ?.response?.data?.detail;
+      setEjectError(
+        detail ?? "Could not eject the disk. It may still be mounted.",
+      );
+    },
+  });
+
+  if (isLoading) return null;
+  // Nothing reported and nothing configured: an ordinary appliance with
+  // no USB disk gains no clutter, exactly like the storage section.
+  if (!data || (!data.reported && data.mounts.length === 0)) return null;
+  const mounted = data.mounts.map((m) => m.name);
+
+  return (
+    <div className="border-t pt-4">
+      <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+        Removable storage
+      </h3>
+      <p className="mt-1 text-xs text-muted-foreground">
+        Mount a USB disk on this node and point a <strong>Local volume</strong>{" "}
+        backup destination at it. The reading comes from this node&apos;s
+        heartbeat, so a disk you just plugged in appears within about a minute.
+        {data.node_name ? ` Disks here are on node ${data.node_name}.` : ""}
+      </p>
+
+      {!data.root_readable && (
+        <p className="mt-2 rounded-md border border-rose-500/40 bg-rose-500/10 px-2 py-1.5 text-[11px] text-rose-600">
+          This node cannot read <code>/var/lib/spatiumddi/removable</code>. The
+          hostPath mount is missing or has lost its{" "}
+          <code>mountPropagation: HostToContainer</code>, so backups here will
+          fail whatever the disks below say.
+        </p>
+      )}
+      {data.apply_state && (
+        <p className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-[11px] text-amber-600">
+          The appliance has not applied its removable-mount config yet (
+          {data.apply_state}).{" "}
+          {/* The runner's own reason, when it wrote one — otherwise the
+              operator is told only "not applied" and sent to journalctl. */}
+          {data.apply_error ? (
+            <>
+              The node reported: <em>{data.apply_error}</em>
+            </>
+          ) : (
+            <>
+              Check <code>journalctl -u spatiumddi-removable-reload</code> on
+              the node.
+            </>
+          )}
+        </p>
+      )}
+
+      {data.mounts.length > 0 && (
+        <div className="mt-2 overflow-hidden rounded-md border">
+          <table className="w-full text-xs">
+            <thead className="bg-muted/40 text-[10px] uppercase tracking-wide text-muted-foreground">
+              <tr>
+                <th className="px-3 py-1.5 text-left font-medium">Name</th>
+                <th className="px-3 py-1.5 text-left font-medium">State</th>
+                <th className="px-3 py-1.5 text-left font-medium">Free</th>
+                <th className="px-3 py-1.5 text-left font-medium">
+                  Destination path
+                </th>
+                <th className="px-3 py-1.5 text-left font-medium" />
+              </tr>
+            </thead>
+            <tbody className="divide-y">
+              {data.mounts.map((m) => (
+                <tr key={m.name}>
+                  <td className="px-3 py-1.5 font-mono">{m.name}</td>
+                  <td className="px-3 py-1.5">
+                    <span
+                      className={cn(
+                        "inline-flex items-center rounded-full border px-1.5 py-0.5 text-[10px] font-medium",
+                        REMOVABLE_STATE_CLS[m.state] ??
+                          REMOVABLE_STATE_CLS.unreported,
+                      )}
+                      title={REMOVABLE_STATE_HELP[m.state]}
+                    >
+                      {m.state}
+                    </span>
+                  </td>
+                  <td className="px-3 py-1.5">
+                    {m.state === "mounted"
+                      ? `${fmtDiskBytes(m.free_bytes)} of ${fmtDiskBytes(m.total_bytes)}`
+                      : "—"}
+                  </td>
+                  <td className="px-3 py-1.5">
+                    <code className="break-all text-[11px]">{m.path}</code>
+                  </td>
+                  <td className="px-3 py-1.5 text-right">
+                    <HeaderButton
+                      variant="destructive"
+                      onClick={() => setEjecting(m)}
+                    >
+                      Eject
+                    </HeaderButton>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {data.reported && (
+        <div className="mt-3">
+          <div className="text-[11px] font-medium text-muted-foreground">
+            Detected disks
+          </div>
+          {data.disks.length === 0 ? (
+            <p className="mt-1 text-xs text-muted-foreground">
+              No USB disk with a filesystem is plugged into this node.
+            </p>
+          ) : (
+            <ul className="mt-1 space-y-1">
+              {data.disks.map((d) => {
+                const alreadyMounted = data.mounts.some(
+                  (m) => m.fs_uuid === d.fs_uuid,
+                );
+                return (
+                  <li
+                    key={d.fs_uuid || d.device}
+                    className="flex flex-wrap items-center gap-2 rounded-md border px-2 py-1.5 text-[11px]"
+                  >
+                    <span className="font-medium">
+                      {[d.vendor, d.model].filter(Boolean).join(" ") ||
+                        d.device ||
+                        "USB disk"}
+                    </span>
+                    <span className="text-muted-foreground">
+                      {d.fstype} · {fmtDiskBytes(d.size_bytes)}
+                      {d.label ? ` · “${d.label}”` : ""}
+                    </span>
+                    <span className="ml-auto flex items-center gap-2">
+                      {/* Unusable disks are shown DISABLED with the reason,
+                          never hidden: a disk that simply does not appear
+                          reads as a broken feature (#1026's picker rule). */}
+                      {d.reason && (
+                        <span className="text-muted-foreground">
+                          {d.reason}
+                        </span>
+                      )}
+                      <HeaderButton
+                        variant="secondary"
+                        disabled={!d.usable || alreadyMounted}
+                        title={
+                          alreadyMounted
+                            ? "Already mounted on this appliance"
+                            : (d.reason ?? undefined)
+                        }
+                        onClick={() => setMounting(d)}
+                      >
+                        {alreadyMounted ? "Mounted" : "Mount…"}
+                      </HeaderButton>
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {mounting && (
+        <MountDiskModal
+          applianceId={row.id}
+          disk={mounting}
+          taken={mounted}
+          pathTemplate={data.path_template}
+          nodeName={data.node_name}
+          onClose={() => setMounting(null)}
+        />
+      )}
+      {ejecting && (
+        <ConfirmModal
+          open
+          title={`Eject ${ejecting.name}?`}
+          // Deliberately not blocked by a backup target still pointing
+          // here. The operator wants their disk back, and refusing would
+          // leave them pulling it anyway with the filesystem un-flushed.
+          message={
+            ejectError ? (
+              <span className="text-destructive">{ejectError}</span>
+            ) : (
+              `The disk is flushed and unmounted, so it is safe to pull once the node ` +
+              `reports it gone. Any backup destination pointing at ${ejecting.path} ` +
+              `will fail — loudly — until you mount it again.`
+            )
+          }
+          confirmLabel="Eject"
+          tone="destructive"
+          loading={eject.isPending}
+          onConfirm={() => eject.mutate(ejecting.name)}
+          onClose={() => {
+            setEjectError(null);
+            setEjecting(null);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
 function ApplianceStorageSection({ row }: { row: ApplianceRow }) {
   const qc = useQueryClient();
   const [pending, setPending] = useState<{
@@ -3498,6 +3894,9 @@ const HOSTCFG_PLANE_LABELS: Record<string, string> = {
   resolver: "DNS resolver",
   firewall: "Firewall",
   timezone: "Timezone",
+  removable: "Removable disks",
+  apt: "APT",
+  console_mode: "Console mode",
 };
 
 function ApplianceHostConfigHealthSection({ row }: { row: ApplianceRow }) {

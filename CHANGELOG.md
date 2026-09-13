@@ -24,6 +24,182 @@ the formatter handles the rest.
 
 ### Added
 
+- **Removable (USB) backup disks on the appliance (#989 item 3).**
+  The last piece of #989, closing it. Items 1, 2 and 4 (write-only +
+  S3 Object Lock, the `https_put` kind, and `ETag` / `If-None-Match` on
+  the pull routes) landed earlier in this same cycle, under #1024.
+  The single-appliance operator with no NAS and no cloud account backs
+  up to a USB disk, and there was no supported way to: `local_volume`
+  writes to a path *inside* the api and worker pods, and nothing
+  managed a host mount. #971 avoided the
+  same problem for NFS by speaking the protocol in userspace — a block
+  device has no userspace escape hatch, so this is the host mount
+  plane. Fleet → the appliance → **Removable storage**; 3 REST routes;
+  1 MCP tool (`find_appliance_removable`, read-only, default on).
+  Migration `e3b9d7412c5a`.
+  **The failure this must never produce is a backup that reports
+  success.** `local_volume`'s write does `mkdir -p` first, so a path
+  whose disk is absent is *created* and written to — on the appliance's
+  own `/var`, with the run green, retention pruning happily, and the
+  operator believing they have backups. That is strictly worse than a
+  destination that never worked, because it displaced the worry. Three
+  independent things stop it, in descending order of how much they can
+  be trusted: the per-disk mountpoint is `0500` root-owned whenever
+  nothing is mounted on it (the kernel refusing, which holds even if
+  everything above it is wrong); every read and write under the
+  removable root refuses unless the path is still on a live mountpoint
+  (one test, four causes — ejected, yanked, mount unit failed, wrong
+  node); and the destination records which node the disk is on so the
+  error names it.
+  **`mountPropagation: HostToContainer` is the contract, not a chart
+  detail.** A hostPath volume defaults to *private* propagation, under
+  which a mount the host makes after the pod started is invisible
+  inside it — so without this the pod writes to the empty underlying
+  directory and reports success, which is the same silent failure by
+  another route. Measured against a real kernel in both modes rather
+  than assumed; `os.path.ismount` was checked the same way, and does
+  correctly flip back to "plain directory" after an unmount.
+  **Two deviations from the issue, both because the premise did not
+  survive contact.** It asked for a `.automount` "so a disk pulled
+  without ejecting does not hang boot" — but what delivers that is the
+  unit being `WantedBy` its `dev-disk-by-uuid-….device` rather than
+  `local-fs.target`, so udev mounts the disk when it appears and boot
+  waits for nothing. autofs adds nothing there and subtracts: a process
+  touching an autofs mountpoint whose device is absent blocks in the
+  kernel, and the processes touching this path are the api and the
+  Celery worker. `BindsTo=` the device gives the rest — a yanked disk
+  is torn down rather than left as a stale mountpoint. And the issue
+  wanted a multi-node run to "fail with `disk is on node X`", which
+  ships — but the honest framing is that on an N-node control plane a
+  run lands on the right node about 1 time in N, since api and worker
+  each run one replica per node. The refusal is the deliverable;
+  routing is a tracked follow-up, and the docs say to prefer `nfs` /
+  `s3` / `smb` on a cluster.
+  **ext4 and exFAT only, and the refusals each have a reason worth
+  stating.** FAT32 caps one file at 4 GiB, so an archive that outgrows
+  it fails at the *end* of a long run on a destination that had worked
+  for months — better refused up front. A filesystem with no UUID has
+  nothing stable for `What=`, since the kernel device name is
+  reassigned on the next plug. And the appliance's **own** partitions
+  are refused by reserved PARTLABEL / filesystem label: a box that
+  boots from USB reports its root, ESP and STATE as removable
+  candidates with perfectly good filesystems on them, and offering the
+  running root as a backup destination is the worst thing this could
+  do. Unusable disks are listed *with the reason* rather than hidden —
+  a disk that simply does not appear is indistinguishable from one not
+  noticed yet (#1026's picker rule).
+  **ext4 rejects `uid=` at mount time** (measured: `ext4: Unknown
+  parameter 'uid'`), so archives go in `<mount>/spatiumddi` — chowning
+  the root of a disk that may hold the operator's other data is ruder
+  than creating one directory on it. A separate
+  `spatiumddi-removable-prepare.service`, pulled in by each `.mount`
+  unit, does that after the mount *however it happened* — including a
+  disk plugged in hours later and mounted by udev with no operator
+  action, which the apply path never sees.
+  **One bug found by the tests, of the class this repo keeps finding.**
+  The teardown loop matched its own units with a shell glob built from
+  the escaped mount root — and `systemd-escape` emits `\x2d` for a
+  literal dash, where in a glob `\x` is an *escaped x*. So the moment
+  the root path contained a dash the pattern stopped matching the very
+  filenames it was derived from, silently, and eject became a no-op
+  that still reported success. It now matches with `case` against a
+  quoted prefix, which has no escaping semantics at all. The prefix is
+  also derived from the root rather than written out as a literal, so
+  the two cannot drift.
+  Also: the worker gained `NODE_NAME` (the api has had it since #983),
+  without which a *scheduled* run could not say which node the disk was
+  on — only that nothing was mounted. The destination's node is
+  **derived from the fleet**, not typed: exactly one appliance has a
+  given mount name and it reports its own node name, so asking the
+  operator to paste a Kubernetes node into a generic text box would
+  have left the defence unarmed on every default install.
+  **/code-review found fourteen more, and the cluster is worth
+  recording because they share one root: three namespaces that look
+  alike.** Host paths, container paths and desired-vs-reported state
+  were each conflated somewhere.
+  *The worst was silent and catastrophic.* `_RESERVED_LABELS` was
+  hand-retyped from the installer and **omitted `var`** — the partition
+  holding PostgreSQL, the container images and `/var/lib/spatiumddi`
+  itself. On a USB-booted appliance it passed every check and was
+  offered in the picker; mounting it binds the same superblock twice,
+  so archives land on the appliance's own `/var` while `ismount`
+  passes, the `0500` guard passes and the run reports success — all
+  three advertised defences green. It now has `var`, has lost the
+  invented `boot` (no partition carries that label), and is backstopped
+  by a booted-disk check that needs no list at all. The refusals were
+  also **reordered**: ownership before filesystem, because the ESP is
+  `vfat` and asking the fstype question first told the operator to
+  reformat the partition their box boots from.
+  *The second was structural.* `_host_mounted_sources` parses
+  `/proc/1/mountinfo`, which under `hostPID: true` renders paths against
+  HOST init's root — and it was compared against the CONTAINER-side
+  `/host-removable`. That can never match, so every disk this feature
+  successfully mounted reported `usable: false, "already mounted at …"`
+  and could not be re-mounted. Two named constants now, and a test
+  built at the production shape: the one it replaced derived both sides
+  from a single fixture value, i.e. modelled the one world where the
+  two namespaces coincide, and was structurally incapable of failing.
+  *The empty set was overloaded three ways.* It hashed to `""` — which
+  is also what a MISSING applied sidecar reads as, so an eject after a
+  failed apply fired nothing at all; and `_write_fire_state` emits
+  `f"{hash}\t{attempts}\t{iso}"` while `_read_fire_state` `.strip()`s
+  the leading tab back off, so an empty hash round-trips as
+  `hash="1"` — pinning the #387 backoff at one attempt (re-firing every
+  tick forever) and making a *successful* eject report `retrying` for
+  the rest of the node's life. It hashes `[]` for real now; `enabled:
+  false` carries the disable semantics. And the validation fallback no
+  longer ships an empty list at all: on this plane empty means *tear
+  everything down*, so a row that stopped validating would have
+  silently unmounted every backup disk on the node. It ships
+  `mounts: null` — "no instruction" — and the supervisor does nothing.
+  *The runner reported success on four different no-ops.* A failed
+  `systemctl disable --now` (EBUSY — a backup holding the mount open)
+  was discarded, the unit deleted anyway and the eject reported
+  applied, leaving the disk mounted with nothing managing it and
+  invisible on every surface; `install` and `systemctl enable` failures
+  were unchecked, so a full or read-only `/etc` overlay produced an
+  apply that armed nothing and stamped the hash; and the `python3`
+  substitution's exit status was unchecked, so an OOM-killed
+  interpreter produced an empty desired set, i.e. the teardown command.
+  The teardown also keyed on "not VERIFIED" rather than "not DESIRED",
+  so an entry this runner's allowlist dropped had its LIVE unit
+  unmounted and its mountpoint removed — while the drop path left the
+  exit status at 0. Teardown is now skipped entirely unless the desired
+  set was understood completely, and a drop fails the apply.
+  *Three more.* `nofail` was missing, so systemd's implicit
+  `Before=local-fs.target` applied and a disk present at boot ordered
+  k3s behind its own mount. Nothing daemon-reloaded after `etc.mount`,
+  so a disk left plugged in across a reboot could have its unit and its
+  symlink both on disk and neither loaded — a new
+  `spatiumddi-removable-boot.service` closes that. And `flock -n`
+  abandoned a deferred run, which with an edge-triggered `.path` and a
+  no-stacking trigger guard wedged the plane permanently.
+  *Honesty fixes.* `supported` and `present` were both computed,
+  shipped and read by nobody — the "written, never read" class — and
+  they are the two fields that separate "your disk is unplugged" from
+  "this node cannot look" and from "the disk is in the port and the
+  mount failed". Both are surfaced now, as `blind` and `present`
+  states. The runner's failure *reason* sidecar was written and
+  discarded (the #882 deferred item, in a new plane); it is read and
+  rendered. `str(None)` is `"None"` and truthy, so a block missing
+  `node_name` rendered "Disks here are on node None" — `_s()` now,
+  which already existed. And the eject mutation had no `onError`, so a
+  503 under maintenance mode left the modal sitting there after
+  promising the disk was safe to pull.
+  *Plus:* an unlocked read-modify-**append** on the desired list (the
+  file's first, where a lost update loses an action rather than
+  overwriting one) now takes `FOR UPDATE`; `local_volume.write`
+  translates `OSError` so a full USB stick records a failure instead of
+  wedging the target at `in_progress` forever; `_path` moved inside the
+  worker threads, since it now walks mountpoints on a device that may
+  have been yanked and was doing it on the api event loop; and
+  `exfatprogs` reached `NOTICE` + `THIRD_PARTY.md`.
+  **No `propose_*` MCP tool** (explicit decision per non-negotiable
+  #13): mounting names a disk that the operator is physically holding
+  and ejecting takes a live backup destination offline. Both are the
+  broad-blast-radius, physical-world-coupled shape that guidance says
+  to keep off the copilot.
+
 - **Interface MTU (#1017).** The appliance could not set one anywhere:
   not in the installer, not in the preseed schema, not in STATE, not in
   the host-config plane. The only route was `nmtui`, and per #1016 an
@@ -2165,6 +2341,13 @@ the formatter handles the rest.
 
 ### Migrations
 
+- `e3b9d7412c5a` — `appliance.desired_removable_mounts` (JSONB, NOT
+  NULL, `[]`): the removable (USB) disks a node should keep mounted for
+  backups (#989 item 3). No backfill — an install upgrades into the
+  feature with none configured, which is what every existing row means.
+  Per-appliance rather than in `platform_settings`, unlike every other
+  host-config plane, because a USB disk is plugged into exactly one
+  node.
 - `a9f2c71e34b8` — #1069, data-only: on a fresh install, delete the
   pristine `feature_module` seed rows so the catalog's
   `default_enabled` governs. No schema change; existing installs are

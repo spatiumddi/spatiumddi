@@ -1,0 +1,507 @@
+#!/bin/bash
+# spatiumddi-removable-reload — host-side removable (USB) disk mount
+# runner (#989 item 3).
+#
+# WHY A HOST RUNNER. ``local_volume`` writes to a path inside the api /
+# worker pods, so pointing a backup at a USB disk needs that disk
+# mounted on the HOST and exposed to those pods. #971 dodged the same
+# problem for NFS by speaking the protocol in userspace; a block device
+# has no userspace escape hatch, and the api container is unprivileged
+# by design (it holds the Fernet master key), so the mount is made here.
+#
+# TRIGGER  /var/lib/spatiumddi/release-state/removable-config-pending
+#   line 1:   "enabled" | "disabled"   ("disabled" == desired set empty,
+#             which is how an EJECT reaches the host — it is not an
+#             off-switch for the feature)
+#   line 2:   sha256 hex of the body
+#   line 3+:  {"mounts": [{"name","fs_uuid","fstype"}, ...]}
+#
+# Apply flow, per reconcile:
+#   1. Parse + re-validate every field against this runner's own
+#      allowlist (the control plane validates too; neither trusts the
+#      other, and only this side knows what is on the disk right now).
+#   2. Render each .mount into a staging dir.
+#   3. ``systemd-analyze verify`` it — the real validator, not a
+#      syntax guess. It catches a Where= that disagrees with the unit
+#      name and a missing What=, both of which are how a rendered unit
+#      silently mounts nothing.
+#   4. Install, daemon-reload, enable (and start when the disk is here).
+#   5. Tear down every unit we own that is no longer desired.
+#
+# ── Why .mount and NOT .automount ────────────────────────────────────
+#
+# #989 asked for a ``.automount`` "so a disk pulled without ejecting
+# does not hang boot". The premise does not hold: what makes a mount
+# block boot is being a dependency of ``local-fs.target``, and these
+# units are not — they are ``WantedBy`` the DEVICE unit, so udev pulls
+# each one in when its disk appears and nothing waits for a disk that
+# never does. autofs would not add to that, and it subtracts: a process
+# touching an autofs mountpoint whose device is absent blocks in the
+# kernel until the automount times out, and the processes touching this
+# path are the api and the Celery worker. ``BindsTo=`` the device unit
+# gives the other half — a disk yanked without ejecting is torn down by
+# systemd rather than left as a stale mountpoint.
+#
+# ── The mountpoint is mode 0500 root-owned when nothing is mounted ───
+#
+# This is the last line of defence and it is worth the one chmod. The
+# failure this feature must never produce is a backup that reports
+# success while writing to the appliance's own /var because the disk was
+# ejected, yanked, or never mounted — an operator with no backups and a
+# green screen. The api-side driver refuses a path that is not a live
+# mountpoint, but that check is software; 0500 is the kernel, and it
+# holds even if every check above it is wrong.
+
+set -uo pipefail
+
+TRIGGER=/var/lib/spatiumddi/release-state/removable-config-pending
+HASH_SIDECAR=/var/lib/spatiumddi/release-state/removable-config-hash
+STATUS_SIDECAR=/var/lib/spatiumddi/release-state/removable-status
+LOG_DIR=/var/log/spatiumddi
+LOG="$LOG_DIR/removable-reload.log"
+LOCK=/run/spatiumddi-removable-reload.lock
+ROOT=/var/lib/spatiumddi/removable
+UNIT_DIR=/etc/systemd/system
+# Every unit this runner owns lives under ROOT, and a .mount unit's name
+# is derived from its Where= — systemd refuses one where the two
+# disagree (proven: "Where= setting doesn't match unit name. Refusing.").
+# So a glob on the escaped ROOT prefix IS an exact ownership test and
+# needs no ledger beside it.
+#
+# DERIVED from ROOT, never written out as a literal: the two are the
+# same value, and a hardcoded copy that drifts does not fail loudly —
+# the teardown loop simply matches nothing, so eject silently leaves
+# every disk mounted while reporting success.
+#
+# Matched with `case`, NOT as a shell glob, and that is not a style
+# choice. systemd-escape emits `\x2d` for a literal dash, and in a glob
+# `\x` is an ESCAPED x — so the moment ROOT contains a dash the pattern
+# stops matching the very filenames it was derived from, silently, and
+# eject becomes a no-op that still reports success. A quoted variable in
+# a `case` pattern is matched literally, so there are no escaping
+# semantics to get wrong.
+UNIT_PREFIX=""   # set once systemd-escape is known to exist (see below)
+# uid/gid the api + worker containers run as (the image's ``app`` user).
+APP_UID=1000
+APP_GID=1000
+
+mkdir -p "$LOG_DIR" "$(dirname "$HASH_SIDECAR")" "$ROOT" 2>/dev/null || true
+chmod 0755 "$ROOT" 2>/dev/null || true
+
+# ── --prepare: make each mounted disk writable by the app uid ────────
+#
+# Pulled in by every .mount unit (Wants= + Before=), so it runs after a
+# mount however that mount happened — including the case the runner
+# cannot reach: a disk plugged in HOURS after the unit was installed,
+# mounted by udev with no operator action. Doing this only at apply
+# time would leave exactly that disk unwritable, which is the common
+# path, not the edge case.
+#
+# ext4 carries real ownership and cannot take uid= at mount time (proven:
+# "ext4: Unknown parameter 'uid'"), so the subdirectory is chowned.
+# exFAT has no ownership at all — the whole filesystem takes the mount's
+# uid=/gid=/umask=, so it is already correct and a chown would return
+# EPERM. Hence check-then-chown rather than chown-and-ignore-errors: the
+# difference between "already right" and "could not be set" is the
+# difference between a working destination and one that fails on write.
+# ── --boot: re-arm the units after the /etc overlay is up ───────────
+#
+# The units and their ``<device>.device.wants/`` symlinks are written
+# into /etc/systemd/system, which on the appliance is the /var-backed
+# OVERLAY UPPER layer — and ``etc.mount`` is itself a unit, ordered
+# after ``var.mount`` and therefore after udev has coldplugged the
+# block devices. systemd resolves a ``.wants`` directory when the unit
+# is loaded and does not rescan, so a USB disk left plugged in across a
+# reboot can be coldplugged while /etc still has no symlink for it: the
+# unit exists on disk, the symlink exists on disk, and neither is
+# loaded. The plane does not re-fire either, because the hash sidecar
+# survived the reboot and still matches.
+#
+# One ``daemon-reload`` after the overlay is mounted closes that, plus
+# a start for any unit whose disk is actually present. Idempotent and
+# silent on a node with no removable disks.
+if [ "${1:-}" = "--boot" ]; then
+    exec >> "$LOG" 2>&1
+    echo "[$(date -Iseconds)] === removable boot re-arm ==="
+    command -v systemd-escape >/dev/null 2>&1 || exit 0
+    prefix="$(systemd-escape -p "$ROOT")-"
+    shopt -s nullglob
+    units=("$UNIT_DIR/$prefix"*.mount)
+    shopt -u nullglob
+    [ "${#units[@]}" -gt 0 ] || { echo "  no removable units installed"; exit 0; }
+    systemctl daemon-reload || echo "  ! daemon-reload failed"
+    for u in "${units[@]}"; do
+        unit=$(basename "$u")
+        uuid=$(sed -n 's|^What=/dev/disk/by-uuid/||p' "$u" | head -1)
+        [ -n "$uuid" ] || continue
+        if [ -e "/dev/disk/by-uuid/$uuid" ]; then
+            systemctl start "$unit" >/dev/null 2>&1 \
+                && echo "  ✓ re-armed $unit" \
+                || echo "  ! could not start $unit"
+        else
+            echo "  · $unit armed, disk absent"
+        fi
+    done
+    exit 0
+fi
+
+if [ "${1:-}" = "--prepare" ]; then
+    exec >> "$LOG" 2>&1
+    echo "[$(date -Iseconds)] === removable prepare ==="
+    for mp in "$ROOT"/*; do
+        [ -d "$mp" ] || continue
+        mountpoint -q "$mp" || continue
+        sub="$mp/spatiumddi"
+        mkdir -p "$sub" 2>/dev/null || { echo "  ! mkdir failed: $sub"; continue; }
+        owner=$(stat -c '%u:%g' "$sub" 2>/dev/null || echo "")
+        if [ "$owner" != "$APP_UID:$APP_GID" ]; then
+            if chown "$APP_UID:$APP_GID" "$sub" 2>/dev/null; then
+                echo "  ✓ chown $sub → $APP_UID:$APP_GID"
+            else
+                echo "  ! chown refused on $sub (owner=$owner) — the destination will not be writable"
+                continue
+            fi
+        fi
+        chmod 0700 "$sub" 2>/dev/null || true
+        echo "  ✓ ready: $sub"
+    done
+    exit 0
+fi
+
+exec >> "$LOG" 2>&1
+echo
+echo "[$(date -Iseconds)] === spatiumddi-removable-reload fired ==="
+
+if [ ! -f "$TRIGGER" ]; then
+    echo "  no trigger file at $TRIGGER, nothing to do"
+    exit 0
+fi
+
+exec 9>"$LOCK"
+# WAIT, do not abandon. The first draft used ``flock -n`` and exited 0 —
+# but the .path unit is ``PathChanged=`` (edge-triggered, so it does not
+# re-fire on a file that is merely still present) and the supervisor's
+# ``_fire_host_config`` refuses to stack a second trigger while one
+# exists. Together that means one deferred run wedges the plane
+# permanently: the desired state is never applied and never retried,
+# with the health report stuck at "retrying" and no runner ever picking
+# it up. Every apply here is seconds long, so waiting is free.
+if ! flock -w 120 9; then
+    echo "  ! another reload held the lock for 120s — leaving the trigger for the next fire"
+    exit 1
+fi
+
+# Consume the trigger on EVERY exit path, success or failure (#550).
+# A trigger left in place is re-fired by the .path unit on the next
+# write and the apply loops forever with nothing said upward; the
+# fire-state ledger on the supervisor side is what bounds the retry.
+fail() {
+    echo "  ✗ $1"
+    printf 'failed %s\n%s\n' "$(date -Iseconds)" "$1" > "$STATUS_SIDECAR"
+    mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" 2>/dev/null || rm -f "$TRIGGER"
+    exit 1
+}
+
+MARKER=$(sed -n '1p' "$TRIGGER" | tr -d '\r\n')
+HASH=$(sed -n '2p' "$TRIGGER" | tr -d '\r\n')
+BODY=$(mktemp /tmp/spatium-removable.XXXXXX.json)
+STAGE=$(mktemp -d /tmp/spatium-removable-units.XXXXXX)
+trap 'rm -rf "$BODY" "$STAGE"' EXIT
+tail -n +3 "$TRIGGER" > "$BODY"
+
+echo "  marker: $MARKER"
+echo "  hash:   ${HASH:-<empty>}"
+
+case "$MARKER" in
+    enabled|disabled) : ;;
+    *) fail "unknown marker line: ${MARKER:-<empty>}" ;;
+esac
+
+command -v systemd-escape >/dev/null 2>&1 || fail "systemd-escape not found"
+command -v systemd-analyze >/dev/null 2>&1 || fail "systemd-analyze not found"
+
+UNIT_PREFIX="$(systemd-escape -p "$ROOT")-"
+[ "$UNIT_PREFIX" != "-" ] || fail "could not derive the unit-name prefix from $ROOT"
+
+# Parse + validate with python3 (always present on the appliance), never
+# a shell regex: every one of these values is interpolated into a
+# systemd unit body AND a unit FILENAME, so a hand-rolled parser is how
+# one of them grows a second directive. Allowlists, not escaping —
+# anything that does not match is dropped and named, so a malformed
+# entry is visible rather than silently mounted somewhere else.
+# Emits one TAB-separated line per accepted mount.
+DESIRED=$(python3 - "$BODY" <<'PYEOF'
+import json, re, sys
+
+try:
+    with open(sys.argv[1]) as fh:
+        body = json.load(fh)
+except Exception as exc:  # noqa: BLE001
+    print(f"__error__\t{exc}", flush=True)
+    raise SystemExit(0)
+
+mounts = body.get("mounts")
+if not isinstance(mounts, list):
+    print("__error__\t'mounts' is not a list", flush=True)
+    raise SystemExit(0)
+
+# Deliberately narrow, and each for its own reason:
+#   name    becomes a directory under ROOT and the escaped unit filename
+#   fs_uuid becomes What=/dev/disk/by-uuid/<v>; ext4 gives a real UUID,
+#           exFAT the 8-hex FAT volume serial (1234-ABCD)
+#   fstype  decides the mount options, so it is an enum not a pattern
+NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}\Z")
+UUID_RE = re.compile(r"[A-Za-z0-9-]{4,64}\Z")
+FSTYPES = {"ext4", "exfat"}
+
+seen = set()
+for entry in mounts:
+    if not isinstance(entry, dict):
+        print("__drop__\tentry is not an object", flush=True)
+        continue
+    name = str(entry.get("name") or "")
+    uuid = str(entry.get("fs_uuid") or "")
+    fstype = str(entry.get("fstype") or "")
+    if not NAME_RE.match(name):
+        print(f"__drop__\trejected name {name!r}", flush=True)
+        continue
+    if not UUID_RE.match(uuid):
+        print(f"__drop__\trejected fs_uuid {uuid!r} for {name}", flush=True)
+        continue
+    if fstype not in FSTYPES:
+        print(f"__drop__\trejected fstype {fstype!r} for {name}", flush=True)
+        continue
+    if name in seen:
+        # Two entries claiming one mountpoint: the second would
+        # overwrite the first's unit and the operator would see one
+        # disk mounted where they configured two.
+        print(f"__drop__\tduplicate name {name}", flush=True)
+        continue
+    seen.add(name)
+    print(f"{name}\t{uuid}\t{fstype}", flush=True)
+PYEOF
+)
+
+PARSE_RC=$?
+# The exit status of the command substitution above. Unchecked in the
+# first draft, which mattered: a python3 that is missing, OOM-killed or
+# segfaulting produced an EMPTY $DESIRED with no __error__ line — and an
+# empty desired set is this plane's TEAR-DOWN-EVERYTHING instruction. So
+# an interpreter crash unmounted every backup disk on the node and then
+# exited 0, recording success at the new hash so it never retried.
+[ "$PARSE_RC" -eq 0 ] || fail "could not parse the desired mount list (python3 exited $PARSE_RC)"
+if printf '%s\n' "$DESIRED" | grep -q '^__error__'; then
+    fail "$(printf '%s\n' "$DESIRED" | sed -n 's/^__error__\t//p' | head -1)"
+fi
+DROPPED=0
+if printf '%s\n' "$DESIRED" | grep -q '^__drop__'; then
+    printf '%s\n' "$DESIRED" | sed -n 's/^__drop__\t/  ! dropped: /p'
+    DROPPED=1
+fi
+DESIRED=$(printf '%s\n' "$DESIRED" | grep -v '^__drop__' | grep -v '^__error__' | grep -v '^$' || true)
+
+# ── render + verify each desired unit into the staging dir ──────────
+WANT_UNITS=""
+ACCEPTED=""
+RC_ANY_FAIL=0
+while IFS=$'\t' read -r NAME UUID FSTYPE; do
+    [ -n "$NAME" ] || continue
+    MP="$ROOT/$NAME"
+    UNIT=$(systemd-escape -p --suffix=mount "$MP") || fail "could not escape $MP"
+    DEVUNIT=$(systemd-escape -p --suffix=device "/dev/disk/by-uuid/$UUID") \
+        || fail "could not escape the device unit for $UUID"
+    case "$FSTYPE" in
+        exfat)
+            # exFAT has no on-disk ownership; the mount's uid/gid/umask
+            # are the whole of it. 0077 keeps archives unreadable by any
+            # other host user — they are already passphrase-encrypted, so
+            # this is depth rather than the guarantee.
+            OPTS="nofail,noexec,nosuid,nodev,uid=$APP_UID,gid=$APP_GID,umask=0077"
+            ;;
+        *)
+            OPTS="nofail,noexec,nosuid,nodev"
+            ;;
+    esac
+    cat > "$STAGE/$UNIT" <<UNIT_EOF
+# Managed by SpatiumDDI (#989) — edits are overwritten on the next apply.
+[Unit]
+Description=SpatiumDDI removable backup disk ($NAME)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/989
+# BindsTo, not just Requires: a disk yanked without ejecting takes the
+# device unit with it, and BindsTo is what tears the mount down instead
+# of leaving a stale mountpoint that still looks writable.
+BindsTo=$DEVUNIT
+After=$DEVUNIT
+# Fix ownership after the mount, however the mount happened — including
+# a disk plugged in long after this unit was installed.
+Wants=spatiumddi-removable-prepare.service
+Before=spatiumddi-removable-prepare.service
+
+[Mount]
+What=/dev/disk/by-uuid/$UUID
+Where=$MP
+Type=$FSTYPE
+Options=$OPTS
+
+[Install]
+# WantedBy the DEVICE, not local-fs.target: udev pulls the mount in when
+# the disk appears, and boot never waits for a disk that is not there.
+WantedBy=$DEVUNIT
+UNIT_EOF
+    if ! VERIFY=$(systemd-analyze verify "$STAGE/$UNIT" 2>&1); then
+        echo "  ✗ systemd-analyze verify rejected $UNIT:"
+        printf '%s\n' "$VERIFY" | sed 's/^/      /'
+        RC_ANY_FAIL=1
+        rm -f "$STAGE/$UNIT"
+        continue
+    fi
+    echo "  ✓ verified $UNIT ($FSTYPE, by-uuid/$UUID)"
+    WANT_UNITS="$WANT_UNITS $UNIT"
+    # Carried forward rather than re-derived: the install loop used to
+    # re-fork systemd-escape on the same path and then test membership
+    # in the list that derivation had produced, which is the drift the
+    # UNIT_PREFIX header warns about one function up — two escape sites
+    # that must agree, where a divergence silently installs a unit that
+    # is never enabled or started.
+    ACCEPTED="$ACCEPTED$NAME\t$UUID\t$FSTYPE\t$UNIT\n"
+done <<< "$DESIRED"
+
+# ── tear down units we own that are no longer desired ───────────────
+#
+# ONLY when the desired set was understood COMPLETELY. The first draft
+# keyed the teardown on "not in WANT_UNITS", which is "not VERIFIED",
+# not "not DESIRED" — so an entry this runner dropped (its allowlist is
+# a second, independently-written copy of the control plane's) or one
+# that failed `systemd-analyze verify` had its LIVE unit unmounted and
+# its mountpoint removed. On the drop path nothing set RC_ANY_FAIL, so
+# the apply then stamped the hash sidecar and exited 0: the supervisor
+# believed the config applied and never retried, and the UI rendered the
+# vanished disk as `waiting`, i.e. "not plugged in".
+#
+# Skipping the teardown is the safe direction — it is additive-only, so
+# a stale mount survives until the operator fixes the bad entry, which
+# is visible. Destroying a working destination because one unrelated row
+# is malformed is not.
+if [ "$DROPPED" -ne 0 ] || [ "$RC_ANY_FAIL" -ne 0 ]; then
+    echo "  ! skipping teardown: the desired set was not fully understood"
+else
+shopt -s nullglob
+for existing in "$UNIT_DIR"/*.mount; do
+    UNIT=$(basename "$existing")
+    # Ours? A .mount unit's name is derived from its Where=, and systemd
+    # refuses one where the two disagree — so the prefix test is an
+    # exact ownership check and needs no ledger beside it.
+    case "$UNIT" in "$UNIT_PREFIX"*) : ;; *) continue ;; esac
+    case " $WANT_UNITS " in *" $UNIT "*) continue ;; esac
+    echo "  → removing $UNIT"
+    # Flush before unmounting: the operator pressed Eject and expects
+    # the disk to be safe to pull when the UI says it is.
+    MP=$(systemd-escape -pu "${UNIT%.mount}" 2>/dev/null || echo "")
+    if [ -n "$MP" ] && mountpoint -q "$MP"; then
+        sync -f "$MP" 2>/dev/null || sync
+    fi
+    systemctl disable --now "$UNIT" >/dev/null 2>&1 || true
+    # VERIFY the unmount rather than assuming it. `disable --now`
+    # returns EBUSY when anything holds an fd under the mount — a
+    # backup run, a shell — and the first draft discarded that, deleted
+    # the unit anyway and reported the eject as applied. The disk then
+    # stayed mounted with NO unit managing it, invisible on every
+    # surface (merge_state iterates the desired set, which no longer
+    # names it), while the UI had told the operator it was safe to pull
+    # and the backup driver's mountpoint check still passed.
+    if [ -n "$MP" ] && mountpoint -q "$MP"; then
+        echo "  ✗ $MP is still mounted — something is holding it open:"
+        (command -v fuser >/dev/null 2>&1 && fuser -vm "$MP" 2>&1 | sed 's/^/      /' | head -8) || true
+        RC_ANY_FAIL=1
+        # The unit stays in place on purpose: it is what still describes
+        # the live mount, and removing it would orphan the disk.
+        continue
+    fi
+    rm -f "$existing"
+    if [ -n "$MP" ] && [ -d "$MP" ]; then
+        # rmdir, never rm -rf: it refuses a non-empty directory, and a
+        # non-empty one here means the unmount did not happen. Deleting
+        # it anyway would delete whatever is on the disk.
+        rmdir "$MP" 2>/dev/null || echo "  ! $MP is not empty — left in place"
+    fi
+done
+shopt -u nullglob
+fi
+
+# ── install the desired units ───────────────────────────────────────
+for staged in "$STAGE"/*.mount; do
+    [ -e "$staged" ] || continue
+    # CHECKED. The script is `set -uo pipefail` with no `-e`, so the
+    # first draft walked straight past a failed install — and
+    # /etc/systemd/system is the /var-backed overlay upper layer, so
+    # ENOSPC or a read-only upper is a real way to get there. The unit
+    # then does not exist, `enable` fails, the disk never mounts when
+    # plugged in, and every surface reports the config applied.
+    # ``-m 0644`` only, deliberately: this unit runs as root (systemd
+    # oneshot, no ``User=``), so the file is root-owned by construction
+    # and an explicit ``-o root -g root`` adds nothing — while making
+    # the command fail outright for any non-root caller, which is what
+    # the test harness and the CI job are. That was invisible until the
+    # install started being CHECKED; before it, the ownership error was
+    # printed and walked past, which is the bug being fixed here.
+    if ! install -m 0644 "$staged" "$UNIT_DIR/$(basename "$staged")"; then
+        echo "  ✗ could not install $(basename "$staged") into $UNIT_DIR"
+        RC_ANY_FAIL=1
+    fi
+done
+systemctl daemon-reload || fail "systemctl daemon-reload failed"
+
+while IFS=$'\t' read -r NAME UUID FSTYPE UNIT; do
+    [ -n "$NAME" ] || continue
+    MP="$ROOT/$NAME"
+    mkdir -p "$MP" 2>/dev/null || true
+    # 0500 root-owned: invisible while something is mounted here (the
+    # mount's own permissions apply), and the kernel's refusal when
+    # nothing is. Guarded on the mount, because applying it to a LIVE
+    # ext4 mount would persist to the disk and lock the api pod out.
+    if ! mountpoint -q "$MP"; then
+        chown root:root "$MP" 2>/dev/null || true
+        chmod 0500 "$MP" 2>/dev/null || true
+    fi
+    # The `WantedBy=<device>.device` symlink IS the auto-mount
+    # mechanism, so a failed enable means the disk never mounts when
+    # plugged in — a silent no-op that the first draft only echoed.
+    if ! systemctl enable "$UNIT" >/dev/null 2>&1; then
+        echo "  ✗ could not enable $UNIT — the disk will not mount when plugged in"
+        RC_ANY_FAIL=1
+        continue
+    fi
+    if [ -e "/dev/disk/by-uuid/$UUID" ]; then
+        if systemctl start "$UNIT" >/dev/null 2>&1; then
+            echo "  ✓ mounted $MP"
+        else
+            echo "  ✗ could not mount $MP:"
+            systemctl status "$UNIT" --no-pager 2>&1 | sed 's/^/      /' | head -12
+            RC_ANY_FAIL=1
+        fi
+    else
+        # Not an error: the unit is armed and udev will mount the disk
+        # when it is plugged in. Reported as its own state so the Fleet
+        # UI can say "waiting for the disk" rather than "failed".
+        echo "  · /dev/disk/by-uuid/$UUID is not present — armed, waiting for the disk"
+    fi
+done <<< "$(printf '%b' "$ACCEPTED")"
+
+/usr/local/bin/spatiumddi-removable-reload --prepare >/dev/null 2>&1 || true
+
+if [ "$DROPPED" -ne 0 ]; then
+    # Never stamp the hash for a set we only partly understood: doing so
+    # tells the supervisor the config is live and stops it retrying, so
+    # a disk the operator configured stays unmounted forever with every
+    # surface reporting success.
+    fail "one or more desired mounts were rejected by this runner's allowlist"
+fi
+if [ "$RC_ANY_FAIL" -ne 0 ]; then
+    fail "one or more removable mounts could not be applied"
+fi
+
+printf 'applied %s\n' "$(date -Iseconds)" > "$STATUS_SIDECAR"
+printf '%s\n' "$HASH" > "$HASH_SIDECAR"
+rm -f "$TRIGGER"
+echo "  ✓ removable mount plane applied (hash ${HASH:-<empty>})"
+exit 0

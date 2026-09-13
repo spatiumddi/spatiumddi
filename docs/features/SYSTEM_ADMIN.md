@@ -371,7 +371,7 @@ All ten destination kinds register in the same driver registry; the UI's destina
 
 | Kind | Tier | Notes |
 |---|---|---|
-| `local_volume` | 1 | Filesystem path on the api/worker container — production deployments mount this as a docker / k8s volume so archives survive container recycle |
+| `local_volume` | 1 | Filesystem path on the api/worker container — production deployments mount this as a docker / k8s volume so archives survive container recycle. On the appliance this is also how a **removable USB disk** is used, via the mount plane below |
 | `s3` | 1 | AWS S3 + S3-compatible (MinIO, Wasabi, Backblaze B2, Cloudflare R2, DigitalOcean Spaces) via the `endpoint_url` field |
 | `scp` | 1 | SSH password *or* PEM private key auth (`paramiko`); SFTP write/read; per-call connection lifecycle (no pooling) |
 | `azure_blob` | 1 | Azure Storage account via shared-key or full connection string |
@@ -474,6 +474,105 @@ where it is reachable — `s3` (a key without `DeleteObject`) and `https_put`
 (no delete verb at all). The filesystem-shaped kinds are not covered, because a
 destination that grants write but not unlink is not a configuration those
 protocols really produce.
+
+#### Removable (USB) disks on the appliance
+
+The single-appliance operator with no NAS and no cloud account backs up to a USB
+disk. `local_volume` writes to a path *inside* the api and worker pods, so
+pointing one at a block device needs that disk mounted on the **host** and
+exposed to those pods — which is what the removable mount plane does. (NFS
+avoided the same problem by speaking the protocol in userspace; a block device
+has no userspace escape hatch.)
+
+Appliance only. On Docker Compose, mount the disk yourself and point a
+`local_volume` target at the path; on plain Kubernetes, use a PV.
+
+**Setting one up.** Plug the disk in, then go to **Fleet → the appliance →
+Removable storage**:
+
+1. The disk appears under *Detected disks* within about a minute — the listing
+   rides that node's heartbeat, so it is not instant.
+2. Click **Mount…**, give it a short name (`backup-usb`), and confirm.
+3. Create a **Local volume** destination pointing at
+   `/var/lib/spatiumddi/removable/<name>/spatiumddi`. The mount modal shows the
+   exact path to paste.
+
+`ext4` and `exFAT` only. **FAT32 is refused**, and not out of fussiness: it caps
+a single file at 4 GiB, so an estate whose archive outgrows that would fail
+mid-run, at the end of a long backup, on a destination that had worked for
+months. A disk with no filesystem UUID is refused too — there would be nothing
+stable to mount it by, since the kernel device name is reassigned on the next
+plug. Archives are already encrypted with the target passphrase, so LUKS on the
+disk is your choice, not a requirement.
+
+On a multi-node cluster the **Kubernetes node** field on the destination is
+filled in for you from the fleet — the disk is plugged into one machine, and
+that is what lets a run scheduled elsewhere name the node instead of just
+reporting that nothing is mounted.
+
+**Disks that cannot be used are listed with the reason rather than hidden.** A
+disk that simply does not appear reads as a broken feature, and you cannot tell
+that from "SpatiumDDI has not noticed it yet". The appliance's own root, ESP and
+STATE partitions are always refused — an appliance that *boots* from USB reports
+every one of them as a removable candidate with a perfectly good filesystem on
+it, and offering the running root as a backup destination is the worst thing
+this feature could do.
+
+**Ejecting.** The **Eject** button flushes and unmounts. It deliberately does
+*not* refuse while a backup destination still points at the mount — you want
+your disk back, and refusing would leave you pulling it anyway with the
+filesystem un-flushed. A run against an ejected disk then fails loudly (see
+below). Pulling the disk *without* ejecting is also handled: the mount unit is
+bound to the device, so systemd tears the mount down and the path stops being a
+mountpoint.
+
+**Wait for the row to disappear before you pull it.** If anything is holding a
+file open under the mount — a backup run, a shell you left there — the unmount
+is refused, and the appliance says so rather than removing the unit and
+reporting success. The mount stays listed, the apply is reported as failed with
+the reason, and the disk is *not* safe to pull yet.
+
+A mount that reads **`present`** rather than `waiting` is the one to look at:
+`waiting` means the disk is not plugged in (normal for a disk you rotate
+off-site), while `present` means it IS plugged in and did not mount — a dirty
+filesystem after a yank, a reformat, or a changed UUID.
+
+**A destination on a removable disk fails closed, and that is the whole point.**
+`local_volume`'s write does `mkdir -p` before it writes, so a path whose disk is
+absent would otherwise be *created* and written to — on the appliance's own
+`/var`, with the run reporting success, retention pruning happily, and you
+believing you had backups. Three independent things stop that:
+
+* The per-disk mountpoint is `0500` root-owned whenever nothing is mounted on
+  it. That is the kernel refusing the write, and it holds even if everything
+  above it is wrong.
+* Every read and write through a `local_volume` path under
+  `/var/lib/spatiumddi/removable` refuses unless the path is still on a live
+  mount. One test, four causes: ejected, yanked, the mount unit failed, or the
+  run landed on the wrong node.
+* The destination records which node the disk is on, so the error names it.
+
+**Multi-node clusters: node-local, and scheduling is not routed.** A USB disk is
+plugged into one node. On a multi-node control plane the api and worker each run
+one replica per node, so a manual **Run now** lands on the right node roughly
+one time in N, and a scheduled run likewise — the ones that land elsewhere fail
+with `this run is on node X and the removable disk is plugged into node Y`
+rather than writing to the wrong host. Routing a run to a particular node is not
+implemented; on a cluster, prefer a destination every node can reach (`nfs`,
+`s3`, `smb`) and keep USB for the single-appliance case it was built for.
+
+**How it works underneath**, for anyone reading `journalctl`: the desired mount
+set lives on the appliance row, rides the supervisor heartbeat like every other
+host-config plane, and is applied by `spatiumddi-removable-reload`, which
+renders one systemd `.mount` unit per disk and validates it with
+`systemd-analyze verify` before installing it. Each unit is `WantedBy` its
+`dev-disk-by-uuid-….device` unit rather than `local-fs.target`, so udev mounts
+the disk when it appears and boot never waits for one that is absent. There is
+deliberately **no `.automount`**: `nofail`-style non-blocking comes from the
+device dependency, while autofs would add a way for a process touching the path
+to block in the kernel — and the processes touching this path are the api and
+the Celery worker. See [`APPLIANCE.md`](../deployment/APPLIANCE.md) for the host
+plane itself.
 
 #### Pull mode — let a backup tool fetch, rather than pushing
 

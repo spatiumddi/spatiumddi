@@ -92,19 +92,8 @@ def host_network_interfaces() -> list[str]:
         # char, ``+…`` subsystem tags are irrelevant here).
         if not (entry.name.startswith("n") and entry.name[1:].isdigit()):
             continue
-        try:
-            text = entry.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        name_exact: str | None = None
-        name_path: str | None = None
-        for line in text.splitlines():
-            line = line.strip()
-            if line.startswith("E:ID_NET_NAME="):
-                name_exact = line.split("=", 1)[1].strip()
-            elif line.startswith("E:ID_NET_NAME_PATH="):
-                name_path = line.split("=", 1)[1].strip()
-        name = name_exact or name_path
+        props, _links = _udev_properties(entry)
+        name = props.get("ID_NET_NAME") or props.get("ID_NET_NAME_PATH")
         if name and not _IFACE_SKIP_RE.match(name):
             names.add(name)
     return sorted(names)
@@ -283,20 +272,14 @@ def _current_slot_from_cmdline() -> str | None:
         # udev data files for block devices are named ``b<major>:<minor>``.
         # Other entries (``+acpi:…`` for ACPI tags, ``c…`` for char devs,
         # ``n…`` for net devs) aren't relevant here.
-        if not entry.name.startswith("b"):
-            continue
-        try:
-            text = entry.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        if not (entry.name.startswith("b") and ":" in entry.name):
             continue
         # ``S:`` lines are symlinks udev creates under /dev/disk/. We
         # pull PARTLABEL + UUID from the matching subdirectory prefix.
+        _props, links = _udev_properties(entry)
         partlabel: str | None = None
         matches_uuid = False
-        for line in text.splitlines():
-            if not line.startswith("S:"):
-                continue
-            value = line[2:].strip()
+        for value in links:
             if value.startswith("disk/by-partlabel/"):
                 # Last segment is the PARTLABEL (preserving GPT case
                 # would matter for downstream consumers, but we only
@@ -528,6 +511,29 @@ _SET_DEFAULT_TRIGGER_FILE = Path(
 _SNMP_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/snmp-config-pending")
 _SNMP_HASH_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/snmp-config-hash")
 _SNMP_STATUS_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/snmp-status")
+# #989 item 3 — removable (USB) disk mounts. Same shape as SNMP / NTP,
+# with one difference that decides the payload: every other host-config
+# plane is FLEET-wide (it renders from platform_settings), and this one
+# is PER-APPLIANCE — the disk is plugged into exactly one node. So the
+# desired set lives on the appliance row, not in platform settings, and
+# the trigger's line-3+ payload is the JSON mount list the runner
+# reconciles against the units already on disk.
+_REMOVABLE_TRIGGER_FILE = Path(
+    "/var/lib/spatiumddi-host/release-state/removable-config-pending"
+)
+_REMOVABLE_HASH_SIDECAR = Path(
+    "/var/lib/spatiumddi-host/release-state/removable-config-hash"
+)
+#: The runner's own verdict + reason for the last apply. Read, not just
+#: written: ``read_host_config_health`` can only say a plane is
+#: unapplied, so without this the operator is told "not applied" and
+#: sent to read journalctl, while the concrete cause ("systemd-analyze
+#: verify rejected …") sits on disk and is discarded. That is exactly
+#: the tz-status / verbose-boot-status gap #882 recorded as deferred;
+#: the SNMP plane already reads its own status sidecar.
+_REMOVABLE_STATUS_SIDECAR = Path(
+    "/var/lib/spatiumddi-host/release-state/removable-status"
+)
 # Issue #154 — NTP / chrony equivalents. Same shape as SNMP.
 _NTP_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/ntp-config-pending")
 _NTP_HASH_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/ntp-config-hash")
@@ -1002,6 +1008,10 @@ _HOST_CONFIG_PLANES: list[tuple[str, Path, Path]] = [
     # #882 audit — was absent, so a console-mode apply that kept failing
     # was invisible on the heartbeat while re-firing every tick.
     ("console_mode", _VERBOSE_TRIGGER_FILE, _VERBOSE_APPLIED_FILE),
+    # #989 item 3 — registered from the start. A removable mount that
+    # keeps failing to apply is exactly the case where the operator sees
+    # a configured disk in the UI and a backup that never lands.
+    ("removable", _REMOVABLE_TRIGGER_FILE, _REMOVABLE_HASH_SIDECAR),
 ]
 
 
@@ -1577,6 +1587,53 @@ def maybe_fire_snmp_reload(bundle_block: object) -> bool:
     # heartbeat (which flooded thousands of .failed sidecars).
     return _fire_host_config(
         _SNMP_TRIGGER_FILE, _SNMP_HASH_SIDECAR, config_hash, payload
+    )
+
+
+def maybe_fire_removable_reload(bundle_block: object) -> bool:
+    """#989 item 3 — write the removable-mount trigger when the control
+    plane's desired set differs from the last one this node applied.
+
+    Strict appliance-only gate, same reasoning as every sibling: the
+    host-side ``spatiumddi-removable-reload`` units do not exist on
+    docker / k8s deploys, so firing there leaves a file in a directory
+    that may not exist and nothing to consume it.
+
+    The payload is the three-section shape the other planes use — a
+    marker line, the hash, then the body — where the body is the JSON
+    mount list. ``enabled`` is ``disabled`` when the desired set is
+    EMPTY, which is not the same as "the feature is off": it is what
+    tells the runner to tear down every unit it owns, and it is how an
+    eject reaches the host at all.
+    """
+    if detect_deployment_kind() != "appliance":
+        return False
+    if not isinstance(bundle_block, dict):
+        return False
+    config_hash = str(bundle_block.get("config_hash") or "")
+    mounts = bundle_block.get("mounts")
+    if not isinstance(mounts, list):
+        # NO INSTRUCTION — not "unmount everything". The control plane
+        # sends a null mount list when the stored desired set could not
+        # be validated, and an empty LIST is this plane's teardown
+        # command, so treating the two alike would have one unparseable
+        # row silently unmount every backup disk on the node.
+        return False
+    if not config_hash:
+        # Also no instruction: an empty hash is what a MISSING applied
+        # sidecar reads as, so acting on it makes an eject a no-op after
+        # a failed apply and corrupts the shared fire-state ledger (see
+        # ``removable_bundle``). A control plane too old to send a real
+        # digest gets nothing rather than something wrong.
+        return False
+    payload = (
+        ("enabled\n" if mounts else "disabled\n")
+        + (config_hash + "\n")
+        + json.dumps({"mounts": mounts})
+        + "\n"
+    )
+    return _fire_host_config(
+        _REMOVABLE_TRIGGER_FILE, _REMOVABLE_HASH_SIDECAR, config_hash, payload
     )
 
 
@@ -3339,6 +3396,440 @@ def read_storage_health() -> dict[str, object]:
     }
 
 
+# ── Issue #989 item 3 — removable (USB) disks ────────────────────────
+#
+# The single-appliance operator with no NAS and no cloud account backs
+# up to a USB disk. ``local_volume`` is a path inside the api / worker
+# pods, so until this existed there was no supported way to point one at
+# a block device: #971 solved the same problem for NFS by speaking the
+# protocol in USERSPACE, and a block device has no userspace escape
+# hatch. So this is the host mount plane.
+#
+# THE READ HALF LISTS EVERY USB FILESYSTEM AND MARKS THE UNUSABLE ONES,
+# rather than filtering them out. A disk that does not appear at all
+# reads as a broken feature — the operator plugged it in and nothing
+# happened — and there is no way to tell that from "SpatiumDDI has not
+# noticed it yet". The #1026 slot-image picker made the same call: a
+# candidate that cannot be used is shown DISABLED with the reason.
+#
+# The reads are the HOST's — /sys is never mount-namespaced and the
+# supervisor DaemonSet is privileged with hostPID, the same window
+# ``_md_arrays()`` and ``_current_slot_from_cmdline()`` already use.
+
+_SYS_DEV_BLOCK = Path("/sys/dev/block")
+
+#: Where the host mount plane puts removable filesystems, as the
+#: SUPERVISOR sees it (a HostToContainer bind of the host's
+#: /var/lib/spatiumddi/removable). Propagation is load-bearing and not a
+#: detail: a hostPath volume defaults to private propagation, under
+#: which a mount the host makes AFTER the pod started is invisible
+#: inside it — the pod sees the empty underlying directory, writes
+#: land on the appliance's own /var, and every surface reports success.
+_REMOVABLE_ROOT = Path("/host-removable")
+
+#: The SAME directory as seen by the host — which is a different string,
+#: and conflating the two is a bug that reads as working code.
+#: ``_host_mounted_sources`` parses /proc/1/mountinfo, and under
+#: ``hostPID: true`` the kernel renders those paths against host init's
+#: root: a disk we mounted ourselves comes back as
+#: ``/var/lib/spatiumddi/removable/usb1``, never ``/host-removable/usb1``.
+#: Comparing a mountinfo path against ``_REMOVABLE_ROOT`` can therefore
+#: NEVER match, which would report every disk this feature successfully
+#: mounted as "already mounted" by somebody else — and refuse to
+#: re-mount it.
+_REMOVABLE_HOST_ROOT = Path("/var/lib/spatiumddi/removable")
+
+#: Filesystems a removable backup disk may carry.
+#:
+#: vfat is deliberately absent, and not for tidiness: FAT32 caps a
+#: single file at 4 GiB, so an estate whose archive grows past that
+#: would fail mid-run, at the END of a long backup, on a destination
+#: that had worked for months. Refusing up front with the reason is a
+#: better answer than a write that returns EFBIG in an hour.
+#:
+#: ntfs is absent because nothing in the image can fsck it and the issue
+#: scoped v1 to ext4 + exFAT; it is reported with that reason rather
+#: than hidden, so an operator who brings an NTFS disk is told what to
+#: reformat it as instead of wondering why it never appeared.
+_SUPPORTED_FSTYPES = frozenset({"ext4", "exfat"})
+
+#: PARTLABELs and filesystem labels the INSTALLER puts on the
+#: appliance's own partitions. An appliance that BOOTS from USB reports
+#: its own root, ESP, STATE and **var** partitions as removable
+#: candidates — every one of them ``ID_BUS=usb`` with a real filesystem —
+#: and offering one of those as a backup destination is the worst
+#: outcome this feature could produce. Matched case-insensitively
+#: against both the GPT name and the filesystem label, because
+#: ``spatium-install`` sets the two independently (``sgdisk -c6:var``
+#: and ``mkfs.ext4 -L var``).
+#:
+#: ``var`` is the one that matters most and was missing from the first
+#: draft: it is ``-n6:0:0``, the whole remaining disk, and it holds
+#: PostgreSQL, the container images and ``/var/lib/spatiumddi`` itself.
+#: Mounting it under the removable root binds the same superblock a
+#: second time, so archives land on the appliance's own /var while
+#: ``ismount`` passes, the 0500 guard passes, and the run reports
+#: success — every advertised defence green.
+#:
+#: ``boot`` was in the first draft and is NOT a label any partition
+#: carries (the BIOS one is ``bios_boot``), so it protected nothing.
+#: Kept in sync by hand with ``spatium-install``'s ``sgdisk -c…`` /
+#: ``mkfs -L…`` calls, and backstopped by the booted-disk check below,
+#: which needs no list at all.
+_RESERVED_LABELS = frozenset({"root_a", "root_b", "state", "var", "esp", "esp2"})
+
+
+def _udev_properties(entry: Path) -> tuple[dict[str, str], list[str]]:
+    """``E:`` properties + ``S:`` symlinks out of one /run/udev/data record."""
+    props: dict[str, str] = {}
+    links: list[str] = []
+    try:
+        text = entry.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return props, links
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("E:"):
+            key, _, value = line[2:].partition("=")
+            if key:
+                props[key] = value
+        elif line.startswith("S:"):
+            links.append(line[2:].strip())
+    return props, links
+
+
+def _host_mounted_sources() -> dict[str, str]:
+    """``{resolved device path: mountpoint}`` for the HOST's own mounts.
+
+    Read from init's mountinfo, which with ``hostPID: true`` is the
+    host's. Best-effort by design and never the only guard: it is the
+    belt to the reserved-label braces, and its job is to give the
+    operator a REASON ("in use at /boot/efi") rather than to be the
+    thing standing between a backup and the running root filesystem.
+    """
+    out: dict[str, str] = {}
+    try:
+        text = Path("/proc/1/mountinfo").read_text(errors="replace")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        # ``… - <fstype> <source> <superopts>`` — the separator is a
+        # lone "-" field, and everything before it is variable-length.
+        _, sep, tail = line.partition(" - ")
+        if not sep:
+            continue
+        fields = line.split(" ")
+        parts = tail.split(" ")
+        if len(parts) < 2 or len(fields) < 5:
+            continue
+        source = parts[1]
+        if not source.startswith("/dev/"):
+            continue
+        try:
+            resolved = str(Path(source).resolve())
+        except OSError:
+            resolved = source
+        # First mount of a device wins; a later bind of the same source
+        # would otherwise overwrite the mountpoint the operator knows.
+        out.setdefault(resolved, fields[4])
+    return out
+
+
+def _booted_disk_kname() -> str | None:
+    """Kernel name of the whole disk this appliance booted from.
+
+    The backstop for ``_RESERVED_LABELS``, and the reason a missing
+    label is survivable: a hand-maintained denylist drifts from
+    ``spatium-install`` (``var`` was missing from the first draft),
+    while "is this on the disk we are running from?" needs no list and
+    covers every partition a future installer adds.
+
+    Resolved from the booted slot's own device, which
+    ``_current_slot_from_cmdline`` already locates by matching
+    /proc/cmdline's ``root=UUID=`` against udev's by-uuid symlinks.
+    ``None`` when it cannot be determined, and the refusal then does not
+    fire — same call the storage runner's bootloader guard makes: a
+    guard that blocks on "I could not tell" is one operators route
+    around.
+    """
+    try:
+        cmdline = _PROC_CMDLINE.read_text()
+    except OSError:
+        return None
+    m = _UUID_RE.search(cmdline)
+    if not m:
+        return None
+    root_uuid = m.group(1).lower()
+    try:
+        entries = list(_UDEV_DATA.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if not (entry.name.startswith("b") and ":" in entry.name):
+            continue
+        _props, links = _udev_properties(entry)
+        if not any(
+            link.startswith("disk/by-uuid/") and link.rsplit("/", 1)[-1].lower() == root_uuid
+            for link in links
+        ):
+            continue
+        kname = _kname_for(entry)
+        if not kname:
+            return None
+        # The PARENT whole disk, so sibling partitions are covered too.
+        try:
+            return Path("/sys/class/block").joinpath(kname, "..").resolve().name
+        except OSError:
+            return None
+    return None
+
+
+def _kname_for(entry: Path) -> str:
+    """Kernel name for a ``b<major>:<minor>`` udev record, or ``""``."""
+    try:
+        return _SYS_DEV_BLOCK.joinpath(entry.name[1:]).resolve().name
+    except OSError:
+        return ""
+
+
+def _removable_candidate(
+    entry: Path,
+    mounted: dict[str, str],
+    host_root: Path,
+    booted_disk: str | None = None,
+) -> dict[str, object] | None:
+    """One USB filesystem, or None when this udev record is not one.
+
+    ``host_root`` is the removable root **as the host sees it**, because
+    ``mounted`` comes from host init's mountinfo — see
+    ``_REMOVABLE_HOST_ROOT``.
+    """
+    props, links = _udev_properties(entry)
+    if props.get("ID_BUS") != "usb" and not props.get("ID_USB_DRIVER"):
+        return None
+    fstype = props.get("ID_FS_TYPE") or ""
+    if not fstype:
+        # A partition-table parent (``ID_PART_TABLE_TYPE``) or a blank
+        # disk. Nothing to mount, and SpatiumDDI does not format disks.
+        return None
+
+    kname = _kname_for(entry)
+    dev_path = f"/dev/{kname}" if kname else ""
+
+    by_id = next((s for s in links if s.startswith("disk/by-id/")), "")
+    fs_uuid = props.get("ID_FS_UUID") or ""
+    label = props.get("ID_FS_LABEL") or ""
+    partlabel = props.get("ID_PART_ENTRY_NAME") or ""
+
+    size_bytes: int | None = None
+    holders: list[str] = []
+    parent_disk = ""
+    if kname:
+        sectors = _read_sysfs_int(Path("/sys/class/block") / kname / "size")
+        if sectors is not None:
+            # sysfs reports 512-byte sectors regardless of the device's
+            # own logical block size.
+            size_bytes = sectors * 512
+        try:
+            holders = sorted(
+                p.name for p in (Path("/sys/class/block") / kname / "holders").iterdir()
+            )
+        except OSError:
+            holders = []
+        try:
+            parent_disk = Path("/sys/class/block").joinpath(kname, "..").resolve().name
+        except OSError:
+            parent_disk = ""
+
+    mount_point = mounted.get(dev_path) if dev_path else None
+    mounted_here = bool(
+        mount_point
+        and (Path(mount_point) == host_root or host_root in Path(mount_point).parents)
+    )
+
+    # ── the refusals, in the order the operator needs to read them ──
+    #
+    # Ownership FIRST, filesystem second. The ESP is vfat with PARTLABEL
+    # ``esp``; asking the fstype question first tells the operator of a
+    # USB-booted appliance to "reformat as exfat, ext4" — an instruction
+    # to reformat the partition the box boots from, rendered beside a
+    # Mount button. Which partition this is matters more than what is on
+    # it.
+    reason: str | None = None
+    if booted_disk and parent_disk and parent_disk == booted_disk:
+        reason = "this disk is the one the appliance booted from"
+    elif label.lower() in _RESERVED_LABELS or partlabel.lower() in _RESERVED_LABELS:
+        reason = "this is one of the appliance's own partitions"
+    elif holders:
+        reason = f"in use by {', '.join(holders)}"
+    elif mount_point and not mounted_here:
+        reason = f"already mounted at {mount_point}"
+    elif not fs_uuid:
+        # Without one there is nothing stable to write into What=; a
+        # kernel name is reassigned on the next plug.
+        reason = f"{fstype} filesystem has no UUID — nothing stable to mount it by"
+    elif fstype not in _SUPPORTED_FSTYPES:
+        supported = ", ".join(sorted(_SUPPORTED_FSTYPES))
+        extra = (
+            " FAT32 caps one file at 4 GiB, which a backup archive can exceed."
+            if fstype in ("vfat", "msdos")
+            else ""
+        )
+        reason = f"{fstype} is not supported — reformat as {supported}.{extra}"
+
+    return {
+        "device": dev_path,
+        "by_id": f"/dev/{by_id}" if by_id else "",
+        "fs_uuid": fs_uuid,
+        "fstype": fstype,
+        "label": label,
+        "model": (props.get("ID_MODEL") or "").replace("_", " ").strip(),
+        "vendor": (props.get("ID_VENDOR") or "").replace("_", " ").strip(),
+        "serial": props.get("ID_SERIAL_SHORT") or "",
+        "size_bytes": size_bytes,
+        "mounted_at": mount_point if mounted_here else None,
+        "usable": reason is None,
+        "reason": reason,
+    }
+
+
+def read_removable_apply_status() -> dict[str, str] | None:
+    """The host runner's last verdict, or None when it never ran.
+
+    Shape: ``{"state": "applied"|"failed", "at": "<iso>", "error": "…"}``
+    — line 1 is ``<state> <iso>``, line 2 the reason (failures only).
+    """
+    try:
+        text = _REMOVABLE_STATUS_SIDECAR.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    lines = text.splitlines()
+    if not lines or not lines[0].strip():
+        return None
+    head = lines[0].split(None, 1)
+    out = {"state": head[0]}
+    if len(head) > 1:
+        out["at"] = head[1].strip()
+    if len(lines) > 1 and lines[1].strip():
+        out["error"] = lines[1].strip()[:500]
+    return out
+
+
+def read_removable_disks(host_root: Path | None = None) -> list[dict[str, object]]:
+    """Every USB filesystem this node can see (#989 item 3).
+
+    ``host_root`` is the removable root **as the HOST sees it**, not as
+    this container does — the mountinfo paths it is compared against
+    come from host init. See ``_REMOVABLE_HOST_ROOT``.
+    """
+    root = host_root or _REMOVABLE_HOST_ROOT
+    mounted = _host_mounted_sources()
+    booted = _booted_disk_kname()
+    out: list[dict[str, object]] = []
+    try:
+        entries = sorted(_UDEV_DATA.iterdir())
+    except OSError:
+        return out
+    for entry in entries:
+        # Block records are ``b<major>:<minor>``; ``n…`` are net devices
+        # and ``+…`` subsystem tags.
+        if not (entry.name.startswith("b") and ":" in entry.name):
+            continue
+        try:
+            row = _removable_candidate(entry, mounted, root, booted)
+        except OSError:
+            continue
+        if row is not None:
+            out.append(row)
+    out.sort(key=lambda r: (str(r.get("by_id") or ""), str(r.get("device") or "")))
+    return out
+
+
+def read_removable_mounts(removable_root: Path | None = None) -> list[dict[str, object]]:
+    """Live state of each configured removable mount (#989 item 3).
+
+    ``mounted`` is decided by comparing st_dev with the parent's, which
+    is what ``os.path.ismount`` does and the same test the backup
+    driver applies from inside the api / worker pods — so the Fleet UI
+    and the destination cannot disagree about whether the disk is there.
+    """
+    root = removable_root or _REMOVABLE_ROOT
+    out: list[dict[str, object]] = []
+    try:
+        entries = sorted(p for p in root.iterdir() if p.is_dir())
+    except OSError:
+        return out
+    for entry in entries:
+        mounted = False
+        try:
+            mounted = os.path.ismount(entry)
+        except OSError:
+            mounted = False
+        # Deliberately NO ``path`` key. The first draft carried one — the
+        # mountpoint — while the control plane's ``merge_state`` computes
+        # its own ``path`` meaning the ARCHIVE directory inside it. One
+        # key, two meanings, and nothing read this one: the "written,
+        # never read" class, with a name collision on top.
+        row: dict[str, object] = {"name": entry.name, "mounted": mounted}
+        if mounted:
+            try:
+                st = os.statvfs(entry)
+                row["total_bytes"] = st.f_blocks * st.f_frsize
+                row["free_bytes"] = st.f_bavail * st.f_frsize
+            except OSError:
+                # Mounted but unstattable — a disk yanked between the
+                # ismount and the statvfs. Reported WITHOUT sizes rather
+                # than as unmounted: "mounted, size unknown" is the
+                # honest reading and the next heartbeat settles it.
+                pass
+        out.append(row)
+    return out
+
+
+def read_removable_state(
+    removable_root: Path | None = None, host_root: Path | None = None
+) -> dict[str, object]:
+    """The removable-disk block carried inside ``cluster_health``.
+
+    ``supported`` says whether this node can answer at all, which is
+    NOT the same as "no disks are plugged in" — without it the Fleet UI
+    cannot tell a node with no USB disk from one whose supervisor is too
+    old to look, and would render both as an empty, healthy-looking list.
+    """
+    root = removable_root or _REMOVABLE_ROOT
+    return {
+        # False = this node cannot look (the /host-removable bind is
+        # missing, or its propagation was lost). NOT the same as "no
+        # disks": /run/udev is a separate mount, so the disk list can be
+        # full while every configured mount reads as absent. Consumed by
+        # the control plane, which renders it as its own state.
+        "supported": root.exists(),
+        # The KUBERNETES node name, which is what a backup target has to
+        # record: a removable destination is node-local, and the api /
+        # worker pod that runs a backup compares this against its own
+        # downward-API NODE_NAME to tell the operator where the disk is.
+        # Reported here rather than as a column because it is only ever
+        # needed in the context of "which node is this disk plugged
+        # into" — and the hostname, which the row already carries, is
+        # only USUALLY the node name (k3s defaults it, an operator can
+        # override it), and "usually" is not good enough for the field
+        # that decides whether a backup lands.
+        "node_name": os.environ.get("NODE_NAME")
+        or os.environ.get("APPLIANCE_HOSTNAME")
+        or "",
+        # TWO roots, and they are not interchangeable. The disk scan
+        # compares against mountinfo paths, which are the HOST's; the
+        # mount-state read stats paths in THIS container. Passing one
+        # where the other belongs is silent: every disk we mounted would
+        # report "already mounted" by somebody else.
+        "disks": read_removable_disks(host_root or _REMOVABLE_HOST_ROOT),
+        "mounts": read_removable_mounts(root),
+        # The runner's own reason for a failed apply — see
+        # ``_REMOVABLE_STATUS_SIDECAR``. Omitted when it never ran.
+        "apply_status": read_removable_apply_status(),
+    }
+
+
 def read_node_ip() -> str | None:
     """Return this node's k3s-registered InternalIP (#272 Phase 7b).
 
@@ -3612,7 +4103,16 @@ def collect() -> dict[str, object]:
         # Built in ONE literal with the storage block rather than two
         # adjacent shallow rebuilds of a dict that already carries the
         # node/pod counts and the #402 partition list.
-        _extra: dict[str, object] = {"storage": read_storage_health()}
+        # #989 item 3 — removable (USB) disks + the state of each
+        # configured mount, folded into the same dict for the same
+        # reason. Shipped unconditionally like the storage block: an
+        # empty reading is what CLEARS a disk off every surface after
+        # the operator unplugs it, and ``supported`` distinguishes
+        # "nothing plugged in" from "this node cannot look".
+        _extra: dict[str, object] = {
+            "storage": read_storage_health(),
+            "removable": read_removable_state(),
+        }
         _network = read_network_state()
         if _network is not None:
             _extra["network"] = _network

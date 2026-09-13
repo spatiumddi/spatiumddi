@@ -917,6 +917,11 @@ def heartbeat_once(
     # Issue #155 — APT sources / proxy / GPG-key config-reload trigger.
     if appliance_state.maybe_fire_apt_reload(body_out.get("apt_settings")):
         log.info("supervisor.heartbeat.apt_trigger_fired")
+    # #989 item 3 — removable (USB) disk mount plane. Unlike its
+    # siblings this block is PER-APPLIANCE, so it is rendered from the
+    # appliance row rather than from platform settings.
+    if appliance_state.maybe_fire_removable_reload(body_out.get("removable_settings")):
+        log.info("supervisor.heartbeat.removable_trigger_fired")
 
     # #272 Phase 7b — control-plane promote/demote. The host-side runner
     # (spatium-cluster-join) reconfigures k3s + reports back via the

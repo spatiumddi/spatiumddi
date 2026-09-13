@@ -694,6 +694,30 @@ class Appliance(Base):
         server_default=sa.text("'{}'::jsonb"),
     )
 
+    # #989 item 3 — removable (USB) disks this node should keep mounted
+    # for backups. Shape: ``[{"name": "usb1", "fs_uuid": "1234-ABCD",
+    # "fstype": "exfat", "label": "BACKUP", "added_at": "<iso>"}, ...]``;
+    # ``[]`` means nothing is mounted, which is also how an EJECT is
+    # expressed.
+    #
+    # PER-APPLIANCE, unlike every other host-config plane, and that is
+    # not an inconsistency: snmp / ntp / ssh / apt render from
+    # ``platform_settings`` because they describe the fleet, and a USB
+    # disk is plugged into exactly one node. A fleet-wide list would ask
+    # every other node to mount a disk it cannot see.
+    #
+    # The DESIRED set only. What is actually mounted is reported back
+    # inside ``cluster_health["removable"]`` (#402 pattern — stored
+    # verbatim, no schema for it), because those two disagreeing is the
+    # normal case whenever a disk is unplugged, and a single column
+    # could not say so.
+    desired_removable_mounts: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+        server_default=sa.text("'[]'::jsonb"),
+    )
+
     # #593 — the supervisor refused a firewall drop-in that would have closed
     # etcd's peer port on this node while k3s still considers it an etcd member
     # (a stale/diverged appliance row). Shape:

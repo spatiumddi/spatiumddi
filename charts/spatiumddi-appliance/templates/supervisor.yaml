@@ -148,6 +148,17 @@ spec:
             - name: host-root
               mountPath: /host-root
               readOnly: true
+            # #989 item 3 — removable (USB) backup disks, read-only:
+            # the heartbeat reports which of them are actually mounted
+            # and how much room is left. HostToContainer for the same
+            # reason the api and worker use it — under the default
+            # private propagation a disk mounted after this pod started
+            # is invisible, so every disk would report "waiting" forever
+            # while the backups were landing perfectly well.
+            - name: removable
+              mountPath: /host-removable
+              mountPropagation: HostToContainer
+              readOnly: true
       volumes:
         - name: etc-spatiumddi-host
           hostPath:
@@ -199,4 +210,9 @@ spec:
           hostPath:
             path: /
             type: Directory
+        # #989 item 3 — see the volumeMount comment.
+        - name: removable
+          hostPath:
+            path: /var/lib/spatiumddi/removable
+            type: DirectoryOrCreate
 {{- end }}

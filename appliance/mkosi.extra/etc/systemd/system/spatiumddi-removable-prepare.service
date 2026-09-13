@@ -1,0 +1,18 @@
+[Unit]
+Description=Prepare SpatiumDDI removable backup disks for the control plane (issue #989)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/989
+# Pulled in by each removable .mount unit (Wants= + Before=), so it runs
+# AFTER the mount however that mount happened — including a disk plugged
+# in long after the unit was installed, which the apply path never sees.
+#
+# ext4 carries real ownership and rejects uid= at mount time, so the
+# backup subdirectory has to be chowned to the api/worker uid once the
+# filesystem is there. exFAT takes its ownership from the mount options
+# and is already correct; the runner checks before it chowns so the two
+# do not need different units.
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spatiumddi-removable-reload --prepare
+RemainAfterExit=no

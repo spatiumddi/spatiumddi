@@ -1,0 +1,16 @@
+[Unit]
+Description=Watch for SpatiumDDI removable-disk mount config (issue #989)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/989
+# Skip on the live ISO — the installer environment mounts no removable
+# backup disks, and the release-state dir it would watch is the live
+# tmpfs rather than the installed /var.
+ConditionKernelCommandLine=!boot=live
+
+[Path]
+# Same atomic-rename trigger the snmp / chrony / ssh planes use: the
+# supervisor writes <name>.new then renames, so PathChanged fires once
+# per complete payload and never on a partial write.
+PathChanged=/var/lib/spatiumddi/release-state/removable-config-pending
+
+[Install]
+WantedBy=multi-user.target

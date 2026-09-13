@@ -112,6 +112,18 @@ from app.services.appliance.network_mtu import (
     network_report,
 )
 from app.services.appliance.ntp import ntp_bundle
+from app.services.appliance.removable import (
+    RemovableError,
+    archive_path,
+    merge_state,
+    normalise_desired,
+    removable_bundle_safe,
+    removable_disk_fields,
+    validate_name,
+)
+from app.services.appliance.removable import (
+    report as removable_report,
+)
 from app.services.appliance.resolver import resolver_bundle
 from app.services.appliance.slot_image_target import (
     SlotImageResolutionError,
@@ -1499,6 +1511,15 @@ class SupervisorHeartbeatResponse(BaseModel):
     # supervisor then keeps its in-pod fallback render). The supervisor
     # pipes a non-empty block to the firewall-pending trigger verbatim.
     firewall_settings: dict[str, Any] = Field(default_factory=dict)
+    # #989 item 3 — removable (USB) backup disks this node should mount.
+    # ``{enabled, config_hash, mounts: [{name, fs_uuid, fstype}]}``.
+    #
+    # The one host-config block rendered from the APPLIANCE ROW rather
+    # than from platform_settings, because a USB disk is plugged into
+    # exactly one node — a fleet-wide list would ask every other node to
+    # mount a disk it cannot see. Empty-shape block still sent, because
+    # an empty desired set is how an EJECT reaches the host.
+    removable_settings: dict[str, Any] = Field(default_factory=dict)
 
 
 def _s(v: object, limit: int = 255) -> str | None:
@@ -2501,6 +2522,7 @@ async def supervisor_heartbeat(
         resolver_settings=resolver_block,
         apt_settings=apt_block,
         firewall_settings=firewall_block,
+        removable_settings=removable_bundle_safe(row.desired_removable_mounts),
         long_poll=long_poll,
     )
 
@@ -6032,7 +6054,324 @@ async def appliance_storage_action(
     )
 
 
+# ── Removable (USB) backup disks (#989 item 3) ───────────────────────
+#
+# Read the candidates this node can see, mount one, eject one. The
+# mount is desired state on the appliance row, applied by the
+# supervisor's host runner over the same trigger-file plane as every
+# other host-config plane — so these endpoints stamp and wake, they
+# never wait for the disk.
+
+
+class RemovableDisk(BaseModel):
+    """One USB filesystem the node reported.
+
+    ``usable`` + ``reason`` rather than filtering: a disk that does not
+    appear at all reads as a broken feature, and the operator cannot
+    tell that from "SpatiumDDI has not noticed it yet".
+    """
+
+    device: str = ""
+    by_id: str = ""
+    fs_uuid: str = ""
+    fstype: str = ""
+    label: str = ""
+    model: str = ""
+    vendor: str = ""
+    serial: str = ""
+    size_bytes: int | None = None
+    mounted_at: str | None = None
+    usable: bool = False
+    reason: str | None = None
+
+
+class RemovableMount(BaseModel):
+    name: str
+    fs_uuid: str
+    fstype: str
+    label: str | None = None
+    added_at: str | None = None
+    #: ``mounted`` / ``waiting`` / ``present`` / ``blind`` /
+    #: ``unreported`` — see ``merge_state``. ``waiting`` is NOT a fault
+    #: (a rotated off-site disk); ``present`` is (the disk is in the
+    #: port and the mount did not take).
+    state: str = "unreported"
+    #: Where a backup target should point. Not the mountpoint: ext4
+    #: carries real ownership and the api runs as uid 1000, so archives
+    #: go in a subdirectory the host runner chowns.
+    path: str
+    mountpoint: str
+    total_bytes: int | None = None
+    free_bytes: int | None = None
+    present: bool = False
+
+
+class RemovableResponse(BaseModel):
+    #: False when the node has not reported a removable block at all —
+    #: a supervisor too old to look, or one that has not heartbeated.
+    #: NOT the same as "no disks", and the UI must not render it as one.
+    reported: bool = False
+    #: The node the disks are plugged into, for the backup target's
+    #: ``node_name``. None until the node reports one.
+    node_name: str | None = None
+    disks: list[RemovableDisk] = Field(default_factory=list)
+    mounts: list[RemovableMount] = Field(default_factory=list)
+    #: Reported by the node when the last apply failed or is retrying,
+    #: so a mount that never lands says so instead of sitting in
+    #: ``waiting`` forever looking like an unplugged disk.
+    apply_state: str | None = None
+    #: The host runner's own reason for the last failure, when it had
+    #: one. Without this the operator is told only "not applied" and
+    #: sent to read ``journalctl`` — the concrete cause is written to a
+    #: sidecar and would otherwise be discarded (the #882 deferred item).
+    apply_error: str | None = None
+    #: False = the node CAN see its disks but cannot read the removable
+    #: root (the hostPath bind is missing, or its propagation was lost).
+    #: Distinct from ``reported``: /run/udev is a separate mount, so the
+    #: disk list can be full while every mount reads as absent, and
+    #: rendering that as "your disk is not plugged in" sends the
+    #: operator to check a cable for no reason.
+    root_readable: bool = True
+    #: The destination path a backup target should use, with ``{name}``
+    #: left to substitute. Served rather than re-derived in the UI so
+    #: the one screen whose job is telling the operator what to paste
+    #: cannot drift from ``archive_path`` — the #878 two-renderers rule.
+    path_template: str = ""
+
+
+class RemovableMountRequest(BaseModel):
+    fs_uuid: str
+    name: str
+
+
+def _removable_apply_error(row: Appliance) -> str | None:
+    """The host runner's own reason for its last failed apply.
+
+    Only surfaced while the failure is still current: once the runner
+    succeeds it writes ``applied``, and reporting a stale reason beside
+    a healthy plane is worse than reporting none.
+    """
+    block = removable_report(row.cluster_health)
+    status = (block or {}).get("apply_status")
+    if not isinstance(status, dict) or status.get("state") != "failed":
+        return None
+    error = status.get("error")
+    return str(error)[:500] if error else None
+
+
+def _removable_response(row: Appliance) -> RemovableResponse:
+    block = removable_report(row.cluster_health)
+    disks = [RemovableDisk(**removable_disk_fields(e)) for e in (block or {}).get("disks") or []]
+    health = row.host_config_health if isinstance(row.host_config_health, dict) else {}
+    plane = health.get("removable") if isinstance(health.get("removable"), dict) else None
+    return RemovableResponse(
+        reported=block is not None,
+        # ``_s`` and not ``str(...) or None``: ``str(None)`` is the
+        # string "None", which is TRUTHY, so the ``or`` never fires and
+        # the UI renders "Disks here are on node None" — which an
+        # operator then copies into a destination's node field, refusing
+        # every backup thereafter.
+        node_name=_s(block.get("node_name")) if block else None,
+        root_readable=(bool(block.get("supported", True)) if block else True),
+        disks=disks,
+        mounts=[
+            RemovableMount(**m)
+            for m in merge_state(row.desired_removable_mounts, row.cluster_health)
+        ],
+        apply_state=_s(plane.get("state")) if plane else None,
+        apply_error=_removable_apply_error(row),
+        path_template=archive_path("{name}"),
+    )
+
+
+@router.get(
+    "/appliances/{appliance_id}/removable",
+    response_model=RemovableResponse,
+    summary="Removable (USB) disks this appliance can see (#989)",
+)
+async def list_removable(appliance_id: uuid.UUID, db: DB, user: CurrentUser) -> RemovableResponse:
+    """Read-only. The listing comes from the node's last heartbeat, so it
+    is at most one heartbeat interval old — a disk plugged in a moment
+    ago appears on the next tick, and the UI says how long ago the node
+    last reported rather than implying the reading is live.
+    """
+    _require_superadmin(user)
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    return _removable_response(row)
+
+
+@router.post(
+    "/appliances/{appliance_id}/removable/mount",
+    response_model=RemovableResponse,
+    summary="Mount a removable disk on an appliance for backups (#989)",
+)
+async def mount_removable(
+    appliance_id: uuid.UUID,
+    body: RemovableMountRequest,
+    request: Request,
+    db: DB,
+    user: CurrentUser,
+) -> RemovableResponse:
+    """Superadmin only, audited.
+
+    **The reported disk list is the allowlist** (the #890 rule): the
+    request names a disk from the listing and is resolved against a
+    FRESH one here, so there is no second list to keep in sync and a
+    UUID the node is not currently reporting is refused rather than
+    written into a mount unit. That also means a disk the node marked
+    unusable — its own root partition, a filesystem we cannot mount, one
+    already in use — cannot be mounted by crafting the request by hand.
+    """
+    _require_superadmin(user)
+    # FOR UPDATE, unlike this file's siblings, and the difference is the
+    # operation shape rather than a change of house style: role
+    # assignment and firewall are whole-value REPLACEs, where
+    # last-writer-wins is a defined outcome. This is the first
+    # per-appliance list built by read-modify-APPEND, so an unlocked
+    # lost update silently drops an operator's action instead of
+    # overwriting it — and the duplicate-name / duplicate-UUID refusals
+    # run against each session's own stale copy, so they cannot see a
+    # concurrent peer either.
+    row = await db.get(Appliance, appliance_id, with_for_update=True)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+
+    block = removable_report(row.cluster_health)
+    if block is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"{row.hostname} has not reported its removable disks yet. It may be "
+            "offline, or running a supervisor that predates this feature.",
+        )
+    candidates = {
+        str(d.get("fs_uuid")): d
+        for d in (block.get("disks") or [])
+        if isinstance(d, dict) and d.get("fs_uuid")
+    }
+    disk = candidates.get(body.fs_uuid.strip())
+    if disk is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"{row.hostname} is not reporting a disk with UUID "
+            f"{body.fs_uuid!r}. If you have just plugged it in, wait for the "
+            "next heartbeat and refresh.",
+        )
+    if not disk.get("usable"):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            str(disk.get("reason") or "this disk cannot be used for backups"),
+        )
+
+    try:
+        name = validate_name(body.name)
+        desired = normalise_desired(
+            [
+                *(row.desired_removable_mounts or []),
+                {
+                    "name": name,
+                    "fs_uuid": str(disk.get("fs_uuid")),
+                    "fstype": str(disk.get("fstype")),
+                    "label": disk.get("label"),
+                    "added_at": datetime.now(UTC).isoformat(),
+                },
+            ]
+        )
+    except RemovableError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+
+    row.desired_removable_mounts = desired
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            user_display_name=user.display_name or user.username,
+            auth_source=user.auth_source or "local",
+            source_ip=_client_ip(request),
+            action="appliance.removable.mount",
+            resource_type="appliance",
+            resource_id=str(row.id),
+            resource_display=row.hostname,
+            result="ok",
+            new_value={
+                "name": name,
+                "fs_uuid": disk.get("fs_uuid"),
+                "fstype": disk.get("fstype"),
+                "label": disk.get("label"),
+                "path": archive_path(name),
+            },
+        )
+    )
+    await db.commit()
+    await db.refresh(row)
+    # #358 Phase 1 — wake the heartbeat long-poll so the disk is mounted
+    # in ~0 s rather than on the next tick. Advisory; the tick is the
+    # fallback, so a Redis outage delays the mount, never loses it.
+    await publish_wake(appliance_channel(row.id))
+    return _removable_response(row)
+
+
+@router.delete(
+    "/appliances/{appliance_id}/removable/{name}",
+    response_model=RemovableResponse,
+    summary="Eject a removable disk from an appliance (#989)",
+)
+async def eject_removable(
+    appliance_id: uuid.UUID,
+    name: str,
+    request: Request,
+    db: DB,
+    user: CurrentUser,
+) -> RemovableResponse:
+    """Flush and unmount, so the disk is safe to pull when this returns.
+
+    Deliberately **not** blocked by a backup target still pointing at
+    the mount. The operator wants their disk back, and refusing here
+    would leave them pulling it anyway with the filesystem un-flushed —
+    strictly worse. A run against an ejected disk then fails loudly:
+    the path stops being a mountpoint, the driver refuses, and nothing
+    is written to the appliance's own /var.
+    """
+    _require_superadmin(user)
+    # See ``mount_removable`` — a mount racing an eject would otherwise
+    # re-append the just-ejected entry from its stale copy, resurrecting
+    # a disk the operator was told was ejected.
+    row = await db.get(Appliance, appliance_id, with_for_update=True)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    try:
+        wanted = validate_name(name)
+    except RemovableError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    current = list(row.desired_removable_mounts or [])
+    remaining = [m for m in current if str(m.get("name")) != wanted]
+    if len(remaining) == len(current):
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, f"{row.hostname} has no removable mount named {wanted!r}."
+        )
+    row.desired_removable_mounts = remaining
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            user_display_name=user.display_name or user.username,
+            auth_source=user.auth_source or "local",
+            source_ip=_client_ip(request),
+            action="appliance.removable.eject",
+            resource_type="appliance",
+            resource_id=str(row.id),
+            resource_display=row.hostname,
+            result="ok",
+            new_value={"name": wanted},
+        )
+    )
+    await db.commit()
+    await db.refresh(row)
+    await publish_wake(appliance_channel(row.id))
+    return _removable_response(row)
+
+
 # ── Packet capture (appliance-host vantage, #59 Phase 2) ─────────────────
+
 #
 # The supervisor's pcap_proxy thread drives these. Unlike the nettool /
 # k8s-proxy in-memory queues, the authority is the packet_capture DB row

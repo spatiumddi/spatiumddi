@@ -207,6 +207,17 @@ spec:
             # chowns it 1000:1000). Always mounted (not mirror-gated).
             - name: pcaps
               mountPath: /var/lib/spatiumddi/pcaps
+            # #989 item 3 — removable (USB) backup disks. HostToContainer
+            # propagation is the whole reason this works: with the DEFAULT
+            # private propagation a disk the host mounts AFTER this pod
+            # started is invisible here, so a backup would write to the
+            # empty underlying directory on the appliance's own /var and
+            # report success. Measured, not assumed. Read-write — the
+            # {api,worker} write archives into <disk>/spatiumddi, which the
+            # host runner chowns to this pod's uid.
+            - name: removable
+              mountPath: /var/lib/spatiumddi/removable
+              mountPropagation: HostToContainer
             # Slot detection. The slot-status/rollback handlers resolve the
             # ACTIVE slot from host state: _current_slot_from_cmdline()
             # matches /proc/cmdline's root UUID against /run/udev/data
@@ -264,6 +275,13 @@ spec:
         - name: pcaps
           hostPath:
             path: {{ .Values.api.applianceHostMounts.pcapsDir }}
+            type: DirectoryOrCreate
+        # #989 item 3 — removable (USB) backup disks. DirectoryOrCreate:
+        # spatiumddi-firstboot makes it, but a node that has never had a
+        # disk plugged in must not fail to schedule over an empty dir.
+        - name: removable
+          hostPath:
+            path: {{ .Values.api.applianceHostMounts.removableDir }}
             type: DirectoryOrCreate
         # Slot detection (see the volumeMount comment). `Directory`, not
         # DirectoryOrCreate, matching supervisor.yaml: both paths always

@@ -11052,6 +11052,32 @@ export const applianceApi = {
    */
   getRemoteAccess: () =>
     api.get<RemoteAccess>("/appliance/remote-access").then((r) => r.data),
+  /**
+   * #989 item 3 — removable (USB) backup disks on one appliance.
+   *
+   * The listing comes from that node's last heartbeat, so it is at most
+   * one heartbeat interval old: a disk plugged in a moment ago appears
+   * on the next tick. The UI says so rather than implying the read is
+   * live, because a Refresh button that cannot possibly help is worse
+   * than none.
+   */
+  listRemovable: (applianceId: string) =>
+    api
+      .get<RemovableResponse>(`/appliance/appliances/${applianceId}/removable`)
+      .then((r) => r.data),
+  mountRemovable: (applianceId: string, body: RemovableMountRequest) =>
+    api
+      .post<RemovableResponse>(
+        `/appliance/appliances/${applianceId}/removable/mount`,
+        body,
+      )
+      .then((r) => r.data),
+  ejectRemovable: (applianceId: string, name: string) =>
+    api
+      .delete<RemovableResponse>(
+        `/appliance/appliances/${applianceId}/removable/${encodeURIComponent(name)}`,
+      )
+      .then((r) => r.data),
 };
 
 // ── Fleet firewall (issue #285 Phase 3) ──────────────────────────────
@@ -12794,6 +12820,75 @@ export interface MultipathMap {
 }
 
 /** One classified thing worth saying about a node's redundancy. */
+/** #989 item 3 — one USB filesystem an appliance reported. */
+export interface RemovableDisk {
+  device: string;
+  by_id: string;
+  fs_uuid: string;
+  fstype: string;
+  label: string;
+  model: string;
+  vendor: string;
+  serial: string;
+  size_bytes: number | null;
+  mounted_at: string | null;
+  /**
+   * An unusable disk is listed DISABLED with its reason rather than
+   * filtered out — a disk that does not appear at all reads as a broken
+   * feature, and the operator cannot tell that from "not noticed yet".
+   */
+  usable: boolean;
+  reason: string | null;
+}
+
+/** #989 item 3 — one configured removable mount, desired ∪ reported. */
+export interface RemovableMount {
+  name: string;
+  fs_uuid: string;
+  fstype: string;
+  label: string | null;
+  added_at: string | null;
+  /**
+   * `mounted` — the disk is there and live.
+   * `waiting` — configured and armed; the disk is not plugged in. NOT an
+   *   error: a rotated off-site disk is legitimately absent for days.
+   * `present` — the disk IS plugged in and is not mounted. This one IS a
+   *   fault; rendering it as `waiting` tells the operator to plug in a
+   *   disk that is already in the port.
+   * `blind` — the node cannot read its removable root at all.
+   * `unreported` — the node has not said (offline, or too old to look).
+   */
+  state: "mounted" | "waiting" | "present" | "blind" | "unreported";
+  /** Where a backup target should point (inside the mount, not its root). */
+  path: string;
+  mountpoint: string;
+  total_bytes: number | null;
+  free_bytes: number | null;
+  present: boolean;
+}
+
+export interface RemovableResponse {
+  /** False = the node has not reported. NOT the same as "no disks". */
+  reported: boolean;
+  /** The k8s node the disks are on — a removable target is node-local. */
+  node_name: string | null;
+  disks: RemovableDisk[];
+  mounts: RemovableMount[];
+  /** `retrying` | `failing` when the host-side apply has not landed. */
+  apply_state: string | null;
+  /** The host runner's own reason for the last failed apply, if any. */
+  apply_error: string | null;
+  /** False = the node can see disks but cannot read the removable root. */
+  root_readable: boolean;
+  /** Where a destination should point, with `{name}` to substitute. */
+  path_template: string;
+}
+
+export interface RemovableMountRequest {
+  fs_uuid: string;
+  name: string;
+}
+
 /** #999 Part B — an md / multipath management action. */
 export interface StorageActionRequest {
   action:

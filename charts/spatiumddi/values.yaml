@@ -268,6 +268,16 @@ api:
     # here when the mirror's PVC comes up empty, and the download handler
     # falls back to it.
     slotImagesDir: /var/lib/spatiumddi/slot-images
+    # #989 item 3 — host dir the removable-disk mount plane mounts USB
+    # filesystems under (<dir>/<name>, archives in <dir>/<name>/spatiumddi).
+    # Mounted into api AND worker with mountPropagation: HostToContainer,
+    # which is load-bearing rather than a detail: a hostPath defaults to
+    # PRIVATE propagation, under which a mount the host makes after the
+    # pod started is invisible inside it — the pod sees the empty
+    # underlying directory, backups land on the appliance's own /var, and
+    # every surface reports success. The backup driver additionally
+    # refuses any path under here that is not a live mountpoint.
+    removableDir: /var/lib/spatiumddi/removable
     # #59 — host dir backing packet-capture .pcap artifacts
     # (SPATIUM_PCAP_DIR). Shared by api (reads on download) + worker
     # (writes the capture) on a single node. Multi-node server-vantage
