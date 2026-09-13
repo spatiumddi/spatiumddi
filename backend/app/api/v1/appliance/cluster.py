@@ -400,6 +400,30 @@ async def _merge_supervisor_host_state(db: AsyncSession, snap: dict[str, Any]) -
             node["host_storage"] = storage
 
 
+async def _merge_host_state_best_effort(db: AsyncSession, snap: dict[str, Any]) -> None:
+    """Attach the supervisor's host state when the database answers; keep
+    the kube snapshot when it does not.
+
+    Everything in ``snap`` a caller polls for — ``nodes_ready``, the per-node
+    Ready flags, the pod rollup — came from kubeapi; only the host disk / md /
+    multipath decoration needs Postgres. During a CNPG failover (the primary's
+    node partitioned or lost, #1083) that read raises for the 60-90 s the
+    promotion takes, and letting it out of the handler turned a complete kube
+    answer into a 500 for exactly the window in which a client watching
+    ``nodes_ready`` needs a true one. Every node then keeps
+    ``host_storage: None`` and ``host_disk_partitions: []``, which the model
+    documents as "not reported" — never as "healthy".
+    """
+    try:
+        await _merge_supervisor_host_state(db, snap)
+    except Exception as exc:  # noqa: BLE001 — the decoration must never sink the snapshot
+        logger.warning(
+            "cluster_health_host_state_unavailable",
+            error_class=type(exc).__name__,
+            error=str(exc)[:200],
+        )
+
+
 @router.get(
     "/health",
     response_model=ClusterHealth,
@@ -419,7 +443,7 @@ async def cluster_health(db: DB) -> ClusterHealth:
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "kubeapi unreachable from api; retry shortly.",
         ) from exc
-    await _merge_supervisor_host_state(db, snap)
+    await _merge_host_state_best_effort(db, snap)
     return ClusterHealth(**snap)
 
 
@@ -450,8 +474,11 @@ async def cluster_health_stream(request: Request) -> StreamingResponse:
                 snap = await anyio.to_thread.run_sync(get_cluster_health)
                 # Short-lived session per tick (don't hold a connection open
                 # for the whole stream); cheap single-row-per-node lookup.
+                # Best-effort for the same reason as the one-shot GET: a
+                # database that is failing over must not turn a complete
+                # kube frame into an "unavailable" one (#1083).
                 async with AsyncSessionLocal() as db:
-                    await _merge_supervisor_host_state(db, snap)
+                    await _merge_host_state_best_effort(db, snap)
             except k8s.KubeapiUnavailableError as exc:
                 # Log detail server-side; keep the client-facing reason generic
                 # so an exception message can't leak internals to the browser
