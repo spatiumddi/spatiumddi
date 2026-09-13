@@ -72,3 +72,30 @@ async def test_a_real_bug_still_reaches_the_500_path() -> None:
     the unhandled-exception capture and the 500."""
     handler = _handler_for(ValueError("bug"))
     assert handler is app.exception_handlers[Exception]
+
+
+@pytest.mark.parametrize(
+    "group",
+    [
+        ExceptionGroup("db", [TimeoutError("connect timed out")]),
+        ExceptionGroup("db", [ConnectionRefusedError(111, "refused")]),
+        ExceptionGroup("outer", [ExceptionGroup("inner", [TimeoutError("nested")])]),
+    ],
+    ids=["timeout", "refused", "nested"],
+)
+async def test_wrapped_dependency_timeouts_answer_503(group: BaseExceptionGroup) -> None:
+    """The asyncpg pre-ping timeout reaches cluster/health wrapped in an anyio
+    ExceptionGroup; a group whose leaves are all dependency-down errors is 503."""
+    handler = app.exception_handlers[ExceptionGroup]
+    resp = await handler(_request(), group)
+    assert resp.status_code == 503
+    assert resp.headers["Retry-After"] == "2"
+
+
+async def test_a_group_carrying_a_real_bug_is_reraised() -> None:
+    """A group with any non-dependency leaf must re-raise so the 500 path and
+    the diagnostics capture still fire."""
+    handler = app.exception_handlers[ExceptionGroup]
+    group = ExceptionGroup("mixed", [TimeoutError("db"), ValueError("bug")])
+    with pytest.raises(BaseExceptionGroup):
+        await handler(_request(), group)

@@ -959,18 +959,23 @@ def create_app() -> FastAPI:
     # timeout in front of the 503. The warning line carries the route.
     from sqlalchemy.exc import TimeoutError as SAPoolTimeoutError  # noqa: PLC0415
 
-    @app.exception_handler(TimeoutError)
-    @app.exception_handler(ConnectionError)
-    @app.exception_handler(SAPoolTimeoutError)
-    async def _dependency_unavailable(request: Request, exc: Exception) -> Response:
+    # The dependency-down exceptions this converts to 503. asyncpg's pre-ping
+    # times out as a bare ``TimeoutError``; a fresh checkout onto the not-yet-
+    # listening new primary raises ``ConnectionError`` (``ConnectionRefusedError``
+    # is a subclass); the pool's own checkout timeout is ``sqlalchemy.exc
+    # .TimeoutError``. All observed live on nightly-2026.09.12's partition rig
+    # while CNPG promoted a new primary.
+    _dependency_down = (TimeoutError, ConnectionError, SAPoolTimeoutError)
+
+    def _dependency_down_response(request: Request, error_class: str, detail: str) -> Response:
         from fastapi.responses import JSONResponse  # noqa: PLC0415
 
         logger.warning(
             "dependency_unavailable",
             method=request.method,
             path=request.url.path,
-            error_class=type(exc).__name__,
-            error=str(exc)[:200],
+            error_class=error_class,
+            error=detail[:200],
         )
         return JSONResponse(
             status_code=503,
@@ -982,6 +987,29 @@ def create_app() -> FastAPI:
             },
             headers={"Retry-After": "2"},
         )
+
+    @app.exception_handler(TimeoutError)
+    @app.exception_handler(ConnectionError)
+    @app.exception_handler(SAPoolTimeoutError)
+    async def _dependency_unavailable(request: Request, exc: Exception) -> Response:
+        return _dependency_down_response(request, type(exc).__name__, str(exc))
+
+    # The same timeout sometimes arrives WRAPPED. SQLAlchemy's asyncpg driver
+    # runs the connection on an anyio task group, so a pre-ping timeout can
+    # surface as an ``ExceptionGroup`` rather than a bare ``TimeoutError`` —
+    # observed on ``GET /appliance/cluster/health`` on the partition rig
+    # (``ExceptionGroup`` over one ``TimeoutError`` from ``asyncpg _async_ping``).
+    # A group whose leaves are ALL dependency-down errors is the same 503; a
+    # group carrying anything else re-raises unchanged so a real bug still
+    # reaches the 500 path and the diagnostics capture.
+    @app.exception_handler(ExceptionGroup)
+    async def _dependency_unavailable_group(request: Request, exc: ExceptionGroup) -> Response:
+        matched, rest = exc.split(_dependency_down)
+        if rest is not None or matched is None:
+            raise exc
+        leaves = getattr(matched, "exceptions", ())
+        first = leaves[0] if leaves else exc
+        return _dependency_down_response(request, type(first).__name__, str(first))
 
     from sqlalchemy.exc import DBAPIError as SADBAPIError  # noqa: PLC0415
     from sqlalchemy.exc import IntegrityError as SAIntegrityError  # noqa: PLC0415
