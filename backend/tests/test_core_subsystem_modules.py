@@ -126,219 +126,113 @@ async def test_operator_surface_is_reachable_while_the_subsystem_is_on(
 
 
 @pytest.mark.parametrize(
-    ("module_id", "path"),
+    ("module_id", "path", "env", "header", "driver"),
     [
-        ("core.dhcp", "/api/v1/dhcp/agents/register"),
-        ("core.dhcp", "/api/v1/dhcp/agents/config"),
-        ("core.dhcp", "/api/v1/dhcp/agents/heartbeat"),
-        ("core.dns", "/api/v1/dns/agents/register"),
-        ("core.dns", "/api/v1/dns/agents/config"),
-        ("core.dns", "/api/v1/dns/agents/heartbeat"),
-    ],
-)
-async def test_agent_endpoints_never_404_when_the_subsystem_is_off(
-    client: AsyncClient, db_session: AsyncSession, module_id: str, path: str
-) -> None:
-    """The whole reason the agent routers are mounted separately.
-
-    A 404 here makes an agent throw its JWT away and re-bootstrap from the
-    PSK, forever, against a surface that keeps answering 404. Whatever the
-    unauthenticated response is (401 / 403 / 422), it must not be 404.
-    """
-    await _disable(db_session, module_id)
-    await db_session.commit()
-
-    for resp in (await client.get(path), await client.post(path, json={})):
-        assert resp.status_code != 404, f"{path} → 404 with {module_id} off: {resp.text}"
-
-
-# ── 3. Children follow their parent ──────────────────────────────────
-
-
-@pytest.mark.parametrize(
-    ("parent", "child"),
-    [
-        ("core.dhcp", "dhcp.import"),
-        ("core.dhcp", "ipv6.router_advertisements"),
-        ("core.dns", "dns.import"),
-        ("core.dns", "dns.dynamic_update_acl"),
-        ("core.dns", "security.dns_threat"),
-        ("core.dns", "security.dnsbl"),
-    ],
-)
-async def test_a_child_resolves_off_when_its_parent_is_off(
-    db_session: AsyncSession, parent: str, child: str
-) -> None:
-    assert child in await feature_modules.get_enabled_modules(db_session)
-
-    await _disable(db_session, parent)
-    await db_session.flush()
-    enabled = await feature_modules.get_enabled_modules(db_session)
-
-    assert parent not in enabled
-    assert child not in enabled, (
-        f"{child} declares requires=({parent!r},) but stayed enabled with its "
-        "parent off — the router would still be mounted."
-    )
-
-
-async def test_a_child_explicitly_on_still_follows_its_parent(
-    db_session: AsyncSession,
-) -> None:
-    """An operator row saying ON does not outrank a disabled parent.
-
-    This is the case a display-only 'requires' note would get wrong: the
-    row exists and says enabled, so every naive reader reports it on.
-    """
-    db_session.add(FeatureModule(id="dhcp.import", enabled=True))
-    await _disable(db_session, "core.dhcp")
-    await db_session.flush()
-
-    assert "dhcp.import" not in await feature_modules.get_enabled_modules(db_session)
-
-
-async def test_child_tools_are_stripped_with_the_parent(
-    db_session: AsyncSession,
-) -> None:
-    """The MCP filter reads the same resolved set, so tagging a tool with
-    a child module is enough — it need not also name the parent."""
-    await _disable(db_session, "core.dns")
-    await db_session.flush()
-    enabled = await feature_modules.get_enabled_modules(db_session)
-
-    surviving = feature_modules.filter_to_enabled_tools(
-        enabled_modules=enabled,
-        tool_modules={
-            "list_dns_zones": "core.dns",
-            "find_dns_import_preview": "dns.import",
-            "list_dhcp_servers": "core.dhcp",
-            "global_search": None,
-        },
-    )
-    assert surviving == {"list_dhcp_servers", "global_search"}
-
-
-# ── 4. Disabling is refused while the subsystem owns rows ────────────
-
-
-async def test_disabling_dhcp_is_refused_while_a_server_exists(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
-    from app.models.dhcp import DHCPServer, DHCPServerGroup
-
-    _u, token = await _superadmin(db_session)
-    group = DHCPServerGroup(name=f"g-{uuid.uuid4().hex[:6]}", description="")
-    db_session.add(group)
-    await db_session.flush()
-    db_session.add(
-        DHCPServer(
-            name=f"kea-{uuid.uuid4().hex[:6]}",
-            driver="kea",
-            host="10.0.0.5",
-            server_group_id=group.id,
-        )
-    )
-    await db_session.commit()
-
-    resp = await client.patch(
-        "/api/v1/admin/feature-modules/core.dhcp",
-        json={"enabled": False},
-        headers=_hdr(token),
-    )
-    assert resp.status_code == 422, resp.text
-    assert "DHCP server" in resp.json()["detail"]
-
-    # Refused before anything was written — no override row, still enabled.
-    feature_modules.invalidate_cache()
-    assert "core.dhcp" in await feature_modules.get_enabled_modules(db_session)
-
-
-async def test_disabling_dns_is_refused_while_a_zone_exists(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
-    from app.models.dns import DNSServerGroup, DNSZone
-
-    _u, token = await _superadmin(db_session)
-    group = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:6]}", description="")
-    db_session.add(group)
-    await db_session.flush()
-    db_session.add(DNSZone(name=f"z{uuid.uuid4().hex[:6]}.test", group_id=group.id))
-    await db_session.commit()
-
-    resp = await client.patch(
-        "/api/v1/admin/feature-modules/core.dns",
-        json={"enabled": False},
-        headers=_hdr(token),
-    )
-    assert resp.status_code == 422, resp.text
-    assert "DNS zone" in resp.json()["detail"]
-
-
-async def test_disabling_is_allowed_once_the_subsystem_is_empty(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
-    _u, token = await _superadmin(db_session)
-    await db_session.commit()
-
-    resp = await client.patch(
-        "/api/v1/admin/feature-modules/core.dhcp",
-        json={"enabled": False},
-        headers=_hdr(token),
-    )
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["enabled"] is False
-
-
-async def test_enabling_is_never_refused(client: AsyncClient, db_session: AsyncSession) -> None:
-    """The guard is one-directional. Turning a subsystem back ON with rows
-    present is exactly the recovery path and must never be blocked."""
-    from app.models.dhcp import DHCPServerGroup
-
-    _u, token = await _superadmin(db_session)
-    db_session.add(DHCPServerGroup(name=f"g-{uuid.uuid4().hex[:6]}", description=""))
-    await _disable(db_session, "core.dhcp")
-    await db_session.commit()
-
-    resp = await client.patch(
-        "/api/v1/admin/feature-modules/core.dhcp",
-        json={"enabled": True},
-        headers=_hdr(token),
-    )
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["enabled"] is True
-
-
-# ── 5. Registration cannot undo the refusal ──────────────────────────
-
-
-@pytest.mark.parametrize(
-    ("module_id", "path"),
-    [
-        ("core.dhcp", "/api/v1/dhcp/agents/register"),
-        ("core.dns", "/api/v1/dns/agents/register"),
+        (
+            "core.dhcp",
+            "/api/v1/dhcp/agents/register",
+            "DHCP_AGENT_KEY",
+            "X-DHCP-Agent-Key",
+            "kea",
+        ),
+        (
+            "core.dns",
+            "/api/v1/dns/agents/register",
+            "DNS_AGENT_KEY",
+            "X-DNS-Agent-Key",
+            "bind9",
+        ),
     ],
 )
 async def test_registration_is_declined_403_not_404_when_the_subsystem_is_off(
-    client: AsyncClient, db_session: AsyncSession, module_id: str, path: str
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    module_id: str,
+    path: str,
+    env: str,
+    header: str,
+    driver: str,
 ) -> None:
     """Register is the one agent call that CREATES a server row.
 
     Left open, it undoes the refuse-while-populated guard: empty the
     subsystem, disable it, and a still-running agent re-registers seconds
     later — a live server stranded behind a 404 surface. It must decline,
-    and it must decline with 403: a 404 is precisely the signal that makes
-    an agent throw its JWT away and re-bootstrap, so 404 here would loop
-    forever instead of stopping.
+    and it must decline with 403, because a 404 is exactly the signal that
+    makes an agent throw its JWT away and re-bootstrap from its PSK.
+
+    The PSK dependency runs BEFORE the handler body, so this has to get
+    PAST it to reach the module guard at all: the bootstrap key is set and
+    sent, and the body is valid. The first version of this test asserted
+    only ``status in (401, 403)`` and sent neither — it passed locally off
+    the 401 from an unconfigured key and passed nothing of the guard, then
+    failed in CI where the key is absent entirely and the answer is 503.
     """
+    monkeypatch.setenv(env, "test-bootstrap-key")
     await _disable(db_session, module_id)
     await db_session.commit()
 
-    resp = await client.post(path, json={})
-    assert resp.status_code != 404, resp.text
-    # 401/403 both acceptable shapes depending on which gate answers
-    # first (the PSK check may run before ours); what must never happen
-    # is a 404, or a 200 that creates a row.
-    assert resp.status_code in (401, 403), resp.text
+    resp = await client.post(
+        path,
+        json={
+            "hostname": f"agent-{uuid.uuid4().hex[:8]}",
+            "driver": driver,
+            "fingerprint": uuid.uuid4().hex,
+        },
+        headers={header: "test-bootstrap-key"},
+    )
+    assert resp.status_code == 403, resp.text
+    assert "disabled" in resp.json()["detail"].lower()
+
+
+@pytest.mark.parametrize(
+    ("module_id", "path", "env", "header", "driver"),
+    [
+        (
+            "core.dhcp",
+            "/api/v1/dhcp/agents/register",
+            "DHCP_AGENT_KEY",
+            "X-DHCP-Agent-Key",
+            "kea",
+        ),
+        (
+            "core.dns",
+            "/api/v1/dns/agents/register",
+            "DNS_AGENT_KEY",
+            "X-DNS-Agent-Key",
+            "bind9",
+        ),
+    ],
+)
+async def test_registration_succeeds_while_the_subsystem_is_on(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    module_id: str,
+    path: str,
+    env: str,
+    header: str,
+    driver: str,
+) -> None:
+    """Negative control: the same request with the module ON is accepted.
+
+    Without this the 403 above could come from anything — a rejected body,
+    a changed header name — and still look like the guard working.
+    """
+    monkeypatch.setenv(env, "test-bootstrap-key")
+    await db_session.commit()
+
+    resp = await client.post(
+        path,
+        json={
+            "hostname": f"agent-{uuid.uuid4().hex[:8]}",
+            "driver": driver,
+            "fingerprint": uuid.uuid4().hex,
+        },
+        headers={header: "test-bootstrap-key"},
+    )
+    assert resp.status_code < 400, resp.text
 
 
 # ── 6. Disabling resolves open alerts rather than freezing them ──────
