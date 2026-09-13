@@ -613,3 +613,188 @@ kbd {
     padding: 28px 20px 70px;
   }
 }
+
+/* ─── Documentation index ────────────────────────────────────────────────────
+   Scoped `.idx-*` so it cannot be confused with the product landing-page CSS
+   #1070 removed. That was a marketing hero, feature grid and screenshot
+   gallery for a site that no longer sells anything; this is a card index over
+   the documentation itself — the same links the page has always carried, laid
+   out so a reader can scan for the one they want instead of reading 36 bullets.
+   Nothing here describes the product beyond one factual paragraph. */
+
+/* A panel, deliberately not a hero. The company site opens on the dark brand
+   chrome with a centred wash; reproducing that here would re-create exactly
+   the landing page #1070 removed. This is the same surface and radius the
+   cards below use, so the page opens with some weight and still reads as
+   documentation from the first glance. */
+/* Only the index opts out of the prose measure — see _layouts/default.html. */
+.doc-body-wide {
+  max-width: var(--page);
+}
+
+.idx-lead {
+  margin: 0 0 2rem;
+  padding: 1.6rem 1.75rem 1.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-soft);
+}
+.idx-lead h1 {
+  margin: 0 0 0.75rem;
+  font-size: 2.1rem;
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+}
+.idx-lead p {
+  margin: 0 0 0.6rem;
+  max-width: 62ch;
+  font-size: 1.02rem;
+  line-height: 1.65;
+  color: var(--fg);
+}
+.idx-lead-note {
+  color: var(--fg-muted) !important;
+  font-size: 0.95rem !important;
+}
+.idx-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin-top: 1.25rem;
+}
+.idx-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0.7rem 1.3rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 0.95rem;
+  font-weight: 600;
+  text-decoration: none;
+  transition:
+    transform 0.12s ease,
+    background 0.12s ease,
+    border-color 0.12s ease;
+}
+.idx-btn:hover {
+  border-color: var(--accent);
+  transform: translateY(-1px);
+  text-decoration: none;
+}
+.idx-btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.idx-btn-primary:hover {
+  /* --accent-bright is the shared hover in components.css; the docs site
+     declares it in its own palette block. */
+  background: var(--accent-bright);
+  color: #fff;
+}
+
+/* At-a-glance facts. Deliberately four rows of plain text rather than
+   feature cards with icons — a reader arriving at documentation wants to know
+   what this thing speaks and how it deploys, not to be sold to. */
+.idx-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 0.5rem 1.75rem;
+  margin: 0 0 2.5rem;
+}
+.idx-fact {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 0.55rem 0;
+  border-top: 1px solid var(--border);
+}
+.idx-fact-k {
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+}
+.idx-fact-v {
+  font-size: 0.88rem;
+  color: var(--fg);
+}
+
+.doc-body h2.idx-h2 {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  margin: 2.25rem 0 1rem;
+  padding-bottom: 0;
+  border-bottom: 0;
+  font-size: 1.15rem;
+}
+.doc-body h2.idx-h2 svg {
+  width: 17px;
+  height: 17px;
+  flex: 0 0 auto;
+  color: var(--accent);
+}
+
+.idx-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 0.7rem;
+  margin: 0 0 1.5rem;
+}
+.idx-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  padding: 1rem 1.1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: inherit;
+  text-decoration: none;
+  transition:
+    border-color 0.14s ease,
+    transform 0.14s ease,
+    box-shadow 0.14s ease;
+}
+.idx-card:hover {
+  border-color: var(--accent);
+  transform: translateY(-2px);
+  box-shadow: var(--shadow);
+  text-decoration: none;
+  color: inherit;
+}
+.idx-card-title {
+  font-size: 0.93rem;
+  font-weight: 600;
+  color: var(--fg);
+}
+.idx-card-desc {
+  font-size: 0.82rem;
+  line-height: 1.5;
+  color: var(--fg-muted);
+}
+.idx-card-desc code {
+  font-size: 0.95em;
+}
+
+.idx-foot {
+  margin-top: 2.5rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+}
+
+@media (max-width: 600px) {
+  .idx-lead h1 {
+    font-size: 1.65rem;
+  }
+  .idx-grid {
+    grid-template-columns: 1fr;
+  }
+}

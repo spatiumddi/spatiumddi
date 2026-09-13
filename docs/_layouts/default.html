@@ -45,7 +45,13 @@
     </div>
     {%- endunless %}
 
-    <article class="doc-body">
+    {%- comment -%}
+      The index is a card grid, not prose, so it is not held to the 58rem
+      reading measure every other page wants — three columns at that width
+      leaves a third of a desktop viewport empty. Same condition as the
+      breadcrumb above.
+    {%- endcomment -%}
+    <article class="doc-body{% if page.url == "/" or page.url == "/index.html" %} doc-body-wide{% endif %}">
       {{ content }}
     </article>
   </main>

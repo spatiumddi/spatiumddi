@@ -41,6 +41,10 @@ defaults:
       layout: default
 
 links:
+  # The company / product site. This docs site deliberately carries no
+  # marketing (#1070); the link is how a reader gets from the reference
+  # material to the product pages.
+  company: https://spatiumnorth.com
   github: https://github.com/spatiumddi/spatiumddi
   releases: https://github.com/spatiumddi/spatiumddi/releases
   issues: https://github.com/spatiumddi/spatiumddi/issues
