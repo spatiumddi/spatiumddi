@@ -1138,7 +1138,7 @@ SpatiumDDI supports Windows Server DHCP as an **agentless** backend. Today's imp
 | Bundle push (`/sync`) | ❌ | `READ_ONLY_DRIVERS` — rejected by the API. Windows DHCP is cmdlet-driven, not config-file-driven. |
 | `reload` / `restart` / `validate_config` | ❌ | Not applicable to Windows; raise `NotImplementedError`. |
 
-The driver lives at [`app/drivers/dhcp/windows.py`](../../backend/app/drivers/dhcp/windows.py) (class `WindowsDHCPReadOnlyDriver`). See [DHCP_DRIVERS.md](../drivers/DHCP_DRIVERS.md#4-windows-dhcp-driver-agentless--read-only-path-a) for internals.
+The driver lives at [`app/drivers/dhcp/windows.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dhcp/windows.py) (class `WindowsDHCPReadOnlyDriver`). See [DHCP_DRIVERS.md](../drivers/DHCP_DRIVERS.md#4-windows-dhcp-driver-agentless--read-only-path-a) for internals.
 
 ### 15.2 Credentials
 
@@ -1163,7 +1163,7 @@ See [WINDOWS.md](../deployment/WINDOWS.md) for the WinRM + account setup.
 
 ### 15.3 Scheduled lease pull
 
-Scheduled Celery beat task: [`app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases`](../../backend/app/tasks/dhcp_pull_leases.py). Beat fires every **10 seconds**; the task gates on platform settings so the UI can change cadence without restarting beat. A 10-second beat tick means operators can configure near-real-time IPAM population from Windows DHCP — the interval is the only knob that limits poll frequency now.
+Scheduled Celery beat task: [`app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/tasks/dhcp_pull_leases.py). Beat fires every **10 seconds**; the task gates on platform settings so the UI can change cadence without restarting beat. A 10-second beat tick means operators can configure near-real-time IPAM population from Windows DHCP — the interval is the only knob that limits poll frequency now.
 
 | Setting | Default | Description |
 |---|---|---|

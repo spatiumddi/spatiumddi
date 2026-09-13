@@ -19,7 +19,7 @@ SpatiumDDI manages DNS servers as first-class resources. It acts as the **author
 
 ## 0. Driver choice — BIND9, PowerDNS, Technitium, or Windows DNS
 
-SpatiumDDI ships five authoritative DNS drivers (Technitium in two shapes — see below), plus the eight cloud providers in §0a. Pick **per server group** — every server inside a group runs the same driver, but mixed installs (one group on BIND, another on PowerDNS, a third on Technitium, a fourth on Windows) are first-class. The driver registry is in [`drivers/dns/__init__.py`](../../backend/app/drivers/dns/__init__.py); the per-driver internals are in [`docs/drivers/DNS_DRIVERS.md`](../drivers/DNS_DRIVERS.md).
+SpatiumDDI ships five authoritative DNS drivers (Technitium in two shapes — see below), plus the eight cloud providers in §0a. Pick **per server group** — every server inside a group runs the same driver, but mixed installs (one group on BIND, another on PowerDNS, a third on Technitium, a fourth on Windows) are first-class. The driver registry is in [`drivers/dns/__init__.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dns/__init__.py); the per-driver internals are in [`docs/drivers/DNS_DRIVERS.md`](../drivers/DNS_DRIVERS.md).
 
 | Capability | BIND9 | PowerDNS | Technitium | Windows DNS |
 |---|:---:|:---:|:---:|:---:|

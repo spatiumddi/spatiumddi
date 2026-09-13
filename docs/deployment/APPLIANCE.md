@@ -309,7 +309,7 @@ single-node appliance restarting cluster DNS is a footgun.
 7. (Appliance role, or a Control-plane node enabling DNS/DHCP) Operator approves the appliance from the control plane's `/appliance → Fleet` tab + picks roles. DaemonSet schedules role pods within ~30 s.
 
 For a step-by-step user-facing version, see the README's
-["Quick start with the OS appliance ISO" section](../../README.md#quick-start-with-the-os-appliance-iso-recommended).
+["Quick start with the OS appliance ISO" section](https://github.com/spatiumddi/spatiumddi/blob/main/README.md#quick-start-with-the-os-appliance-iso-recommended).
 
 ---
 
@@ -2205,7 +2205,7 @@ runs on a build that carries the Looking Glass, so an A/B slot upgrade
 picks it up rather than only fresh installs.
 
 Recipe, schema table, and Azure / AWS / Proxmox / PXE examples:
-[`appliance/cloud-init/README.md`](../../appliance/cloud-init/README.md)
+[`appliance/cloud-init/README.md`](https://github.com/spatiumddi/spatiumddi/blob/main/appliance/cloud-init/README.md)
 plus `spatium-preseed-control-plane.yaml.example` +
 `spatium-preseed-appliance.yaml.example`.
 

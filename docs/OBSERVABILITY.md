@@ -876,7 +876,7 @@ All services expose:
 > the dashboards below depend on the planned (un-emitted) metric
 > families in § 6. What *does* exist is a single **perf-testing**
 > "war room" dashboard at
-> [`perf/dashboards/grafana/dashboards/warroom.json`](../perf/dashboards/grafana/dashboards/warroom.json)
+> [`perf/dashboards/grafana/dashboards/warroom.json`](https://github.com/spatiumddi/spatiumddi/blob/main/perf/dashboards/grafana/dashboards/warroom.json)
 > (with provisioning under `perf/dashboards/grafana/provisioning/` and
 > a matching scrape config at `perf/dashboards/prometheus/prometheus.yml`).
 > That stack is for the load/soak test harness under `perf/`, not for

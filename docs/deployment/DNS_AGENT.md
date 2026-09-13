@@ -367,7 +367,7 @@ data out to every server directly.
 
 - A record change enqueues **one `DNSRecordOp` row per enabled
   agent-based server in the group** (`enqueue_record_op` in
-  [`backend/app/services/dns/record_ops.py`](../../backend/app/services/dns/record_ops.py)).
+  [`backend/app/services/dns/record_ops.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/services/dns/record_ops.py)).
   Each agent pulls its own queued ops via the config long-poll and
   applies them through loopback `nsupdate` against its local daemon.
 - `DNSServer.is_primary` does **not** mean "the only writer" for
@@ -393,7 +393,7 @@ data out to every server directly.
 
 For **agentless** drivers (`windows_dns` plus the cloud-hosted DNS
 drivers — see `AGENTLESS_DRIVERS` in
-[`backend/app/drivers/dns/__init__.py`](../../backend/app/drivers/dns/__init__.py))
+[`backend/app/drivers/dns/__init__.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dns/__init__.py))
 there is no agent and no loopback `nsupdate`. Here the
 `is_primary=True` server is the **single writer**: `enqueue_record_op`
 detects the agentless driver and applies the op **immediately from the

@@ -668,7 +668,7 @@ When **any** integration toggle is on, the dashboard renders an **Integrations p
 
 ## Roadmap — additional integrations
 
-Tier 1 status (tracked in [CLAUDE.md §Integration roadmap](../../CLAUDE.md)): **UniFi Network Application**, **OPNsense** and **NetBird** have shipped as read-only mirrors (gated by the `integrations.unifi` / `integrations.opnsense` / `integrations.netbird` feature modules); **pfSense** remains. All target the same homelab / SMB audience and fit the Kubernetes/Docker/Proxmox/Tailscale reconciler shape. See CLAUDE.md for per-integration scope notes.
+Tier 1 status (tracked in [CLAUDE.md §Integration roadmap](https://github.com/spatiumddi/spatiumddi/blob/main/CLAUDE.md)): **UniFi Network Application**, **OPNsense** and **NetBird** have shipped as read-only mirrors (gated by the `integrations.unifi` / `integrations.opnsense` / `integrations.netbird` feature modules); **pfSense** remains. All target the same homelab / SMB audience and fit the Kubernetes/Docker/Proxmox/Tailscale reconciler shape. See CLAUDE.md for per-integration scope notes.
 
 The **enterprise-firewall family** has since shipped on the same reconciler shape — **Palo Alto PAN-OS / Panorama** (#605) plus **Fortinet FortiGate** and **Cisco Meraki MX** (#606, Phase 1), each with its own section above. Check Point and Cisco FTD / FMC are the remaining Phase 2 vendors.
 
