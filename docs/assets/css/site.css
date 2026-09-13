@@ -176,11 +176,14 @@ kbd {
   border-radius: 7px;
   display: block;
 }
+/* The tail word is the SAME letterform as the head — only the colour
+   differs. That is how the company lockup is built: scripts/build-logos.mjs
+   in spatiumddi-web converts one wordmark to paths and fills "Spatium" with
+   var(--fg) and the tail ("North", "DDI") with var(--wordmark), the family
+   teal. This used to shrink DDI to 0.78em, lighten it to 500 and letter-space
+   it, which read as a different mark from the one on the company site. */
 .nav-brand .ddi {
   color: var(--accent);
-  font-weight: 500;
-  letter-spacing: 0.14em;
-  font-size: 0.78em;
 }
 
 .nav-links {
