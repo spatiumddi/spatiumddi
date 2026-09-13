@@ -5,6 +5,7 @@ import { isAxiosError } from "axios";
 import { authApi } from "@/lib/api";
 import { evaluatePolicy, parsePasswordError } from "@/lib/password-policy";
 import { cn } from "@/lib/utils";
+import { PasswordInput } from "@/components/ui/password-input";
 
 const GENERIC_FAILURE = "Failed to change password — try again.";
 
@@ -95,28 +96,24 @@ export function ChangePasswordPage() {
             <label htmlFor="current-password" className="text-sm font-medium">
               Current Password
             </label>
-            <input
+            <PasswordInput
               id="current-password"
-              type="password"
               autoComplete="current-password"
               required
               value={currentPassword}
               onChange={(e) => setCurrentPassword(e.target.value)}
-              className="w-full rounded-md border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
             />
           </div>
           <div className="space-y-2">
             <label htmlFor="new-password" className="text-sm font-medium">
               New Password
             </label>
-            <input
+            <PasswordInput
               id="new-password"
-              type="password"
               autoComplete="new-password"
               required
               value={newPassword}
               onChange={(e) => setNewPassword(e.target.value)}
-              className="w-full rounded-md border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
             />
             {evaluation && <PolicyHintList evaluation={evaluation} />}
           </div>
@@ -124,17 +121,13 @@ export function ChangePasswordPage() {
             <label htmlFor="confirm-password" className="text-sm font-medium">
               Confirm New Password
             </label>
-            <input
+            <PasswordInput
               id="confirm-password"
-              type="password"
               autoComplete="new-password"
               required
               value={confirmPassword}
               onChange={(e) => setConfirmPassword(e.target.value)}
-              className={cn(
-                "w-full rounded-md border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring",
-                mismatch && "border-destructive",
-              )}
+              className={cn(mismatch && "border-destructive")}
             />
             {mismatch && (
               <p className="text-sm text-destructive">Passwords do not match</p>
