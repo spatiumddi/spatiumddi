@@ -140,3 +140,14 @@ export function useClusterHealthStream() {
 
   return { snapshot, history, connected };
 }
+
+/** Disk-scale sizes in DECIMAL units — GB is what the label on a USB
+ *  disk says, and a 64 GB stick reading "59.6 GiB" reads as the wrong
+ *  disk. Deliberately not `fmtBytes` (binary), which is right for RAM
+ *  and filesystem usage and wrong here. */
+export function fmtDiskBytes(bytes: number | null | undefined): string {
+  if (typeof bytes !== "number" || bytes <= 0) return "—";
+  const tb = bytes / 1000 ** 4;
+  if (tb >= 1) return `${tb.toFixed(tb >= 10 ? 0 : 1)} TB`;
+  return `${(bytes / 1000 ** 3).toFixed(0)} GB`;
+}

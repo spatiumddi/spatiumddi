@@ -184,6 +184,22 @@ mkdir -p /var/lib/spatiumddi/pcaps
 chown 1000:1000 /var/lib/spatiumddi/pcaps
 chmod 0700 /var/lib/spatiumddi/pcaps
 
+# /var/lib/spatiumddi/removable — where the removable-disk mount plane
+# mounts USB backup disks (#989 item 3). Deliberately root-owned 0755
+# and NOT chowned to uid 1000, unlike its two neighbours above: this
+# directory is only ever a place to mount things IN, never a place to
+# write. Each per-disk mountpoint under it is created by
+# spatiumddi-removable-reload as root, mode 0500 while nothing is
+# mounted on it, so an ejected or yanked disk makes the path
+# unwritable at the KERNEL rather than relying on the api-side check
+# alone — the failure this must never produce is a backup that reports
+# success while writing to the appliance's own /var. Created up front
+# so the hostPath mounts (api, worker, supervisor) resolve on a node
+# that has never had a disk plugged in.
+mkdir -p /var/lib/spatiumddi/removable
+chown root:root /var/lib/spatiumddi/removable
+chmod 0755 /var/lib/spatiumddi/removable
+
 # #59 Phase 2 — appliance-host capture trigger dir under release-state.
 # The supervisor (control-plane→host) drops <cid>.request here and the
 # spatiumddi-pcap.path unit watches it; the host runner writes <cid>.pcap

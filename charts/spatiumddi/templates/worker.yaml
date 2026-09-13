@@ -69,6 +69,16 @@ spec:
             - {{ .Values.worker.queues | quote }}
           env:
             {{- include "spatiumddi.commonEnv" . | nindent 12 }}
+            # #989 item 3 — the node this replica runs on. SCHEDULED
+            # backups run here, and a removable destination is
+            # node-local: without this the worker cannot say which node
+            # the disk is plugged into, so a run that lands on the wrong
+            # one reports only that nothing is mounted. The api has had
+            # this since #983; the worker never did.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
             {{- if $kubeletCA.enabled }}
             # #983 Phase 2 — the worker runs alert evaluation, so it makes the
             # same direct kubelet call the api does and needs the same CA.
@@ -106,6 +116,17 @@ spec:
             # shared hostPath (firstboot chowns it 1000:1000).
             - name: pcaps
               mountPath: /var/lib/spatiumddi/pcaps
+            # #989 item 3 — removable (USB) backup disks. HostToContainer
+            # propagation is the whole reason this works: with the DEFAULT
+            # private propagation a disk the host mounts AFTER this pod
+            # started is invisible here, so a backup would write to the
+            # empty underlying directory on the appliance's own /var and
+            # report success. Measured, not assumed. Read-write — the
+            # {api,worker} write archives into <disk>/spatiumddi, which the
+            # host runner chowns to this pod's uid.
+            - name: removable
+              mountPath: /var/lib/spatiumddi/removable
+              mountPropagation: HostToContainer
             {{- end }}
           {{- end }}
       {{- if or .Values.api.applianceHostMounts.enabled $kubeletCA.enabled }}
@@ -120,6 +141,13 @@ spec:
         - name: pcaps
           hostPath:
             path: {{ .Values.api.applianceHostMounts.pcapsDir }}
+            type: DirectoryOrCreate
+        # #989 item 3 — removable (USB) backup disks. DirectoryOrCreate:
+        # spatiumddi-firstboot makes it, but a node that has never had a
+        # disk plugged in must not fail to schedule over an empty dir.
+        - name: removable
+          hostPath:
+            path: {{ .Values.api.applianceHostMounts.removableDir }}
             type: DirectoryOrCreate
         {{- end }}
       {{- end }}

@@ -387,6 +387,104 @@ async def find_appliance_storage(
     }
 
 
+# ── find_appliance_removable ───────────────────────────────────────
+
+
+class FindApplianceRemovableArgs(BaseModel):
+    configured_only: bool = Field(
+        default=False,
+        description=(
+            "Return only appliances with at least one removable mount "
+            "configured. False (the default) also lists nodes that can "
+            "see a USB disk nobody has mounted yet."
+        ),
+    )
+    limit: int = Field(default=50, ge=1, le=200)
+
+
+@register_tool(
+    name="find_appliance_removable",
+    description=(
+        "Report removable (USB) backup disks across the appliance fleet "
+        "(superadmin only, #989). Each configured mount carries a state: "
+        "'mounted' (the disk is there and live), 'waiting' (configured "
+        "and armed, disk not plugged in) or 'unreported' (the node has "
+        "not said). IMPORTANT: 'waiting' is NOT a fault — a rotated "
+        "off-site disk is legitimately absent for days — so do not "
+        "report it as an outage. It IS the reason a backup to that "
+        "destination will fail, which is the useful thing to say when "
+        "asked why a backup did not run. Also carries the destination "
+        "path a Local volume backup target should use, and the "
+        "Kubernetes node the disk is plugged into (a removable "
+        "destination is node-local: a run scheduled on another node "
+        "refuses rather than writing to the wrong host). Use to answer "
+        "'is the backup disk on ddi1 plugged in?', 'how much room is "
+        "left on it?' or 'which nodes have a USB disk I have not set up "
+        "yet?'. Read-only."
+    ),
+    args_model=FindApplianceRemovableArgs,
+    category="admin",
+    default_enabled=True,
+)
+async def find_appliance_removable(
+    db: AsyncSession, user: User, args: FindApplianceRemovableArgs
+) -> dict[str, Any]:
+    if (err := _superadmin_gate(user)) is not None:
+        return err
+
+    from app.services.appliance.removable import (  # noqa: PLC0415
+        merge_state,
+        removable_disk_fields,
+    )
+    from app.services.appliance.removable import (
+        report as removable_report,
+    )
+
+    stmt = select(Appliance).where(Appliance.revoked_at.is_(None)).order_by(Appliance.hostname)
+    rows = list((await db.execute(stmt)).scalars().all())
+
+    out: list[dict[str, Any]] = []
+    # Same reasoning as find_appliance_storage: a node filtered out for
+    # having nothing, and one filtered out because nobody looked, read
+    # as the same absence — and only the second can hide a disk.
+    not_reporting: list[str] = []
+    for row in rows:
+        block = removable_report(row.cluster_health)
+        if block is None:
+            not_reporting.append(row.hostname)
+        mounts = merge_state(row.desired_removable_mounts, row.cluster_health)
+        disks = [d for d in (block or {}).get("disks") or [] if isinstance(d, dict)]
+        if args.configured_only and not mounts:
+            continue
+        if not args.configured_only and not mounts and not disks:
+            continue
+        out.append(
+            {
+                "appliance_id": str(row.id),
+                "hostname": row.hostname,
+                "state": row.state,
+                "reported": block is not None,
+                "node_name": (block or {}).get("node_name") or None,
+                "mounts": mounts,
+                # Shared with the REST row builder so the two surfaces
+                # cannot disagree about how to read one heartbeat blob —
+                # the ``mtu_fields`` rule. Hand-written in the first
+                # draft, and the two lists had already diverged (this
+                # one omitted the vendor and model an operator
+                # identifies a disk by, and left ``size_bytes``
+                # uncoerced where REST would have nulled it).
+                "detected_disks": [removable_disk_fields(d) for d in disks],
+            }
+        )
+    out = out[: args.limit]
+    return {
+        "appliances": out,
+        "count": len(out),
+        "not_reporting": not_reporting,
+        "not_reporting_count": len(not_reporting),
+    }
+
+
 # ── propose_storage_action ─────────────────────────────────────────
 
 

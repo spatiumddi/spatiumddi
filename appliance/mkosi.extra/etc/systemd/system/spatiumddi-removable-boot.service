@@ -1,0 +1,22 @@
+[Unit]
+Description=Re-arm SpatiumDDI removable-disk mounts after the /etc overlay (issue #989)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/989
+ConditionKernelCommandLine=!boot=live
+# The whole point: the .mount units and their <device>.device.wants/
+# symlinks live in the /var-backed /etc overlay UPPER layer, which is
+# mounted by etc.mount — ordered after var.mount and therefore after
+# udev has already coldplugged the block devices. systemd resolves a
+# unit's .wants directory at load time and never rescans, so without one
+# daemon-reload on this side of etc.mount a disk left plugged in across
+# a reboot can have a unit on disk, a symlink on disk, and neither
+# loaded. Nothing else in the image daemon-reloads.
+After=etc.mount local-fs.target systemd-udev-settle.service
+Requires=etc.mount
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spatiumddi-removable-reload --boot
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

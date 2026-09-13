@@ -1415,6 +1415,122 @@ By default the appliance boots quietly (`loglevel=3` — only kernel errors reac
 - **Role assignment Save** shows a transient `✓ Saved` indicator and re-baselines the `dirty` check against the refreshed row.
 - **Slot image Delete** gated behind a `ConfirmModal` (destructive tone, shows version + notes + SHA-256 prefix, loading spinner during the mutation). The previous one-click delete wiped a ~700 MiB cached release on a misclick.
 
+### Removable (USB) backup disks — issue #989 item 3
+
+The single-appliance operator with no NAS and no cloud account backs up to a USB
+disk. `local_volume` writes to a path *inside* the api and worker pods, so
+pointing one at a block device needs the host to mount it — the only host-config
+plane that manages a **mount** rather than a config file. (NFS (#971) dodged the
+same problem by speaking the protocol in userspace; a block device has no
+userspace escape hatch.) Operator-facing walkthrough in
+[`SYSTEM_ADMIN.md` §2.9](../features/SYSTEM_ADMIN.md).
+
+- **Detect.** `read_removable_state()` in `appliance_state.py` reads the host's
+  `/run/udev/data/b<maj:min>` records for `ID_BUS=usb` entries carrying a
+  filesystem, resolving the kernel name and size through `/sys/dev/block`. Rides
+  `cluster_health` (#402 pattern — stored verbatim, no schema for it).
+- **Desired state.** `appliance.desired_removable_mounts` (JSONB, migration
+  `e3b9d7412c5a`). The one host-config plane rendered from the **appliance row**
+  rather than `platform_settings`: a USB disk is plugged into exactly one node,
+  and a fleet-wide list would ask every other node to mount a disk it cannot see.
+- **Apply.** `removable_settings` on the heartbeat →
+  `maybe_fire_removable_reload` → `spatiumddi-removable-reload`, which renders
+  one `.mount` unit per disk into a staging dir, validates it with
+  `systemd-analyze verify`, then installs, `daemon-reload`s and enables. Units
+  live in `/etc/systemd/system`, so they persist across A/B slot swaps via the
+  `/etc` overlay. Registered on `_HOST_CONFIG_PLANES` as `removable`, so a
+  failing apply surfaces on the Fleet drilldown rather than re-firing silently.
+- **Expose.** `/var/lib/spatiumddi/removable` is hostPath-mounted into api,
+  worker and supervisor with **`mountPropagation: HostToContainer`**. That is
+  load-bearing, not a detail: a hostPath defaults to *private* propagation,
+  under which a mount the host makes after the pod started is invisible inside
+  it — the pod sees the empty underlying directory, archives land on the
+  appliance's own `/var`, and every surface reports success. Verified against a
+  real kernel in both propagation modes.
+
+**Three design points that are easy to get wrong.**
+
+*No `.automount`, and `nofail` regardless.* #989 asked for an automount "so a
+disk pulled without ejecting does not hang boot". Being `WantedBy` its
+`dev-disk-by-uuid-….device` unit rather than `local-fs.target` is what covers
+the ABSENT disk — udev pulls the mount in when it appears, and boot waits for
+nothing that is not there. autofs would not add to that and would subtract: a
+process touching an autofs mountpoint whose device is absent blocks in the
+kernel, and the processes touching this path are the api and the Celery worker.
+`BindsTo=` the device gives the other half — a yanked disk is torn down rather
+than left as a stale mountpoint.
+
+`nofail` in `Options=` covers the disk that IS present at boot, and it is not
+decoration: systemd's `mount_add_default_dependencies()` adds an implicit
+`Before=local-fs.target` to every mount unit with `DefaultDependencies=yes`
+unless `nofail` is set — native unit files included, not only fstab-generated
+ones. Without it a plugged-in disk orders `local-fs.target`, and therefore
+sysinit / basic / multi-user / k3s, behind its own mount, up to
+`DefaultTimeoutStartSec` on a dirty exFAT volume.
+
+*One `daemon-reload` at boot, from `spatiumddi-removable-boot.service`.* The
+units and their `.device.wants/` symlinks live in the `/var`-backed `/etc`
+overlay upper layer, and `etc.mount` is itself ordered after `var.mount` —
+therefore after udev has coldplugged the block devices. systemd resolves a
+unit's `.wants` directory when the unit is loaded and never rescans, so a disk
+left plugged in across a reboot can have its unit on disk, its symlink on disk,
+and neither loaded. Nothing else in the image daemon-reloads.
+
+*The mountpoint is `0500` root-owned whenever nothing is mounted on it.* The
+failure this plane must never produce is a backup that reports success while
+writing to `/var`. The api-side driver refuses a `local_volume` path under the
+removable root that is not a live mountpoint, but that is software; `0500` is the
+kernel, and it holds even if every check above it is wrong. It is invisible while
+a disk is mounted, because the mount's own permissions apply.
+
+*The archive directory is `<mount>/spatiumddi`, not the mount root.* ext4 carries
+real ownership and **rejects `uid=` at mount time** (measured: `ext4: Unknown
+parameter 'uid'`), so something has to be owned by the api's uid 1000 — and
+chowning the root of a disk that may hold the operator's other data is ruder than
+creating one directory on it. `spatiumddi-removable-prepare.service` does that,
+pulled in by each `.mount` unit (`Wants=` + `Before=`) so it runs after the mount
+*however that mount happened* — including a disk plugged in hours later and
+mounted by udev with no operator action, which the apply path never sees. exFAT
+has no on-disk ownership at all and takes `uid=`/`gid=`/`umask=` from the mount
+options, so the runner checks before it chowns rather than ignoring an EPERM.
+
+**Refusals, in the order they are evaluated.** Ownership first: anything on the
+disk the appliance booted from, and anything carrying one of the installer's own
+labels (`root_a`, `root_b`, `state`, **`var`**, `esp`, `esp2` — matched against
+both the GPT name and the filesystem label, which `spatium-install` sets
+independently). `var` is the one that matters most: it is the whole remaining
+disk and holds PostgreSQL, the container images and `/var/lib/spatiumddi` itself,
+so mounting it under the removable root would bind the same superblock twice and
+land archives on the appliance's own `/var` with `ismount`, the `0500` guard and
+the run all reporting success.
+
+Ordering is the point, not an accident. The ESP is `vfat` with PARTLABEL `esp`;
+answering the filesystem question first would tell the operator of a USB-booted
+appliance to "reformat as exfat, ext4" — an instruction to reformat the
+partition the box boots from, rendered beside a Mount button.
+
+Then: a device already in use (an md member, an LVM PV, a mount elsewhere), a
+filesystem with no UUID (nothing stable for `What=`; the kernel name is
+reassigned on the next plug), and finally the filesystem type — `ext4` and
+`exFAT` only, because FAT32 caps one file at 4 GiB and an archive that outgrows
+it fails at the *end* of a long run.
+
+Unusable disks are *listed with the reason*, never hidden — a disk that does not
+appear is indistinguishable from one not noticed yet.
+
+**Two roots, and they are different strings.** `_REMOVABLE_ROOT`
+(`/host-removable`) is the supervisor's own bind; `_REMOVABLE_HOST_ROOT`
+(`/var/lib/spatiumddi/removable`) is the same directory as host init names it.
+`/proc/1/mountinfo` under `hostPID: true` renders paths against host init's root,
+so comparing a mountinfo path against the container root can never match — which
+would report every disk this feature successfully mounted as "already mounted"
+by somebody else, and refuse to re-mount it.
+
+**Multi-node.** A removable destination is node-local and scheduling is not
+routed: on an N-node control plane a run lands on the right node roughly 1 in N
+times, and the others refuse naming the node the disk is on. Routing is a
+tracked follow-up; on a cluster prefer `nfs` / `s3` / `smb`.
+
 ### Misc
 
 - `spatiumddi-firstboot` writes `/etc/spatiumddi/.env` mode 644 (was 600) so the supervisor's unprivileged user can read it through the `/etc/spatiumddi:/etc/spatiumddi-host:ro` bind mount. `service_lifecycle.py` passes the host `.env` as an additional `--env-file` to `docker compose` so service containers' `${SPATIUMDDI_VERSION}` / `${DOCKER_GID}` interpolation resolves without re-emitting every var into the role env.
