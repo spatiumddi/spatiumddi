@@ -35,6 +35,7 @@ from app.drivers.dns import get_driver
 from app.models.audit import AuditLog
 from app.models.dns import DNSServer, DNSZone
 from app.models.settings import PlatformSettings
+from app.services.feature_modules import is_module_enabled
 
 logger = structlog.get_logger(__name__)
 
@@ -53,6 +54,10 @@ async def _run_sync() -> dict[str, Any]:
 
     try:
         async with session_factory() as db:
+            # #1068 — the DHCP/DNS subsystem can be switched off wholesale;
+            # do no work (and open no driver connections) when it is.
+            if not await is_module_enabled(db, "core.dns"):
+                return {"status": "disabled"}
             ps = await db.get(PlatformSettings, _SINGLETON_ID)
             if ps is None or not ps.dns_pull_from_server_enabled:
                 return {"status": "disabled"}

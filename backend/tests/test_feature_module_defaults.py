@@ -34,6 +34,15 @@ _VERSIONS = _BACKEND / "alembic" / "versions"
 # policy" section of ``app/services/feature_modules.py`` for the criterion
 # each of these is derived from.
 EXPECTED_DEFAULTS: dict[str, bool] = {
+    # ── Core subsystems (#1068) ─────────────────────────────────────
+    # These two are the exception to #1069's "default-off unless core
+    # workflow" reasoning in the most literal way: they ARE the core
+    # workflow. They exist to be switched OFF by the minority of installs
+    # that run SpatiumDDI for only one of DNS / DHCP / IPAM, not to be
+    # discovered. Flipping either of these to False would ship an install
+    # with no DNS or no DHCP out of the box.
+    "core.dns": True,
+    "core.dhcp": True,
     # ── Network ─────────────────────────────────────────────────────
     "network.customer": False,
     "network.provider": False,
@@ -165,10 +174,11 @@ def test_the_default_on_set_stays_small() -> None:
     that happening again except a limit someone has to look at.
     """
     on = sorted(mid for mid, enabled in _catalog_defaults().items() if enabled)
-    assert len(on) <= 18, (
+    assert len(on) <= 20, (
         f"{len(on)} modules ship enabled: {on}. That is more than #1069 left on "
-        "(14) plus room to grow. Before raising this ceiling, check the additions "
-        "really are core workflow rather than features that are merely useful."
+        "(14, plus the two core subsystems #1068 added) with room to grow. Before "
+        "raising this ceiling, check the additions really are core workflow rather "
+        "than features that are merely useful."
     )
 
 
@@ -235,3 +245,54 @@ def test_no_new_migration_seeds_a_feature_module_row() -> None:
         "add it to EXPECTED_DEFAULTS above. If this migration genuinely has to touch "
         "the table, add it to _MIGRATIONS_TOUCHING_FEATURE_MODULE and say why."
     )
+
+
+# ── requires-chain integrity (#1068) ─────────────────────────────────
+
+
+def test_every_requires_names_a_real_module_and_the_graph_is_acyclic() -> None:
+    """``requires`` is a real gate, so a typo in it silently disables a
+    whole feature and a cycle would disable both ends of it.
+
+    ``_resolve_with_parents`` is deliberately forgiving at runtime — an
+    unknown parent resolves TRUE so a rename can never black out a
+    subtree in production — which means the catalog itself is the only
+    place this can be caught.
+    """
+    from app.services.feature_modules import MODULES
+
+    known = {m.id for m in MODULES}
+    for spec in MODULES:
+        for parent in spec.requires:
+            assert parent in known, (
+                f"{spec.id} requires {parent!r}, which is not in the catalog. "
+                "At runtime an unknown parent resolves enabled, so this would "
+                "fail open and silently."
+            )
+
+    # Depth-first cycle detection over the requires edges.
+    by_id = {m.id: m for m in MODULES}
+    state: dict[str, int] = {}  # 0 = visiting, 1 = done
+
+    def walk(mid: str, path: tuple[str, ...]) -> None:
+        if state.get(mid) == 1:
+            return
+        assert state.get(mid) != 0, f"requires cycle: {' → '.join([*path, mid])}"
+        state[mid] = 0
+        for parent in by_id[mid].requires:
+            walk(parent, (*path, mid))
+        state[mid] = 1
+
+    for spec in MODULES:
+        walk(spec.id, ())
+
+
+def test_a_core_subsystem_has_no_parent_of_its_own() -> None:
+    """``core.dns`` / ``core.dhcp`` are the roots. Giving either one a
+    parent would make the whole subsystem vanish behind some other
+    module's toggle, which is not what an operator reading "DNS" expects.
+    """
+    from app.services.feature_modules import MODULES_BY_ID
+
+    for mid in ("core.dns", "core.dhcp"):
+        assert MODULES_BY_ID[mid].requires == (), f"{mid} must stay a root of the requires graph."

@@ -14,6 +14,43 @@ import { featureModulesApi, type FeatureModuleEntry } from "@/lib/api";
  * the sidebar from an operator because the API hiccupped on a
  * background poll. The toggle write always errors loud.
  */
+/**
+ * Resolve the enabled set the way the server does (#1068).
+ *
+ * `entry.enabled` is a module's OWN state. A module is only actually on
+ * when its whole `requires` ancestry is on too — `get_enabled_modules` in
+ * `app/services/feature_modules.py` applies exactly this rule, and the two
+ * MUST agree: if the sidebar reads a child as enabled while the router has
+ * resolved it off, the operator gets a nav row whose page 404s.
+ *
+ * Matches the server's forgiving edges deliberately: an unknown parent id
+ * resolves TRUE (a rename must never black out a subtree), and a cycle
+ * resolves FALSE for the repeated id rather than recursing forever. The
+ * catalog itself is pinned acyclic and dangling-free by
+ * `tests/test_feature_module_defaults.py`.
+ */
+export function resolveEnabled(modules: FeatureModuleEntry[]): Set<string> {
+  const byId = new Map(modules.map((m) => [m.id, m]));
+  const memo = new Map<string, boolean>();
+
+  function resolve(id: string, seen: Set<string>): boolean {
+    const cached = memo.get(id);
+    if (cached !== undefined) return cached;
+    if (seen.has(id)) return false;
+    const entry = byId.get(id);
+    if (!entry) return true;
+    const ok =
+      entry.enabled &&
+      entry.requires.every((parent) => resolve(parent, new Set([...seen, id])));
+    memo.set(id, ok);
+    return ok;
+  }
+
+  return new Set(
+    modules.filter((m) => resolve(m.id, new Set())).map((m) => m.id),
+  );
+}
+
 export function useFeatureModules() {
   const query = useQuery({
     queryKey: ["feature-modules"],
@@ -22,7 +59,7 @@ export function useFeatureModules() {
   });
 
   const modules = query.data ?? [];
-  const enabledSet = new Set(modules.filter((m) => m.enabled).map((m) => m.id));
+  const enabledSet = resolveEnabled(modules);
 
   // ``enabled`` is the hot path — every NavItem in the sidebar calls
   // it. When we're still loading (or errored), default to true so we

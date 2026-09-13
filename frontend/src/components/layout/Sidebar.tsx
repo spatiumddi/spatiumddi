@@ -354,24 +354,42 @@ export function Sidebar({
                 onNavigate={mobileOpen ? onMobileClose : undefined}
               />
             ))}
-            <SubNavLabel label="IPAM" collapsed={effectiveCollapsed} />
-            {coreIpamNav.map((item) => (
-              <NavItem
-                key={item.to}
-                {...item}
-                collapsed={effectiveCollapsed}
-                onNavigate={mobileOpen ? onMobileClose : undefined}
-              />
-            ))}
-            <SubNavLabel label="DNS" collapsed={effectiveCollapsed} />
-            {dnsSectionNav.map((item) => (
-              <NavItem
-                key={item.to}
-                {...item}
-                collapsed={effectiveCollapsed}
-                onNavigate={mobileOpen ? onMobileClose : undefined}
-              />
-            ))}
+            {/* #1068 — both sub-groups go through the module filter and
+             *  their heading is suppressed when nothing survives it. The
+             *  DNS group carried module tags that nothing applied, so with
+             *  core.dns off you got a "DNS" heading over a lone Domains
+             *  row: not a missing feature, just a stray label that reads
+             *  like the menu has been reshuffled. */}
+            {(() => {
+              const ipamItems = filterByModule(coreIpamNav);
+              const dnsItems = filterByModule(dnsSectionNav);
+              return (
+                <>
+                  {ipamItems.length > 0 && (
+                    <SubNavLabel label="IPAM" collapsed={effectiveCollapsed} />
+                  )}
+                  {ipamItems.map((item) => (
+                    <NavItem
+                      key={item.to}
+                      {...item}
+                      collapsed={effectiveCollapsed}
+                      onNavigate={mobileOpen ? onMobileClose : undefined}
+                    />
+                  ))}
+                  {dnsItems.length > 0 && (
+                    <SubNavLabel label="DNS" collapsed={effectiveCollapsed} />
+                  )}
+                  {dnsItems.map((item) => (
+                    <NavItem
+                      key={item.to}
+                      {...item}
+                      collapsed={effectiveCollapsed}
+                      onNavigate={mobileOpen ? onMobileClose : undefined}
+                    />
+                  ))}
+                </>
+              );
+            })()}
           </NavSection>
 
           <NavSection

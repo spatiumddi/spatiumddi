@@ -24,6 +24,70 @@ the formatter handles the rest.
 
 ### Added
 
+- **`core.dns` / `core.dhcp` — turn a whole subsystem off (#1068).** An
+  operator running SpatiumDDI for DNS only, DHCP only or IPAM only had no
+  way to put the unused subsystem away: DNS and DHCP were two of four
+  fixed sidebar anchors that no feature module gated, so a DNS-only
+  install carried a DHCP sidebar entry, a DHCP dashboard tab, DHCP
+  affordances throughout IPAM, the DHCP copilot tools and the DHCP alert
+  rules, all pointing at nothing. Both modules ship **enabled**, so no
+  existing install changes; 16 of 55 modules now ship on.
+  **The agent routers are deliberately outside the gate**, and that is
+  the whole reason `dhcp/__init__.py` changed: `require_module` answers
+  **404**, and 404 is precisely the status that makes an agent discard
+  its JWT and re-bootstrap from its PSK. Gating the agent path would not
+  disable a fleet, it would put every live Kea agent into a re-bootstrap
+  loop. The DHCP agent router was nested inside `dhcp_router` and had to
+  be lifted out and mounted separately at the same `/dhcp` prefix (the
+  DNS side already had this shape). It keeps `wake_publishing` — unlike
+  the DNS agent router, which really is a pure consumer — because
+  `/dhcp/agents/lease-events` runs subnet DDNS through
+  `enqueue_record_op`, and `collect_wake` is a silent no-op with no
+  collector installed: dropping it would not error, lease-driven DNS
+  updates would just stop waking DNS agents and converge on the 12 s
+  safety tick.
+  **Disabling is refused while the subsystem still owns rows** (422
+  naming the counts), the same fail-closed stance as the #934 / #935
+  moves — the agents keep serving from cached config either way, so the
+  alternative is live state hidden behind a 404 with no way to reach it
+  from the UI. `/agents/register` is the one agent call that CREATES a
+  server row, so it now declines with **403** while the module is off;
+  without that, a still-running agent re-registers seconds after the
+  toggle and strands exactly the state the refusal exists to protect.
+  403 rather than 404 for the same re-bootstrap reason.
+  **`ModuleSpec` gained `requires`**, and it is a real gate rather than a
+  UI hint: `get_enabled_modules` resolves a module enabled only when its
+  whole ancestry is, so `dhcp.import`, `ipv6.router_advertisements`,
+  `dns.import`, `dns.dynamic_update_acl`, `security.dns_threat` and
+  `security.dnsbl` follow their parent and need no gate of their own. An
+  operator row saying ON does not outrank a disabled parent. The
+  frontend hook resolves the chain the same way — it previously read each
+  module's own `enabled` flag, which would have shown a sidebar row for a
+  child whose router had already resolved it off (the two-renderers class
+  from #878). Catalog integrity — no dangling parent, no cycles, core
+  modules stay roots — is pinned by a test, because `_resolve_with_parents`
+  is deliberately forgiving at runtime (an unknown parent resolves TRUE so
+  a rename can never black out a subtree) and the catalog is therefore the
+  only place a typo can be caught.
+  Also gated: 12 beat tasks, 13 alert rule types, 42 copilot tools, 8
+  global-search providers (which otherwise returned zones and scopes that
+  link into 404 pages), the sidebar anchors and DNS section, the dashboard
+  tabs and their queries, and the DNS/DHCP reads inside IPAM.
+  **`rogue_dhcp` is deliberately NOT gated**, the one entry that needed
+  arguing: its subject rows keep arriving on the ungated agent router, and
+  the rule matters MOST to an install that does not run DHCP, where
+  anything answering DHCP is by definition unauthorised. Its drill-down
+  page does 404 with the module off — the cost — but an alert naming the
+  offending IP and MAC beats silence.
+  The module gate in `evaluate_all` falls through with an empty match set
+  rather than `continue`-ing: a `continue` skips the open-event
+  reconciliation too, so a DHCP pool-exhaustion event that was firing when
+  the operator disabled DHCP would stay open forever with no evaluator
+  left that could ever close it. No migration — per #1069 a
+  `feature_module` row means "an operator changed this" and the shipped
+  default lives in the catalog, so the defaults are declared in
+  `backend/tests/test_feature_module_defaults.py` instead.
+
 
 - **E911 dispatchable location — SpatiumDDI answers "which room is
   this phone in, right now?" (#972, Phase 1a).** Behind the default-on

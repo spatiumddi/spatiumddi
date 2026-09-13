@@ -47,6 +47,7 @@ from app.drivers.dhcp import is_agentless
 from app.models.audit import AuditLog
 from app.models.dhcp import DHCPServer
 from app.models.settings import PlatformSettings
+from app.services.feature_modules import is_module_enabled
 
 logger = structlog.get_logger(__name__)
 
@@ -65,6 +66,10 @@ async def _run_pull() -> dict[str, Any]:
 
     try:
         async with session_factory() as db:
+            # #1068 — the DHCP/DNS subsystem can be switched off wholesale;
+            # do no work (and open no driver connections) when it is.
+            if not await is_module_enabled(db, "core.dhcp"):
+                return {"status": "disabled"}
             ps = await db.get(PlatformSettings, _SINGLETON_ID)
             if ps is None or not ps.dhcp_pull_leases_enabled:
                 return {"status": "disabled"}

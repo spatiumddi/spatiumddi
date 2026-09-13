@@ -303,6 +303,29 @@ async def agent_register(
     _psk: str = Depends(_require_bootstrap_key),
 ) -> AgentRegisterResponse:
     """Bootstrap registration — PSK → per-server JWT."""
+    # #1068 — registration is the one agent call that CREATES a server
+    # row, so it is the one that can undo the refuse-while-populated
+    # guard on the core.dhcp toggle: delete the servers, disable the
+    # module, and a still-running agent re-registers seconds later,
+    # leaving a live server stranded behind a 404 surface.
+    #
+    # Declined with 403, never 404. A 404 is what tells an agent its
+    # registration is gone and it should re-bootstrap from the PSK, so
+    # answering 404 here would produce exactly the tight re-bootstrap
+    # loop the ungated mount exists to avoid. 403 is terminal, logged by
+    # the agent, and leaves an already-registered agent's config
+    # long-poll and heartbeat working untouched.
+    from app.services.feature_modules import is_module_enabled  # noqa: PLC0415
+
+    if not await is_module_enabled(db, "core.dhcp"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "The DHCP subsystem is disabled on this control plane, so "
+                "new agents cannot register. Enable it under Settings → "
+                "Features."
+            ),
+        )
     group: DHCPServerGroup | None = None
     if body.group_name:
         res = await db.execute(

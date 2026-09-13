@@ -1179,6 +1179,7 @@ PROVIDERS: tuple[SearchProvider, ...] = (
         resource_types=("dns_group",),
         fn=search_dns_groups,
         shapes=TEXT_ONLY,
+        module="core.dns",
     ),
     SearchProvider(
         type="dns_zone",
@@ -1189,6 +1190,7 @@ PROVIDERS: tuple[SearchProvider, ...] = (
         # Reverse zones are named after addresses, but as ``…in-addr.arpa``
         # rather than dotted-quad, so an IP query never matches one.
         shapes=TEXT_ONLY,
+        module="core.dns",
     ),
     SearchProvider(
         type="dns_record",
@@ -1199,6 +1201,7 @@ PROVIDERS: tuple[SearchProvider, ...] = (
         # An A record's value IS an address — "which name points here?" is
         # one of the most common lookups in the product.
         shapes=TEXT_AND_IP,
+        module="core.dns",
     ),
     SearchProvider(
         type="dns_server",
@@ -1215,6 +1218,7 @@ PROVIDERS: tuple[SearchProvider, ...] = (
         resource_types=("dns_group",),
         fn=search_dns_views,
         shapes=TEXT_ONLY,
+        module="core.dns",
     ),
     SearchProvider(
         type="dns_blocklist",
@@ -1223,6 +1227,7 @@ PROVIDERS: tuple[SearchProvider, ...] = (
         resource_types=("dns_blocklist",),
         fn=search_dns_blocklists,
         shapes=TEXT_ONLY,
+        module="core.dns",
     ),
     # ── DHCP ──
     SearchProvider(
@@ -1232,6 +1237,7 @@ PROVIDERS: tuple[SearchProvider, ...] = (
         resource_types=("dhcp_scope",),
         fn=search_dhcp_scopes,
         shapes=TEXT_ONLY,
+        module="core.dhcp",
     ),
     SearchProvider(
         type="dhcp_reservation",
@@ -1241,6 +1247,7 @@ PROVIDERS: tuple[SearchProvider, ...] = (
         fn=search_dhcp_reservations,
         # The reservation table is where a MAC lookup usually lands.
         shapes=frozenset({"text", "ip", "mac"}),
+        module="core.dhcp",
     ),
     SearchProvider(
         type="dhcp_server",
@@ -1249,6 +1256,7 @@ PROVIDERS: tuple[SearchProvider, ...] = (
         resource_types=("dhcp_server",),
         fn=search_dhcp_servers,
         shapes=TEXT_AND_IP,
+        module="core.dhcp",
     ),
     # ── Network ──
     SearchProvider(

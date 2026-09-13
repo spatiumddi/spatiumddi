@@ -26,6 +26,7 @@ from app.models.ipam import IPAddress
 # imports them back here.
 from app.services.dhcp.lease_cleanup import _load_subnet_cache, _resolve_lease_subnet_id
 from app.services.dhcp.lease_history import record_lease_history
+from app.services.feature_modules import is_module_enabled
 
 logger = structlog.get_logger(__name__)
 
@@ -46,6 +47,10 @@ EXPIRED_DELETE_GRACE = timedelta(hours=24)
 async def _sweep() -> tuple[int, int]:
     cutoff = datetime.now(UTC) - EXPIRY_GRACE
     async with task_session() as db:
+        # #1068 — the DHCP/DNS subsystem can be switched off wholesale;
+        # do no work (and open no driver connections) when it is.
+        if not await is_module_enabled(db, "core.dhcp"):
+            return (0, 0)
         # Find any active-marked lease whose actual expiry passed the grace.
         res = await db.execute(
             select(DHCPLease).where(

@@ -6,13 +6,19 @@ import {
   ShieldAlert,
   ToggleLeft,
 } from "lucide-react";
-import { featureModulesApi, type FeatureModuleEntry } from "@/lib/api";
+import {
+  featureModulesApi,
+  formatApiError,
+  type FeatureModuleEntry,
+} from "@/lib/api";
 import {
   APPROVAL_QUEUED_MESSAGE,
   CHANGE_REQUEST_QUERY_KEY,
   handleApprovalQueued,
 } from "@/lib/approvalQueue";
 import { usePermissions } from "@/hooks/usePermissions";
+import { resolveEnabled } from "@/hooks/useFeatureModules";
+import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { useSessionState } from "@/lib/useSessionState";
 import { cn } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
@@ -96,6 +102,11 @@ export function FeaturesPage() {
   const [queuedNotice, setQueuedNotice] = useState<string | null>(null);
   // Enable-time opt-in modal for governance.approvals (protect_controls).
   const [enableApprovalsModal, setEnableApprovalsModal] = useState(false);
+  // Module the operator is about to switch OFF, pending confirmation.
+  const [disableTarget, setDisableTarget] = useState<FeatureModuleEntry | null>(
+    null,
+  );
+  const [toggleError, setToggleError] = useState<string | null>(null);
   // Break-glass force-disable affordance (superadmin escape hatch).
   const [breakGlass, setBreakGlass] = useState(false);
 
@@ -130,6 +141,14 @@ export function FeaturesPage() {
       // refresh.
       qc.invalidateQueries({ queryKey: ["settings"] });
     },
+    // Without this a refusal is silent. Disabling core.dns / core.dhcp 422s
+    // while the subsystem still owns servers, zones or scopes (#1068), and
+    // that response body is the only place the counts are reported — the
+    // toggle would otherwise just snap back with no explanation.
+    onError: (err) => {
+      setToggleError(formatApiError(err, "Could not change this feature."));
+      qc.invalidateQueries({ queryKey: ["feature-modules"] });
+    },
   });
 
   // Route a module toggle. governance.approvals gets special handling:
@@ -137,11 +156,59 @@ export function FeaturesPage() {
   //  - disabling → fire the toggle (the 202 path handles the locked case).
   const handleToggle = (m: FeatureModuleEntry, next: boolean) => {
     setQueuedNotice(null);
+    setToggleError(null);
     if (m.id === APPROVALS_MODULE_ID && next) {
       setEnableApprovalsModal(true);
       return;
     }
+    // Turning something OFF is the direction that removes surface area, so
+    // it is confirmed and explained. Turning it back ON is not: it only
+    // ever restores, and a prompt there would be friction for nothing.
+    if (!next) {
+      setDisableTarget(m);
+      return;
+    }
     toggleMutation.mutate({ id: m.id, enabled: next });
+  };
+
+  // #1068 — every module by id, so a row can look its parents up. Built
+  // from the unfiltered list rather than the active tab's slice: a parent
+  // can sit in a different group from its child (security.dnsbl is under
+  // Security, core.dns under DNS), and on the Integrations tab it would
+  // not be in the slice at all.
+  const byId = useMemo(
+    () => new Map((data ?? []).map((m) => [m.id, m])),
+    [data],
+  );
+
+  // Resolved ancestry, not just the direct parent's own flag. With a
+  // depth-2 chain (A requires B requires C, C off) checking only B's
+  // ``enabled`` reports A as fine, so the row would render a live-looking
+  // toggle that changes nothing. ``resolveEnabled`` is the same function
+  // the sidebar and the server use, so all three agree.
+  const resolved = useMemo(() => resolveEnabled(data ?? []), [data]);
+
+  // Modules that would switch off with `id` — transitive, so a future
+  // depth-2 chain is reported in full rather than one level of it. Only
+  // modules that are currently ON are listed: naming a feature that is
+  // already off as something you are about to lose is just noise.
+  const dependentsOf = (id: string): FeatureModuleEntry[] => {
+    const all = data ?? [];
+    const doomed = new Set([id]);
+    let grew = true;
+    while (grew) {
+      grew = false;
+      for (const m of all) {
+        if (doomed.has(m.id)) continue;
+        if (m.requires.some((parent) => doomed.has(parent))) {
+          doomed.add(m.id);
+          grew = true;
+        }
+      }
+    }
+    return all.filter(
+      (m) => m.id !== id && doomed.has(m.id) && resolved.has(m.id),
+    );
   };
 
   const grouped = useMemo(() => {
@@ -258,6 +325,22 @@ export function FeaturesPage() {
         </div>
       )}
 
+      {/* #1068 — a refused toggle. Disabling core.dns / core.dhcp 422s while
+       *  the subsystem still owns servers, zones or scopes, and the response
+       *  body names the counts; without this the toggle just snapped back. */}
+      {toggleError && (
+        <div className="mx-4 mt-3 flex items-start gap-2 rounded-md border border-red-500/40 bg-red-500/10 p-3 text-sm text-red-700 dark:text-red-300">
+          <span className="flex-1">{toggleError}</span>
+          <button
+            type="button"
+            onClick={() => setToggleError(null)}
+            className="shrink-0 rounded px-1 text-xs underline"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
       {isLoading && (
         <div className="p-4 text-sm text-muted-foreground">Loading…</div>
       )}
@@ -340,6 +423,18 @@ export function FeaturesPage() {
                 >
                   {modules.map((m) => {
                     const isOverridden = m.enabled !== m.default_enabled;
+                    // #1068 — a module under a disabled parent still reports
+                    // enabled=true (that is its own state), but resolves off
+                    // everywhere it matters. Say so, and make the toggle
+                    // inert: flipping it here would appear to do nothing.
+                    const blockedBy = m.requires.filter(
+                      (parentId) =>
+                        byId.has(parentId) && !resolved.has(parentId),
+                    );
+                    const isBlocked = blockedBy.length > 0;
+                    const blockedLabel = blockedBy
+                      .map((parentId) => byId.get(parentId)?.label ?? parentId)
+                      .join(", ");
                     return (
                       <div
                         key={m.id}
@@ -361,6 +456,14 @@ export function FeaturesPage() {
                                 overridden
                               </span>
                             )}
+                            {isBlocked && (
+                              <span
+                                className="rounded bg-muted px-1 py-px text-[9px] font-medium text-muted-foreground"
+                                title={`${blockedLabel} is disabled, so this feature is off regardless of the toggle.`}
+                              >
+                                requires {blockedLabel}
+                              </span>
+                            )}
                           </div>
                           <p className="mt-0.5 text-xs leading-snug text-muted-foreground">
                             {m.description}
@@ -369,8 +472,8 @@ export function FeaturesPage() {
                         <div className="mt-0.5">
                           <Toggle
                             label={`${m.enabled ? "Disable" : "Enable"} ${m.label}`}
-                            checked={m.enabled}
-                            disabled={toggleMutation.isPending}
+                            checked={m.enabled && !isBlocked}
+                            disabled={toggleMutation.isPending || isBlocked}
                             onChange={(v) => handleToggle(m, v)}
                           />
                         </div>
@@ -412,6 +515,36 @@ export function FeaturesPage() {
         )}
       </div>
 
+      {/* #1068 — confirm + explain before any module is switched OFF. The
+       *  question operators actually have is "will I lose my data", so the
+       *  modal leads with the answer (no) rather than with a warning. */}
+      <ConfirmModal
+        open={disableTarget !== null}
+        title={`Turn off ${disableTarget?.label ?? ""}?`}
+        tone="destructive"
+        confirmLabel={`Turn off ${disableTarget?.label ?? ""}`}
+        loading={toggleMutation.isPending}
+        requireCheckboxLabel={
+          disableTarget && CORE_SUBSYSTEM_IDS.has(disableTarget.id)
+            ? `I understand the whole ${disableTarget.label} section will be hidden and its API will stop responding.`
+            : undefined
+        }
+        message={
+          disableTarget ? (
+            <DisableModuleMessage
+              module={disableTarget}
+              dependents={dependentsOf(disableTarget.id)}
+            />
+          ) : null
+        }
+        onConfirm={() => {
+          if (!disableTarget) return;
+          toggleMutation.mutate({ id: disableTarget.id, enabled: false });
+          setDisableTarget(null);
+        }}
+        onClose={() => setDisableTarget(null)}
+      />
+
       {/* #62 enable-time opt-in: when turning ON Approval workflows, offer to
        *  also turn on the self-governance lock in the same call. */}
       {enableApprovalsModal && (
@@ -450,6 +583,82 @@ export function FeaturesPage() {
 // ``protect_controls`` into the toggle call — enabling the lock in the same
 // request (strengthening → single-person, no approval needed). Leaving it
 // unchecked enables the module without the lock; it can be turned on later.
+
+// Core subsystems (#1068). These get the extra acknowledgement checkbox:
+// they are the only modules whose toggle removes a whole sidebar section,
+// its dashboard tab, its REST surface and its background jobs at once.
+const CORE_SUBSYSTEM_IDS = new Set(["core.dns", "core.dhcp"]);
+
+/**
+ * What disabling a module actually does, written out for the operator.
+ *
+ * The headline is deliberately the reassurance rather than the warning,
+ * because it is the question people actually have and the answer is
+ * unambiguous: a feature module is a visibility and scheduling switch, not
+ * a delete. Nothing in `set_module_enabled` touches a domain table — it
+ * upserts one row in `feature_module` — so every zone, scope, lease and
+ * reservation is exactly where it was when the module comes back on.
+ */
+function DisableModuleMessage({
+  module,
+  dependents,
+}: {
+  module: FeatureModuleEntry;
+  dependents: FeatureModuleEntry[];
+}) {
+  const isCore = CORE_SUBSYSTEM_IDS.has(module.id);
+  return (
+    <div className="space-y-3 text-sm">
+      <p>
+        <span className="font-medium text-foreground">No data is deleted.</span>{" "}
+        Disabling a feature hides it — it does not remove anything. Every record
+        it manages stays in the database untouched, and turning the feature back
+        on restores the surface exactly as it was.
+      </p>
+      <div>
+        <p className="font-medium text-foreground">While it is off:</p>
+        <ul className="mt-1 list-disc space-y-0.5 pl-5 text-muted-foreground">
+          <li>its sidebar section and dashboard panels are hidden</li>
+          <li>
+            its API endpoints answer <code className="text-xs">404</code>, so
+            scripts and integrations calling them will fail
+          </li>
+          <li>
+            its scheduled background jobs stop, and its alert rules stop
+            evaluating — any alert of its that is currently open is resolved
+          </li>
+          <li>its Operator Copilot tools disappear from the tool list</li>
+        </ul>
+      </div>
+      {isCore && (
+        <div>
+          <p className="font-medium text-foreground">
+            What keeps running anyway:
+          </p>
+          <ul className="mt-1 list-disc space-y-0.5 pl-5 text-muted-foreground">
+            <li>
+              already-registered agents keep serving from their current config —
+              disabling the subsystem here does not stop DNS or DHCP on the wire
+            </li>
+            <li>new agents cannot register until it is re-enabled</li>
+          </ul>
+        </div>
+      )}
+      {dependents.length > 0 && (
+        <div>
+          <p className="font-medium text-foreground">
+            {dependents.length} dependent feature
+            {dependents.length === 1 ? "" : "s"} will switch off with it:
+          </p>
+          <p className="mt-1 text-muted-foreground">
+            {dependents.map((d) => d.label).join(", ")}. Their own settings are
+            kept, and they come back when this one does.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function EnableApprovalsModal({
   onClose,

@@ -25,12 +25,17 @@ from app.celery_app import celery_app
 from app.db import task_session
 from app.models.dhcp import DHCPLeaseHistory
 from app.models.settings import PlatformSettings
+from app.services.feature_modules import is_module_enabled
 
 logger = structlog.get_logger(__name__)
 
 
 async def _prune() -> int:
     async with task_session() as db:
+        # #1068 — the DHCP/DNS subsystem can be switched off wholesale;
+        # do no work (and open no driver connections) when it is.
+        if not await is_module_enabled(db, "core.dhcp"):
+            return 0
         settings = (await db.execute(select(PlatformSettings))).scalar_one_or_none()
         retention_days = (
             getattr(settings, "dhcp_lease_history_retention_days", 90) if settings else 90

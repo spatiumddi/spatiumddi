@@ -63,6 +63,13 @@ class ModuleSpec:
     group: str
     description: str
     default_enabled: bool = True
+    # Parent modules this one is meaningless without (#1068). A module
+    # resolves ENABLED only if every ancestor does — see
+    # ``get_enabled_modules``. This is a real gate, not a UI hint: a
+    # child left independently on when its parent is off would keep a
+    # router mounted and a sidebar row visible, pointing at a subsystem
+    # the operator has turned off.
+    requires: tuple[str, ...] = ()
 
 
 # Stable dotted-name ids. A new module appends here and does NOT seed a
@@ -245,6 +252,7 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         group="Network",
         description="Manage IPv6 Router Advertisements (radvd) per subnet — M/O flags derived from the DHCPv6 mode, RDNSS/DNSSL from DNS settings, prefix + router lifetimes — plus passive rogue-RA detection with an expected-router allowlist and a rogue_ra alert. Discovery toggle only; emitting RAs needs a per-scope opt-in and radvd on the DHCP agent, and the sniffer needs DHCP_RA_SNIFFER_ENABLED.",
         default_enabled=False,
+        requires=("core.dhcp",),
     ),
     # AI — operator copilot, gated as a whole.
     ModuleSpec(
@@ -319,6 +327,39 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         ),
         default_enabled=False,
     ),
+    # DNS — the subsystem itself (#1068), then the togglable extras
+    # beneath it.
+    #
+    # ``core.dns`` exists so a DHCP-only or IPAM-only install can put the
+    # whole DNS surface away: sidebar anchor, /dns routers, the DNS
+    # dashboard panels, the DNS beat tasks and every DNS copilot tool.
+    # Default-ON, and it stays that way — this is core workflow under the
+    # #1069 criterion, and the module is here to be turned OFF by the
+    # minority of installs that do not run DNS, not to be discovered.
+    #
+    # NOT gated by it: ``/dns/agents/*``. That router is mounted
+    # separately at the v1 level precisely so this gate cannot reach it.
+    # ``require_module`` answers 404, and 404 is the status that makes an
+    # agent throw its JWT away and re-bootstrap from the PSK (see "Agent
+    # bootstrap + reconnection" in CLAUDE.md) — so gating the agent path
+    # would not disable a fleet, it would put it in a re-bootstrap loop.
+    #
+    # Turning it off is REFUSED while any dns_server or dns_zone row
+    # exists (see the toggle endpoint): a toggle that strands a running
+    # fleet behind a 404 is worse than no toggle.
+    ModuleSpec(
+        id="core.dns",
+        label="DNS",
+        group="DNS",
+        description=(
+            "The DNS subsystem as a whole — zones, records, views, server "
+            "groups, blocklists and the DNS dashboard panels. Turn it off "
+            "on an IPAM-only or DHCP-only install to put the entire DNS "
+            "surface away; every DNS feature below depends on it. Agent "
+            "registration and config polling are deliberately unaffected, "
+            "and disabling is refused while any DNS server or zone exists."
+        ),
+    ),
     # DNS — togglable extras under the Settings → Import surface and
     # the DNS sidebar group. The importer is one-shot (issue #128) —
     # operators upload BIND9 configs / live-pull from Windows DNS or
@@ -332,6 +373,7 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         label="DNS configuration import",
         group="DNS",
         description="One-shot import from BIND9 / Windows DNS / PowerDNS into SpatiumDDI's native zones + records. Settings → Import → DNS surface; sources gate behind their own credential / file-upload step.",
+        requires=("core.dns",),
     ),
     # Dynamic-update (RFC 2136) ACLs on zones (issue #641). Lets an
     # operator authorize third-party DDNS writers (an AD DC, a DHCP
@@ -345,6 +387,25 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         label="Dynamic update ACLs",
         group="DNS",
         description="Operator-configurable RFC 2136 dynamic-update ACLs on DNS zones — authorize external DDNS writers (AD DC, DHCP server) by TSIG key or source IP/CIDR. BIND9 + PowerDNS express it natively; Windows maps coarsely; cloud drivers can't (the write 422s).",
+        requires=("core.dns",),
+    ),
+    # DHCP — the subsystem itself (#1068). Mirror of ``core.dns`` above,
+    # including the agent carve-out (``/dhcp/agents/*``, which #1068 had
+    # to lift OUT of ``dhcp_router`` to keep it reachable) and the
+    # refuse-while-populated rule (dhcp_server / dhcp_scope).
+    ModuleSpec(
+        id="core.dhcp",
+        label="DHCP",
+        group="DHCP",
+        description=(
+            "The DHCP subsystem as a whole — servers, scopes, pools, "
+            "reservations, leases, client classes and the DHCP dashboard "
+            "panels, plus the DHCP affordances inside IPAM. Turn it off on "
+            "a DNS-only or IPAM-only install; every DHCP feature below "
+            "depends on it. Agent registration and config polling are "
+            "deliberately unaffected, and disabling is refused while any "
+            "DHCP server or scope exists."
+        ),
     ),
     # DHCP — sister importer to ``dns.import`` (issue #129). One-shot
     # import of scopes / pools / reservations / classes from Kea JSON /
@@ -357,6 +418,7 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         label="DHCP configuration import",
         group="DHCP",
         description="One-shot import from Kea / Windows DHCP / ISC dhcpd.conf into SpatiumDDI's native scopes + pools + reservations + classes. Settings → Import → DHCP surface; sources gate behind their own credential / file-upload step.",
+        requires=("core.dhcp",),
     ),
     # IPAM — NetBox read-only one-shot migration importer (issue #36).
     # Sister to ``dns.import`` / ``dhcp.import``: pulls prefixes / IP
@@ -591,6 +653,7 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
             "server group."
         ),
         default_enabled=False,
+        requires=("core.dns",),
     ),
     # Security — active block sync / write-back enforcement (#601). The
     # deliberate, guarded exception to the read-only-mirror stance: pushes
@@ -633,6 +696,7 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         group="Security",
         description="Check every public-facing IP SpatiumDDI knows (public IPAM addresses, internet-facing subnets, NAT/PAT egress addresses, and operator-pinned IPs) against the major DNS blocklists (Spamhaus ZEN, Barracuda, SpamCop, SORBS, …) on a daily reversed-octet sweep — catching mail-deliverability / reputation problems before users report them. Discovery toggle only: no external DNS queries run until you enable the sweep (Settings → dnsbl_monitoring_enabled) and turn on at least one list.",
         default_enabled=False,
+        requires=("core.dns",),
     ),
 )
 
@@ -684,6 +748,37 @@ def invalidate_cache() -> None:
     _cache_loaded_at = 0.0
 
 
+def _resolve_with_parents(
+    module_id: str, own: dict[str, bool], _seen: frozenset[str] = frozenset()
+) -> bool:
+    """Is ``module_id`` enabled, accounting for ``requires`` (#1068)?
+
+    A module is enabled only when its own state is on AND every ancestor
+    resolves enabled. Without this a child could sit on while its parent
+    is off — which does not read as "partly on", it reads as a sidebar
+    row and a mounted router pointing at a subsystem the operator turned
+    off.
+
+    An unknown parent id resolves TRUE, matching ``is_module_enabled``:
+    a renamed or removed module must never silently disable its
+    children. Cycles resolve FALSE for the repeated id rather than
+    recursing forever; ``tests/test_feature_module_defaults.py`` refuses
+    a cyclic or dangling ``requires`` at the catalog level, so this is a
+    backstop and not the enforcement.
+    """
+    if module_id in _seen:
+        return False
+    if module_id not in own:
+        return True
+    if not own[module_id]:
+        return False
+    spec = MODULES_BY_ID.get(module_id)
+    if spec is None or not spec.requires:
+        return True
+    seen = _seen | {module_id}
+    return all(_resolve_with_parents(parent, own, seen) for parent in spec.requires)
+
+
 async def get_enabled_modules(db: AsyncSession) -> set[str]:
     """Return the set of currently-enabled module ids.
 
@@ -691,6 +786,8 @@ async def get_enabled_modules(db: AsyncSession) -> set[str]:
         for each module in the catalog:
             if a DB override exists, honour it
             else honour the catalog's default_enabled
+        then drop any module whose ``requires`` chain is not fully
+        enabled (#1068).
     """
     global _cache_loaded_at, _cached_enabled
     now = time.monotonic()
@@ -700,11 +797,10 @@ async def get_enabled_modules(db: AsyncSession) -> set[str]:
     rows = (await db.execute(select(FeatureModule))).scalars().all()
     overrides: dict[str, bool] = {row.id: row.enabled for row in rows}
 
-    enabled: set[str] = set()
-    for spec in MODULES:
-        is_on = overrides.get(spec.id, spec.default_enabled)
-        if is_on:
-            enabled.add(spec.id)
+    own: dict[str, bool] = {
+        spec.id: overrides.get(spec.id, spec.default_enabled) for spec in MODULES
+    }
+    enabled = {mid for mid in own if _resolve_with_parents(mid, own)}
 
     _cached_enabled = enabled
     _cache_loaded_at = now
