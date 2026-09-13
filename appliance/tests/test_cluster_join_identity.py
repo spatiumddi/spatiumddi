@@ -41,6 +41,10 @@ SCRIPT = (
 # files are the #590 regression guard; db/tls/cred were already covered.
 IDENTITY_ENTRIES = ("db", "tls", "cred", "token", "agent-token", "node-token")
 
+# What k3s writes to agent/images/.cache.json once it has imported the baked
+# tarballs: per file, the size + mtime it will skip the file on next start.
+IMPORT_CACHE = '{"airgap.tar": {"size": 5, "modTime": "2026-09-13T00:00:00Z", "images": ["x"]}}'
+
 
 def _tree(tmp_path: Path) -> dict[str, Path]:
     server = tmp_path / "k3s" / "server"
@@ -59,6 +63,13 @@ def _tree(tmp_path: Path) -> dict[str, Path]:
 
     (agent / "images").mkdir(parents=True)
     (agent / "images" / "airgap.tar").write_text("baked")
+    # k3s's import cache (persisted by k3s.service) and the containerd
+    # store it describes — the cache must leave with the store, never
+    # outlive it (a kept cache + a wiped store = ErrImageNeverPull on
+    # every pod of the joiner).
+    (agent / "images" / ".cache.json").write_text(IMPORT_CACHE)
+    (agent / "containerd").mkdir()
+    (agent / "containerd" / "io.containerd.content.v1.content").mkdir()
     (agent / "client-kubelet.crt").write_text("kubelet")
 
     node_pw = tmp_path / "node" / "password"
@@ -133,6 +144,67 @@ def test_wipe_keeps_baked_airgap_images(tmp_path: Path) -> None:
     assert not (t["agent"] / "client-kubelet.crt").exists()
     assert not t["node_pw"].exists()
     assert not t["kubeconfig"].exists()
+
+
+def test_wipe_moves_the_import_cache_aside_with_the_containerd_store(tmp_path: Path) -> None:
+    """The wipe takes agent/containerd (where the tarballs were imported)
+    but keeps agent/images. k3s's import cache in that dir re-imports a
+    tarball only on a size/mtime change, so a cache that outlived the store
+    would tell the fresh start every image is present when none is — every
+    pod on the joiner would sit in ErrImageNeverPull (imagePullPolicy:
+    Never on the appliance). The cache goes aside with the store."""
+    t = _tree(tmp_path)
+    env = _env(tmp_path, t)
+    proc = _run(env, 'backup_and_wipe_identity join > "$SPATIUM_RELEASE_STATE/bak_path"')
+    assert proc.returncode == 0, proc.stderr
+
+    assert not (t["agent"] / "containerd").exists(), "the store must leave with the identity"
+    assert not (t["agent"] / "images" / ".cache.json").exists(), (
+        "the import cache survived the wipe of the store it describes — the fresh "
+        "k3s would skip every tarball and the joiner's pods would never find an image"
+    )
+    assert (t["agent"] / "images" / "airgap.tar").read_text() == "baked"
+    bak = Path((Path(env["SPATIUM_RELEASE_STATE"]) / "bak_path").read_text().strip())
+    assert (bak / "agent-images-cache.json").read_text() == IMPORT_CACHE
+    assert (bak / "agent" / "containerd").is_dir()
+
+
+def test_restore_puts_back_the_cache_that_matches_the_restored_store(tmp_path: Path) -> None:
+    """A rollback brings the OLD containerd store back. Whatever cache the
+    failed join's k3s wrote meanwhile describes the store that just left;
+    the backed-up one describes the store that just returned."""
+    t = _tree(tmp_path)
+    env = _env(tmp_path, t)
+    proc = _run(
+        env,
+        'bak="$(backup_and_wipe_identity join)"\n'
+        # the fresh (failed) join's k3s imported into a NEW store and cached it
+        'printf \'%s\' \'{"airgap.tar": {"size": 5, "images": ["new-store"]}}\' '
+        '> "$SPATIUM_K3S_AGENT_DIR/images/.cache.json"\n'
+        'restore_identity "$bak"',
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    assert (t["agent"] / "containerd" / "io.containerd.content.v1.content").is_dir()
+    assert (t["agent"] / "images" / ".cache.json").read_text() == IMPORT_CACHE
+    assert (t["agent"] / "images" / "airgap.tar").read_text() == "baked"
+
+
+def test_restore_without_a_backed_up_cache_leaves_none(tmp_path: Path) -> None:
+    """No cache before the join means no cache after the rollback either:
+    the next start re-imports, which is the safe direction."""
+    t = _tree(tmp_path)
+    (t["agent"] / "images" / ".cache.json").unlink()
+    env = _env(tmp_path, t)
+    proc = _run(
+        env,
+        'bak="$(backup_and_wipe_identity join)"\n'
+        'printf \'%s\' \'{"airgap.tar": {"size": 5}}\' '
+        '> "$SPATIUM_K3S_AGENT_DIR/images/.cache.json"\n'
+        'restore_identity "$bak"',
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert not (t["agent"] / "images" / ".cache.json").exists()
 
 
 def test_restore_round_trips_every_identity_entry(tmp_path: Path) -> None:
