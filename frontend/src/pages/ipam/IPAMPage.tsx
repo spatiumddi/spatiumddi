@@ -1160,9 +1160,13 @@ function DnsSettingsSection({
   fallbackSpaceId?: string | null;
   hideInheritToggle?: boolean;
 }) {
+  // #1068 — mirror of the DHCP gate below; DNS can be switched off too.
+  const { enabled: dnsFeature, ready: dnsFeatureReady } = useFeatureModules();
+  const dnsOn = dnsFeatureReady && dnsFeature("core.dns");
   const { data: allGroups = [] } = useQuery({
     queryKey: ["dns-groups"],
     queryFn: dnsApi.listGroups,
+    enabled: dnsOn,
     staleTime: 60_000,
   });
 
@@ -1194,6 +1198,10 @@ function DnsSettingsSection({
       queryKey: ["dns-zones", gId],
       queryFn: () => dnsApi.listZones(gId),
       staleTime: 60_000,
+      // Needs its own gate, unlike the dashboard's: these ids come from
+      // the inherited block/space settings, not from the dns-groups query
+      // that the module gate empties.
+      enabled: dnsOn,
     })),
   });
   const allAvailableZones: DNSZone[] = zoneQueries.flatMap(
@@ -1368,10 +1376,17 @@ function DhcpSettingsSection({
   fallbackSpaceId?: string | null;
   hideInheritToggle?: boolean;
 }) {
+  // #1068 — DHCP can be switched off wholesale; these reads 404 then.
+  // ``ready`` matters: ``enabled`` answers true while the module set is
+  // still loading, so without it each of these fires once on a hard
+  // reload before the real state is known.
+  const { enabled: dhcpFeature, ready: dhcpFeatureReady } = useFeatureModules();
+  const dhcpOn = dhcpFeatureReady && dhcpFeature("core.dhcp");
   const { data: allGroups = [] } = useQuery({
     queryKey: ["dhcp-groups"],
     queryFn: () => dhcpApi.listGroups(),
     staleTime: 60_000,
+    enabled: dhcpOn,
   });
 
   const { data: blockDhcp } = useQuery({
@@ -3211,9 +3226,16 @@ function AddAddressModal({
 
   // Scopes load unconditionally (cheap) so we can do the dynamic-pool
   // check + pool warnings even before the user flips to ``static_dhcp``.
+  // #1068 — DHCP can be switched off wholesale; these reads 404 then.
+  // ``ready`` matters: ``enabled`` answers true while the module set is
+  // still loading, so without it each of these fires once on a hard
+  // reload before the real state is known.
+  const { enabled: dhcpFeature, ready: dhcpFeatureReady } = useFeatureModules();
+  const dhcpOn = dhcpFeatureReady && dhcpFeature("core.dhcp");
   const { data: dhcpScopes = [] } = useQuery({
     queryKey: ["dhcp-scopes-subnet", subnetId],
     queryFn: () => dhcpApi.listScopesBySubnet(subnetId),
+    enabled: dhcpOn,
   });
   const poolQueries = useQueries({
     queries: dhcpScopes.map((sc) => ({
@@ -4726,9 +4748,16 @@ function SubnetDetail({
   });
 
   // DHCP pool membership — derive which pool (if any) each IP falls within.
+  // #1068 — DHCP can be switched off wholesale; these reads 404 then.
+  // ``ready`` matters: ``enabled`` answers true while the module set is
+  // still loading, so without it each of these fires once on a hard
+  // reload before the real state is known.
+  const { enabled: dhcpFeature, ready: dhcpFeatureReady } = useFeatureModules();
+  const dhcpOn = dhcpFeatureReady && dhcpFeature("core.dhcp");
   const { data: dhcpScopes = [] } = useQuery({
     queryKey: ["dhcp-scopes-subnet", subnet.id],
     queryFn: () => dhcpApi.listScopesBySubnet(subnet.id),
+    enabled: dhcpOn,
   });
   const allPoolQueries = useQueries({
     queries: dhcpScopes.map((sc) => ({
@@ -8177,15 +8206,23 @@ type DhcpServerSyncState =
 
 function useDhcpSync(subnetId: string, enabled: boolean) {
   const qc = useQueryClient();
+  // #1068 — DHCP can be switched off wholesale; these reads 404 then.
+  // ``ready`` matters: ``enabled`` answers true while the module set is
+  // still loading, so without it each of these fires once on a hard
+  // reload before the real state is known.
+  const { enabled: dhcpFeature, ready: dhcpFeatureReady } = useFeatureModules();
+  const dhcpOn = dhcpFeatureReady && dhcpFeature("core.dhcp");
   const { data: scopes = [] } = useQuery({
     queryKey: ["dhcp-scopes-subnet", subnetId],
     queryFn: () => dhcpApi.listScopesBySubnet(subnetId),
-    enabled,
+    enabled: enabled && dhcpOn,
   });
   const { data: servers = [] } = useQuery({
     queryKey: ["dhcp-servers"],
     queryFn: () => dhcpApi.listServers(),
-    enabled,
+    // Shares the ["dhcp-servers"] key with the dashboard, so an ungated
+    // 404 here would poison that cache entry for the whole app.
+    enabled: enabled && dhcpOn,
   });
   // Under the group-centric model, a scope targets a group, and every
   // member of that group serves the subnet. Fan the sync out to every
@@ -8569,10 +8606,16 @@ function EditAddressModal({
   const needsDhcpScope =
     status === "static_dhcp" && !address.static_assignment_id;
 
+  // #1068 — DHCP can be switched off wholesale; these reads 404 then.
+  // ``ready`` matters: ``enabled`` answers true while the module set is
+  // still loading, so without it each of these fires once on a hard
+  // reload before the real state is known.
+  const { enabled: dhcpFeature, ready: dhcpFeatureReady } = useFeatureModules();
+  const dhcpOn = dhcpFeatureReady && dhcpFeature("core.dhcp");
   const { data: dhcpScopes = [] } = useQuery({
     queryKey: ["dhcp-scopes-subnet", address.subnet_id],
     queryFn: () => dhcpApi.listScopesBySubnet(address.subnet_id),
-    enabled: needsDhcpScope,
+    enabled: needsDhcpScope && dhcpOn,
   });
 
   useEffect(() => {

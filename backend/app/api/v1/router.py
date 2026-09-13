@@ -32,6 +32,7 @@ from app.api.v1.custom_fields.router import router as custom_fields_router
 from app.api.v1.cutover import router as cutover_router
 from app.api.v1.dashboards import router as dashboards_router
 from app.api.v1.dhcp import router as dhcp_router
+from app.api.v1.dhcp.agents import router as dhcp_agents_router
 from app.api.v1.dhcp.ra_routers import router as ra_routers_router
 from app.api.v1.dhcp_import.router import router as dhcp_import_router
 from app.api.v1.diagnostics import router as diagnostics_router
@@ -221,9 +222,34 @@ api_v1_router.include_router(
     prefix="/dhcp",
     tags=["dhcp"],
     # #358 — DHCP CRUD shifts the rebuilt-bundle ETag; publish a wake on
-    # commit so parked Kea agents re-poll immediately. (The DHCP agent
-    # long-poll lives inside this router but never calls collect_wake, so
-    # its own etag-bookkeeping commit can't self-wake.)
+    # commit so parked Kea agents re-poll immediately.
+    #
+    # #1068 — the whole operator-facing DHCP surface hangs off core.dhcp
+    # so a DNS-only or IPAM-only install can put it away. The agent
+    # router used to live INSIDE this one and was lifted out (next
+    # include) because this gate answers 404, which is exactly what makes
+    # an agent re-bootstrap from its PSK.
+    dependencies=[Depends(require_module("core.dhcp")), Depends(wake_publishing)],
+)
+# DHCP agent bootstrap / config long-poll / lease + log ingest. Same
+# ``/dhcp`` prefix as above so the wire path is unchanged, but mounted
+# here rather than inside ``dhcp_router`` so it does NOT carry the
+# core.dhcp gate: turning DHCP off must stop the operator surface, never
+# the fleet, and require_module answers 404 — the status that makes an
+# agent discard its JWT and re-bootstrap from its PSK.
+#
+# It DOES keep wake_publishing, unlike the DNS agent include below. The
+# DNS agent router really is a pure consumer, but ``/dhcp/agents/
+# lease-events`` runs subnet-level DDNS (``apply_ddns_for_lease`` →
+# ``_sync_dns_record`` → ``enqueue_record_op``), which calls
+# ``collect_wake`` — and collect_wake is a silent no-op when no collector
+# is installed. Dropping it here would not error; lease-driven DNS
+# updates would simply stop waking DNS agents and converge on the 12 s
+# safety tick instead.
+api_v1_router.include_router(
+    dhcp_agents_router,
+    prefix="/dhcp",
+    tags=["dhcp-agents"],
     dependencies=[Depends(wake_publishing)],
 )
 api_v1_router.include_router(
@@ -268,8 +294,10 @@ api_v1_router.include_router(
     # #358 — publish a Redis wake after any record-mutating handler
     # commits so parked agent long-polls re-poll immediately. The
     # agent router (next line) is deliberately NOT wrapped — it holds
-    # the long-poll and never enqueues record ops.
-    dependencies=[Depends(wake_publishing)],
+    # the long-poll and never enqueues record ops, and since #1068 that
+    # separation is also what keeps the fleet reachable when core.dns is
+    # off (the gate answers 404, which re-bootstraps agents).
+    dependencies=[Depends(require_module("core.dns")), Depends(wake_publishing)],
 )
 api_v1_router.include_router(dns_agents_router, prefix="/dns", tags=["dns-agents"])
 api_v1_router.include_router(
@@ -277,7 +305,7 @@ api_v1_router.include_router(
     prefix="/dns",
     tags=["dns-blocklists"],
     # #358 — RPZ blocklist edits shift the structural ETag; publish on commit.
-    dependencies=[Depends(wake_publishing)],
+    dependencies=[Depends(require_module("core.dns")), Depends(wake_publishing)],
 )
 api_v1_router.include_router(
     dns_import_router,
@@ -290,9 +318,14 @@ api_v1_router.include_router(
     prefix="/dns",
     tags=["dns-pools"],
     # #358 — GSLB pool reconcile calls enqueue_record_op; publish on commit.
-    dependencies=[Depends(wake_publishing)],
+    dependencies=[Depends(require_module("core.dns")), Depends(wake_publishing)],
 )
-api_v1_router.include_router(dns_tools_router, prefix="/dns", tags=["dns-tools"])
+api_v1_router.include_router(
+    dns_tools_router,
+    prefix="/dns",
+    tags=["dns-tools"],
+    dependencies=[Depends(require_module("core.dns"))],
+)
 api_v1_router.include_router(
     dns_threat_router,
     prefix="/dns-threat",

@@ -18,6 +18,7 @@ from app.config import settings
 from app.core.agent_wake import dns_group_channel, publish_wake
 from app.models.dns import DNSBlockList, DNSBlockListEntry, DNSServer
 from app.services.dns_blocklist import parse_feed_detailed
+from app.services.feature_modules import is_module_enabled
 
 # If an agent hasn't heartbeat'd in this long, we fall back to an active probe.
 AGENT_STALE_AFTER = timedelta(seconds=120)
@@ -34,6 +35,10 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
 
     try:
         async with session_factory() as db:
+            # #1068 — the DHCP/DNS subsystem can be switched off wholesale;
+            # do no work (and open no driver connections) when it is.
+            if not await is_module_enabled(db, "core.dns"):
+                return {"status": "disabled"}
             bl = (
                 await db.execute(
                     select(DNSBlockList)
@@ -238,6 +243,12 @@ async def _dns_agent_stale_sweep_async() -> dict[str, int]:
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
+            # #1068 — the DHCP/DNS subsystem can be switched off wholesale;
+            # do no work (and open no driver connections) when it is.
+            if not await is_module_enabled(db, "core.dns"):
+                # Typed dict[str, int] — a "status" string would not type
+                # check, and zero marked is the honest count anyway.
+                return {"marked_unreachable": 0}
             cutoff = datetime.now(UTC) - timedelta(seconds=AGENT_STALE_AFTER_SECONDS)
             # Issue #182: paused servers are deliberately offline —
             # don't trip the heartbeat-stale state transition for them.
@@ -307,6 +318,10 @@ async def _check_health(server_id: uuid.UUID) -> None:
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
+            # #1068 — the DHCP/DNS subsystem can be switched off wholesale;
+            # do no work (and open no driver connections) when it is.
+            if not await is_module_enabled(db, "core.dns"):
+                return
             from app.drivers.dns import get_driver, is_agentless  # noqa: PLC0415
 
             server = await db.get(DNSServer, server_id)
@@ -398,6 +413,10 @@ async def _enqueue_all() -> None:
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
+            # #1068 — the DHCP/DNS subsystem can be switched off wholesale;
+            # do no work (and open no driver connections) when it is.
+            if not await is_module_enabled(db, "core.dns"):
+                return
             result = await db.execute(select(DNSServer.id))
             ids = [str(row[0]) for row in result.all()]
     finally:

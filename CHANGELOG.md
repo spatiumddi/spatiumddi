@@ -38,6 +38,70 @@ the formatter handles the rest.
 
 ### Added
 
+- **`core.dns` / `core.dhcp` — turn a whole subsystem off (#1068).** An
+  operator running SpatiumDDI for DNS only, DHCP only or IPAM only had no
+  way to put the unused subsystem away: DNS and DHCP were two of four
+  fixed sidebar anchors that no feature module gated, so a DNS-only
+  install carried a DHCP sidebar entry, a DHCP dashboard tab, DHCP
+  affordances throughout IPAM, the DHCP copilot tools and the DHCP alert
+  rules, all pointing at nothing. Both modules ship **enabled**, so no
+  existing install changes; 16 of 55 modules now ship on.
+  **The agent routers are deliberately outside the gate**, and that is
+  the whole reason `dhcp/__init__.py` changed: `require_module` answers
+  **404**, and 404 is precisely the status that makes an agent discard
+  its JWT and re-bootstrap from its PSK. Gating the agent path would not
+  disable a fleet, it would put every live Kea agent into a re-bootstrap
+  loop. The DHCP agent router was nested inside `dhcp_router` and had to
+  be lifted out and mounted separately at the same `/dhcp` prefix (the
+  DNS side already had this shape). It keeps `wake_publishing` — unlike
+  the DNS agent router, which really is a pure consumer — because
+  `/dhcp/agents/lease-events` runs subnet DDNS through
+  `enqueue_record_op`, and `collect_wake` is a silent no-op with no
+  collector installed: dropping it would not error, lease-driven DNS
+  updates would just stop waking DNS agents and converge on the 12 s
+  safety tick.
+  **Disabling is refused while the subsystem still owns rows** (422
+  naming the counts), the same fail-closed stance as the #934 / #935
+  moves — the agents keep serving from cached config either way, so the
+  alternative is live state hidden behind a 404 with no way to reach it
+  from the UI. `/agents/register` is the one agent call that CREATES a
+  server row, so it now declines with **403** while the module is off;
+  without that, a still-running agent re-registers seconds after the
+  toggle and strands exactly the state the refusal exists to protect.
+  403 rather than 404 for the same re-bootstrap reason.
+  **`ModuleSpec` gained `requires`**, and it is a real gate rather than a
+  UI hint: `get_enabled_modules` resolves a module enabled only when its
+  whole ancestry is, so `dhcp.import`, `ipv6.router_advertisements`,
+  `dns.import`, `dns.dynamic_update_acl`, `security.dns_threat` and
+  `security.dnsbl` follow their parent and need no gate of their own. An
+  operator row saying ON does not outrank a disabled parent. The
+  frontend hook resolves the chain the same way — it previously read each
+  module's own `enabled` flag, which would have shown a sidebar row for a
+  child whose router had already resolved it off (the two-renderers class
+  from #878). Catalog integrity — no dangling parent, no cycles, core
+  modules stay roots — is pinned by a test, because `_resolve_with_parents`
+  is deliberately forgiving at runtime (an unknown parent resolves TRUE so
+  a rename can never black out a subtree) and the catalog is therefore the
+  only place a typo can be caught.
+  Also gated: 12 beat tasks, 13 alert rule types, 42 copilot tools, 8
+  global-search providers (which otherwise returned zones and scopes that
+  link into 404 pages), the sidebar anchors and DNS section, the dashboard
+  tabs and their queries, and the DNS/DHCP reads inside IPAM.
+  **`rogue_dhcp` is deliberately NOT gated**, the one entry that needed
+  arguing: its subject rows keep arriving on the ungated agent router, and
+  the rule matters MOST to an install that does not run DHCP, where
+  anything answering DHCP is by definition unauthorised. Its drill-down
+  page does 404 with the module off — the cost — but an alert naming the
+  offending IP and MAC beats silence.
+  The module gate in `evaluate_all` falls through with an empty match set
+  rather than `continue`-ing: a `continue` skips the open-event
+  reconciliation too, so a DHCP pool-exhaustion event that was firing when
+  the operator disabled DHCP would stay open forever with no evaluator
+  left that could ever close it. No migration — per #1069 a
+  `feature_module` row means "an operator changed this" and the shipped
+  default lives in the catalog, so the defaults are declared in
+  `backend/tests/test_feature_module_defaults.py` instead.
+
 
 - **E911 dispatchable location — SpatiumDDI answers "which room is
   this phone in, right now?" (#972, Phase 1a).** Behind the default-on
@@ -706,6 +770,98 @@ the formatter handles the rest.
   #1013, below.
 
 ### Changed
+
+- **Fewer features are switched on out of the box (#1069).** A fresh
+  install enabled **37 of 53** feature modules, because the policy was
+  "default-on so operators discover what exists" — so a new operator
+  met BACnet, DICOM, OT Purdue zoning, E911, a BGP looking glass and
+  SD-WAN overlays in the sidebar before creating their first subnet.
+  That policy is replaced by a criterion: a module ships **on** only
+  if it is core IPAM / DNS / DHCP workflow, a zero-footprint UI
+  convenience, or a read-only diagnostic invoked by hand; it ships
+  **off** if it is a domain-specific registry most installs never
+  populate, emits traffic or writes to infrastructure once armed,
+  calls off-prem, or is one-shot migration tooling. Day-one importers
+  are the deliberate exception to that last clause — a fresh install
+  is exactly when an estate gets imported, so DNS / DHCP / NetBox
+  import stay on while the Windows cutover does not. **14 of 53**
+  modules now ship enabled. Discovery is unaffected: Settings →
+  Features has always listed every module with its description
+  whether or not it is on, which is why the sidebar does not have to.
+  **Existing installs are untouched** — an operator already running
+  E911 or Conformity does not lose it to an upgrade they did not ask
+  for.
+
+  **The mechanism was the bug.** Non-negotiable #14 told every
+  module's migration to seed a `feature_module` row at its shipped
+  default, and the resolver prefers a row over the catalog — so
+  `default_enabled` was dead code on every install, fresh ones
+  included, since a fresh install runs the same seed migrations an
+  upgrade does. Flipping a default in the catalog would have changed
+  nothing at all. A row now means one thing, "an operator changed
+  this"; migrations no longer seed one; and the new migration deletes
+  the pristine historical seeds **on a fresh install only**. Its
+  downgrade is a genuine no-op rather than a stub: the old code carries
+  the old catalog, whose defaults were true, so an absent row resolves
+  to the old behaviour on its own.
+
+  **"Fresh" is `audit_log` being empty, not the `user` table.** The
+  obvious test is "no users yet", and it is wrong in the direction that
+  fails silently: the API seeds the default admin at lifespan start,
+  and on Compose the `api` service waited only for postgres and redis,
+  so on a cold `docker compose up -d` it could insert that admin while
+  the 291 revisions were still running. The row count would be 1, the
+  migration would call the install an upgrade, skip, and #1069 would
+  quietly do nothing on exactly the installs it is aimed at.
+  Non-negotiable #4 puts an audit row behind every mutation, and
+  logging in writes one, while nothing on the startup path does — so a
+  racing API
+  cannot manufacture the evidence, and an empty table means nobody has
+  configured anything worth preserving. Proven on a real database in
+  three shapes: a clean fresh install clears all 51 seed rows, an
+  install with 1,033 audit rows keeps all 51, and the race itself — one
+  user, zero audit rows — is still correctly treated as fresh.
+
+- **Compose waits for the schema, not just the database (#1069).** The
+  `api` and `worker` services now depend on `migrate` completing.
+  Without it the API could serve against a half-migrated schema, and
+  worse, `_seed_default_admin` runs at lifespan start and never
+  retries: if it lost the race badly enough that the `user` table did
+  not exist yet, it skipped silently and the install had no account
+  anyone could log in with. Kubernetes has had a wait-for-migrate init
+  container all along; this is Compose catching up. `beat` is left
+  alone — it only schedules, and its `depends_on` is the short list
+  form.
+
+- **Settings → Features lists every module again (#1069).** Its two
+  tabs were driven by a hardcoded list of catalog group names that had
+  fallen five groups behind, so both DNS toggles, DHCP import, NetBox
+  import, Fleet Firewall and Saved views rendered on neither tab and
+  were untoggleable anywhere in the product. The split is now derived
+  from the catalog — Integrations on one tab, everything else on the
+  other — so a new group cannot go missing by omission. That page is
+  load-bearing for the change above, which hides most modules from the
+  sidebar on the argument that this one lists all of them.
+
+  Two guards keep it from drifting back. The first, in
+  `tests/test_feature_module_defaults.py`, writes out the shipped
+  value of all 53 modules, so changing one is two deliberate edits and
+  adding a module fails until somebody states which way it ships — and
+  it parses the catalog *source* rather than importing it, so it
+  cannot be masked by the new `conftest` fixture that turns every
+  module on for the test suite. The second fails any new migration
+  that touches `feature_module` at all.
+
+  Verified on a real database both ways: a full migration chain on an
+  empty database leaves zero rows, so the catalog governs; the dev
+  database with its 51 seeded rows keeps all 51.
+
+  `scripts/seed_demo.py` now enables the nine gated modules it
+  populates before it starts. It POSTs to routers the flip turns off,
+  and its HTTP helper logs a failure and walks on — so left alone it
+  would have printed a wall of 404s and produced a demo dataset with
+  no ASNs, customers, providers, circuits, services, overlays,
+  network devices, multicast groups or conformity policy in it.
 
 - **CI: a backend PR no longer waits 28 minutes on one test shard
   (#1019).** The eight `Backend — Tests` shards were split by test
@@ -1861,6 +2017,10 @@ the formatter handles the rest.
 
 ### Migrations
 
+- `a9f2c71e34b8` — #1069, data-only: on a fresh install, delete the
+  pristine `feature_module` seed rows so the catalog's
+  `default_enabled` governs. No schema change; existing installs are
+  not touched.
 - `c93f1a72e408` — `dhcp_metric_sample.receive_drop` /
   `.socket_drop` (both nullable: NULL means unmeasured) and
   `dhcp_server_group.kea_thread_pool_size` / `.kea_packet_logging`.

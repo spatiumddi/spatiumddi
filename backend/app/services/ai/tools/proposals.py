@@ -350,6 +350,7 @@ async def propose_create_address_set(
     writes=False,
     category="dns",
     default_enabled=False,
+    module="core.dns",
 )
 async def propose_create_dns_record(
     db: AsyncSession, user: User, args: CreateDNSRecordArgs
@@ -377,6 +378,7 @@ async def propose_create_dns_record(
     writes=False,
     category="dns",
     default_enabled=False,
+    module="core.dns",
 )
 async def propose_create_dns_zone(
     db: AsyncSession, user: User, args: CreateDNSZoneArgs
@@ -459,6 +461,7 @@ async def propose_allocate_multicast_group(
     writes=False,
     category="dhcp",
     default_enabled=False,
+    module="core.dhcp",
 )
 async def propose_create_dhcp_static(
     db: AsyncSession, user: User, args: CreateDHCPStaticArgs
@@ -688,6 +691,7 @@ async def propose_test_webhook(
     writes=False,
     category="dns",
     default_enabled=False,
+    module="core.dns",
 )
 async def propose_sign_zone_dnssec(
     db: AsyncSession, user: User, args: SignZoneDNSSECArgs
@@ -706,6 +710,7 @@ async def propose_sign_zone_dnssec(
     writes=False,
     category="dns",
     default_enabled=False,
+    module="core.dns",
 )
 async def propose_unsign_zone_dnssec(
     db: AsyncSession, user: User, args: UnsignZoneDNSSECArgs

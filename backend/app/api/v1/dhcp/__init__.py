@@ -1,8 +1,24 @@
-"""DHCP API router aggregation."""
+"""DHCP API router aggregation.
+
+``agents.router`` is deliberately NOT included here (#1068). It is
+mounted separately at the v1 level, under the same ``/dhcp`` prefix so
+the wire path is unchanged, because this router carries the
+``core.dhcp`` gate and ``require_module`` answers **404** — the one
+status that makes a DHCP agent discard its JWT and re-bootstrap from the
+PSK ("Agent bootstrap + reconnection" in CLAUDE.md). Gating the agent
+long-poll would not disable a fleet, it would put every live Kea agent
+into a re-bootstrap loop against a surface that keeps saying 404.
+
+It keeps ``wake_publishing`` at that mount point, because
+``/dhcp/agents/lease-events`` drives subnet DDNS and so does enqueue
+record ops.
+
+The DNS side has always had this shape; only DHCP nested its agent
+router, which is why this file changed and ``dns/__init__.py`` did not.
+"""
 
 from fastapi import APIRouter
 
-from app.api.v1.dhcp.agents import router as agents_router
 from app.api.v1.dhcp.client_classes import router as client_classes_router
 from app.api.v1.dhcp.device_policies import router as device_policies_router
 from app.api.v1.dhcp.lease_history import router as lease_history_router
@@ -39,6 +55,5 @@ router.include_router(option_codes_router)
 router.include_router(option_templates_router)
 router.include_router(voip_options_router)
 router.include_router(responders_router)
-router.include_router(agents_router)
 
 __all__ = ["router"]

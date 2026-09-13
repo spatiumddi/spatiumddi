@@ -222,9 +222,11 @@ Phase 2 layered an external iCal / CalDAV calendar gate; Phase 3 adds **post-wak
 liveness verify + bounded retry**, **stagger auto-tuning** for large fleets, and the
 **FOG / PXE re-image runbook** below.
 
-Lives behind the default-enabled `tools.wake_scheduler` feature module
-(disable it and the router prefix, sidebar entry, and MCP tools all drop out —
-non-negotiable #14). REST surface is mounted at `/api/v1/wake-scheduler`
+Lives behind the `tools.wake_scheduler` feature module, which ships
+**disabled** — it ends in magic packets going out on a schedule, so it is
+opted into ([#1069](https://github.com/spatiumddi/spatiumddi/issues/1069)).
+Enable it under Settings → Features; while it is off the router prefix,
+sidebar entry, and MCP tools all drop out (non-negotiable #14). REST surface is mounted at `/api/v1/wake-scheduler`
 (the Python package is `wol_schedules`; the wire prefix is `wake-scheduler`,
 the cross-surface contract shared with the frontend and MCP layers). Every
 handler is gated by the `wake_scheduler` permission (`read` / `write` /
@@ -1324,9 +1326,11 @@ mail-deliverability / reputation problem is reported by users. IPv4
 only in v1 (the DNSBLs are IPv4-centric; IPv6 DNSBL is a future
 enhancement).
 
-Behind the default-enabled **`security.dnsbl`** feature module — a
-discovery toggle only: the catalog + settings UI are visible, but the
-subsystem makes **zero external DNS queries** until the operator flips
+Behind the **`security.dnsbl`** feature module, which ships **disabled**
+([#1069](https://github.com/spatiumddi/spatiumddi/issues/1069)): armed, it
+asks public blocklist operators about the operator's own address space, and
+an off-prem call is a choice. It is the outer of two gates — even enabled,
+the subsystem makes **zero external DNS queries** until the operator flips
 the master sweep switch AND enables at least one list.
 
 **Curated catalog** (`dnsbl_list`). Seeded as platform rows

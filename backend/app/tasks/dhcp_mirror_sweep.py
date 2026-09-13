@@ -33,6 +33,7 @@ from app.celery_app import celery_app
 from app.db import task_session
 from app.models.audit import AuditLog
 from app.services.dhcp.static_ipam import sweep_orphaned_static_mirrors
+from app.services.feature_modules import is_module_enabled
 
 logger = structlog.get_logger(__name__)
 
@@ -44,6 +45,10 @@ _MAX_PER_RUN = 500
 
 async def _sweep() -> int:
     async with task_session() as db:
+        # #1068 — the DHCP/DNS subsystem can be switched off wholesale;
+        # do no work (and open no driver connections) when it is.
+        if not await is_module_enabled(db, "core.dhcp"):
+            return 0
         freed = await sweep_orphaned_static_mirrors(db, limit=_MAX_PER_RUN)
         if freed:
             # Only audit when we actually changed something — a row per hour

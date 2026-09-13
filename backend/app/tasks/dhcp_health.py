@@ -34,6 +34,7 @@ from app.celery_app import celery_app
 from app.config import settings
 from app.drivers.dhcp import get_driver, is_agentless
 from app.models.dhcp import DHCPServer
+from app.services.feature_modules import is_module_enabled
 
 # If agent hasn't heartbeat'd in this long, mark unreachable.
 AGENT_STALE_AFTER = timedelta(seconds=120)
@@ -46,6 +47,10 @@ async def _check_health(server_id: uuid.UUID) -> None:
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
+            # #1068 — the DHCP/DNS subsystem can be switched off wholesale;
+            # do no work (and open no driver connections) when it is.
+            if not await is_module_enabled(db, "core.dhcp"):
+                return
             server = await db.get(DHCPServer, server_id)
             if server is None:
                 return
@@ -127,6 +132,10 @@ async def _enqueue_all() -> None:
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
+            # #1068 — the DHCP/DNS subsystem can be switched off wholesale;
+            # do no work (and open no driver connections) when it is.
+            if not await is_module_enabled(db, "core.dhcp"):
+                return
             result = await db.execute(select(DHCPServer.id))
             ids = [str(row[0]) for row in result.all()]
     finally:

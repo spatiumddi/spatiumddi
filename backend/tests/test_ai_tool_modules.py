@@ -38,7 +38,6 @@ def test_every_registered_tool_module_is_catalog_valid() -> None:
 # The read tools #479 rescued. Before the fix each was tagged with a
 # non-catalog module id and silently dropped on every install.
 _RESCUED_ALWAYS_ON = (  # now module=None → present regardless of modules
-    "find_zone_dnssec_info",
     "list_webhooks",
     "get_webhook_event_types",
     "find_webhook_deliveries",
@@ -53,6 +52,15 @@ _RESCUED_UNDER_CONFORMITY = (  # now module="compliance.conformity"
     "find_conformity_results",
     "get_conformity_summary",
 )
+# #1068 — moved OFF the always-on list, deliberately. #479 set it to
+# module=None because its old tag was the bogus id ``"dns"``, which gated
+# it against a set that could never contain that id and so dropped it from
+# every install. None was the right fix at the time: there was no real
+# module for a DNS tool to belong to. ``core.dns`` is now a real catalog
+# id, so this restores the intent #479 wanted rather than re-creating the
+# defect — the tool reads DNS zone state and has no meaning on an install
+# where the whole DNS surface is switched off.
+_RESCUED_UNDER_CORE_DNS = ("find_zone_dnssec_info",)
 
 
 def test_rescued_read_tools_present_with_all_modules_enabled() -> None:
@@ -61,7 +69,11 @@ def test_rescued_read_tools_present_with_all_modules_enabled() -> None:
         provider_enabled=None,
         enabled_modules=all_module_ids(),
     )
-    for name in (*_RESCUED_ALWAYS_ON, *_RESCUED_UNDER_CONFORMITY):
+    for name in (
+        *_RESCUED_ALWAYS_ON,
+        *_RESCUED_UNDER_CONFORMITY,
+        *_RESCUED_UNDER_CORE_DNS,
+    ):
         assert name in enabled, f"{name} still dropped from the effective set"
 
 
@@ -92,6 +104,28 @@ def test_conformity_tools_follow_conformity_module() -> None:
         enabled_modules=all_module_ids() - {"compliance.conformity"},
     )
     for name in _RESCUED_UNDER_CONFORMITY:
+        assert name in with_module
+        assert name not in without_module
+
+
+def test_dnssec_tool_follows_core_dns() -> None:
+    """Present with DNS on, stripped with DNS off (#1068).
+
+    The pairing is the point: #479's failure mode was a tool that was
+    always absent, so asserting only the "stripped" half would pass on a
+    tool that had gone back to being permanently invisible.
+    """
+    with_module = effective_tool_names(
+        platform_enabled=None,
+        provider_enabled=None,
+        enabled_modules=all_module_ids(),
+    )
+    without_module = effective_tool_names(
+        platform_enabled=None,
+        provider_enabled=None,
+        enabled_modules=all_module_ids() - {"core.dns"},
+    )
+    for name in _RESCUED_UNDER_CORE_DNS:
         assert name in with_module
         assert name not in without_module
 

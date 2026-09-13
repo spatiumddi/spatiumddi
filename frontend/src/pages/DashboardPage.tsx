@@ -1385,13 +1385,17 @@ const _PERSISTED_TABS: ReadonlySet<DashboardTab> = new Set([
 
 export function DashboardPage() {
   const qc = useQueryClient();
-  const { enabled } = useFeatureModules();
+  const { enabled, ready } = useFeatureModules();
 
   // Per-tab feature-module gate — keep in lock-step with the tab-bar
   // array's ``module`` fields below. A tab whose module is off is hidden
   // and must never be the active tab (its panel would 404).
   const _TAB_MODULES: Partial<Record<DashboardTab, string>> = {
     conformity: "compliance.conformity",
+    // #1068 — an install that does not run DNS / DHCP hides the tab, and
+    // the effect below moves an operator parked on it back to Overview.
+    dns: "core.dns",
+    dhcp: "core.dhcp",
   };
   const tabVisible = (key: DashboardTab): boolean => {
     const mod = _TAB_MODULES[key];
@@ -1451,10 +1455,20 @@ export function DashboardPage() {
   );
 
   // DNS
+  //
+  // #1068 — every /dns and /dhcp read below is gated on ``ready &&
+  // enabled(...)``. ``enabled`` answers true while the module set is still
+  // loading so the sidebar does not blink, so without ``ready`` each of
+  // these would fire once on a hard reload and 404 before the real state
+  // is known. The dependent per-group queries need no gate of their own:
+  // their list comes from a query that stays empty.
+  const dnsOn = ready && enabled("core.dns");
+  const dhcpOn = ready && enabled("core.dhcp");
   const { data: dnsGroups = [] } = useQuery({
     queryKey: ["dns-groups"],
     queryFn: dnsApi.listGroups,
     staleTime: 30_000,
+    enabled: dnsOn,
   });
   const zoneQueries = useQueries({
     queries: dnsGroups.map((g) => ({
@@ -1481,6 +1495,7 @@ export function DashboardPage() {
     queryKey: ["dhcp-servers"],
     queryFn: () => dhcpApi.listServers(),
     refetchInterval: 30_000,
+    enabled: dhcpOn,
   });
   // Single groups fetch — drives both the DHCP server-row group-name
   // lookup and the HA panel (groups with >= 2 Kea members).
@@ -1488,6 +1503,7 @@ export function DashboardPage() {
     queryKey: ["dhcp-groups"],
     queryFn: dhcpApi.listGroups,
     refetchInterval: 30_000,
+    enabled: dhcpOn,
   });
   const haGroups = dhcpGroups.filter((g) => g.kea_member_count >= 2);
 
@@ -1836,8 +1852,13 @@ export function DashboardPage() {
               [
                 { key: "overview", label: "Overview", Icon: Activity },
                 { key: "ipam", label: "IPAM", Icon: Network },
-                { key: "dns", label: "DNS", Icon: Globe2 },
-                { key: "dhcp", label: "DHCP", Icon: Server },
+                { key: "dns", label: "DNS", Icon: Globe2, module: "core.dns" },
+                {
+                  key: "dhcp",
+                  label: "DHCP",
+                  Icon: Server,
+                  module: "core.dhcp",
+                },
                 { key: "network", label: "Network", Icon: Waypoints },
                 { key: "integrations", label: "Integrations", Icon: Plug },
                 { key: "compliance", label: "Compliance", Icon: ShieldCheck },
@@ -1981,17 +2002,19 @@ export function DashboardPage() {
                     : "default"
               }
             />
-            <KpiCard
-              label="DNS Zones"
-              value={totalZones}
-              sub={
-                dnsGroups.length > 0
-                  ? `${dnsGroups.length} group${dnsGroups.length === 1 ? "" : "s"}`
-                  : "no groups"
-              }
-              icon={Globe2}
-              to="/dns"
-            />
+            {dnsOn && (
+              <KpiCard
+                label="DNS Zones"
+                value={totalZones}
+                sub={
+                  dnsGroups.length > 0
+                    ? `${dnsGroups.length} group${dnsGroups.length === 1 ? "" : "s"}`
+                    : "no groups"
+                }
+                icon={Globe2}
+                to="/dns"
+              />
+            )}
             <KpiCard
               label="Servers"
               value={allServers.length}
