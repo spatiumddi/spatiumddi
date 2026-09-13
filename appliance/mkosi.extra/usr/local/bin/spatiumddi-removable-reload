@@ -437,7 +437,14 @@ for staged in "$STAGE"/*.mount; do
     # ENOSPC or a read-only upper is a real way to get there. The unit
     # then does not exist, `enable` fails, the disk never mounts when
     # plugged in, and every surface reports the config applied.
-    if ! install -o root -g root -m 0644 "$staged" "$UNIT_DIR/$(basename "$staged")"; then
+    # ``-m 0644`` only, deliberately: this unit runs as root (systemd
+    # oneshot, no ``User=``), so the file is root-owned by construction
+    # and an explicit ``-o root -g root`` adds nothing — while making
+    # the command fail outright for any non-root caller, which is what
+    # the test harness and the CI job are. That was invisible until the
+    # install started being CHECKED; before it, the ownership error was
+    # printed and walked past, which is the bug being fixed here.
+    if ! install -m 0644 "$staged" "$UNIT_DIR/$(basename "$staged")"; then
         echo "  ✗ could not install $(basename "$staged") into $UNIT_DIR"
         RC_ANY_FAIL=1
     fi
