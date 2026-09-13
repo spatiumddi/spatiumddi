@@ -13,9 +13,12 @@ import threading
 import time
 from pathlib import Path
 
+import httpx
 import pytest
 
 from spatium_supervisor import storage_proxy as sp
+from spatium_supervisor.config import SupervisorConfig
+from spatium_supervisor.identity import Identity, load_or_generate
 
 
 @pytest.fixture
@@ -128,3 +131,60 @@ def test_the_reply_body_carries_the_request_id() -> None:
     # ...and the reply status is checked, so a rejected reply is not
     # indistinguishable from an appliance that never answered.
     assert "supervisor.storage.reply_rejected" in src
+
+
+# ── #1072 — the loop must actually start ─────────────────────────────────
+
+
+def _bare_config(state_dir: Path) -> SupervisorConfig:
+    """A ``SupervisorConfig`` with exactly the fields ``from_env`` builds.
+
+    Deliberately the real frozen dataclass and not a namespace or a mock:
+    the defect was the loop reading an attribute the real config does not
+    have, and a stand-in that answers every attribute would hide exactly
+    that.
+    """
+    return SupervisorConfig(
+        control_plane_url="https://control-plane.example",
+        hostname="qa-node",
+        state_dir=state_dir,
+        bootstrap_pairing_code="",
+        heartbeat_interval_seconds=30,
+        k8s_proxy_enabled=False,
+        in_pod_firewall_enabled=True,
+    )
+
+
+class _FirstPassDone(BaseException):
+    """Raised by the stubbed poll so the forever-loop returns after one pass.
+
+    A ``BaseException`` on purpose: the loop's ``except Exception`` guard
+    must not be able to swallow it, or a passing run would hang.
+    """
+
+
+def test_the_loop_reaches_its_first_poll_with_a_bare_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The thread died on its first instruction, on every appliance (#1072).
+
+    ``storage_loop_forever`` built its client with ``verify=cfg.verify_tls``
+    and ``SupervisorConfig`` has no such field. The AttributeError was raised
+    one line ABOVE the ``except Exception`` guard written to keep the thread
+    alive, so it left the function and ended the thread — silently, apart
+    from one traceback in the pod log at boot. None of the tests above enter
+    the loop; this one does, with the real client, and proves control
+    reaches ``_storage_once``.
+    """
+    seen: list[httpx.Client] = []
+
+    def _once(cfg: SupervisorConfig, identity: Identity, client: httpx.Client) -> None:
+        seen.append(client)
+        raise _FirstPassDone
+
+    monkeypatch.setattr(sp, "_storage_once", _once)
+    identity, _ = load_or_generate(tmp_path)
+    with pytest.raises(_FirstPassDone):
+        sp.storage_loop_forever(_bare_config(tmp_path), identity)
+    assert len(seen) == 1
+    assert isinstance(seen[0], httpx.Client)
