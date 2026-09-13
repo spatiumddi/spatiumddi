@@ -50,6 +50,26 @@ RestartSec=5s
 ExecStartPre=-/sbin/modprobe br_netfilter
 ExecStartPre=-/sbin/modprobe overlay
 ExecStartPre=/bin/mkdir -p /etc/rancher/k3s /var/lib/rancher/k3s /var/log/spatiumddi
+# Persist k3s's image-import cache. Without ``.cache.json`` in the images
+# dir k3s re-imports EVERY baked tarball on EVERY start — not only the
+# first one this unit's header describes: the importer opens the cache
+# ``O_WRONLY|O_TRUNC`` and never creates it (pkg/agent/containerd/
+# watcher.go ``syncCache``), and the docs say so outright ("Image
+# archives are imported every time k3s starts … To enable [the cache],
+# create a .cache.json file in the images directory"). The appliance
+# ships ~20 tarballs there, and the import runs BEFORE the kubelet
+# starts, so every k3s restart costs 90-160 s of node-NotReady on a
+# nested QA rig (a member returning from a network partition rejoined
+# in 168-284 s, of which 126 s was "Importing images from …"; the
+# nightly's HA drill budget is 240 s). With the cache a tarball is
+# re-imported only when its size or mtime changes — exactly what a slot
+# upgrade does when it copies the new slot's set across
+# (spatium-upgrade-slot ``_refresh_baked_images``), so upgrades still
+# import. ``touch`` creates the file when absent and only bumps the
+# timestamps of an existing, populated cache; the cluster-join identity
+# wipe moves it aside together with the containerd store it describes.
+ExecStartPre=/bin/mkdir -p /var/lib/rancher/k3s/agent/images
+ExecStartPre=/bin/touch /var/lib/rancher/k3s/agent/images/.cache.json
 # ``server`` boots an all-in-one node (control plane + agent). Single
 # node — no joining a cluster. All other flags live in /etc/rancher/
 # k3s/config.yaml so they're operator-editable without touching the

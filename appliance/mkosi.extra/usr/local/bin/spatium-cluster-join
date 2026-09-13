@@ -208,6 +208,18 @@ backup_and_wipe_identity() {
             mv "$e" "$bak/agent/$n"
         done
     fi
+    # The loop above just took agent/containerd — the image store the
+    # baked tarballs were imported into — but kept images/ whole, and the
+    # glob does not even see the dotfile inside it. k3s's import cache
+    # (images/.cache.json, persisted by k3s.service's ExecStartPre) would
+    # then tell the fresh start that every tarball is already imported
+    # (it re-imports only on a size/mtime change), and every pod on the
+    # joiner would sit in ErrImageNeverPull. The cache describes the store
+    # it was written against: it goes aside WITH that store, and the
+    # fresh k3s re-imports the tarballs and writes a new one.
+    if [ -f "$K3S_AGENT_DIR/images/.cache.json" ]; then
+        mv "$K3S_AGENT_DIR/images/.cache.json" "$bak/agent-images-cache.json"
+    fi
     [ -f "$K3S_NODE_PASSWORD" ] && mv "$K3S_NODE_PASSWORD" "$bak/node-password"
     [ -f "$K3S_LOCAL_KUBECONFIG" ] && mv "$K3S_LOCAL_KUBECONFIG" "$bak/k3s.yaml"
     # #277 — clear stale pod-network state so the (re)joining node gets
@@ -269,6 +281,16 @@ restore_identity() {
     fi
     [ -f "$bak/node-password" ] && { mkdir -p "$(dirname "$K3S_NODE_PASSWORD")"; mv "$bak/node-password" "$K3S_NODE_PASSWORD"; }
     [ -f "$bak/k3s.yaml" ] && mv "$bak/k3s.yaml" "$K3S_LOCAL_KUBECONFIG"
+    # The import cache follows the store it describes (see the wipe): drop
+    # whatever the failed join's k3s wrote against the store that just
+    # left, and put back the one that matches the restored store. No
+    # backed-up cache means no cache — the next start re-imports, which
+    # is the safe direction.
+    rm -f "${K3S_AGENT_DIR:?}/images/.cache.json"
+    if [ -f "$bak/agent-images-cache.json" ]; then
+        mkdir -p "$K3S_AGENT_DIR/images"
+        mv "$bak/agent-images-cache.json" "$K3S_AGENT_DIR/images/.cache.json"
+    fi
     log "restored cluster identity from $bak"
 }
 
