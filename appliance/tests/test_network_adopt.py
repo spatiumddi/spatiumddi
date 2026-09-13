@@ -298,7 +298,8 @@ def test_clearing_an_mtu_in_nmtui_is_drift_not_silence(keyfile):
     live = sna._state_from_keyfile(sna.parse_keyfile(keyfile))
     assert live["network_mtu"] == ""
     drift = sna.drift_for({"network_mtu": "9000"}, live)
-    assert drift["network_mtu"] == {"state": "9000", "live": ""}
+    assert drift["network_mtu"]["state"] == "9000"
+    assert drift["network_mtu"]["live"] == ""
 
 
 def test_an_mtu_of_zero_means_default_not_a_value(keyfile):
@@ -362,6 +363,79 @@ def test_a_normally_rendered_mtu_is_still_adoptable(tmp_path, applied):
         encoding="utf-8",
     )
     assert sna._mtu_suppression(status) is None
+
+
+def test_compare_marks_a_refused_mtu_unadoptable(keyfile, monkeypatch, tmp_path):
+    """Through ``compare()``, not the helper.
+
+    The first cut tested ``_mtu_suppression`` directly, so the wiring
+    inside ``compare()`` was never executed: deleting it entirely left
+    all the tests green while ``--adopt`` silently overwrote the
+    operator's configured MTU with an empty one — the exact scenario the
+    wiring exists to stop. This is the same argument the module makes for
+    extracting ``drift_for``.
+    """
+    status = tmp_path / "network-status"
+    status.write_text(
+        "INTERFACE=eth0\nMODE=static\nMTU=\nMTU_REQUESTED=1200\nMTU_APPLIED=dropped\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sna, "NETWORK_STATUS", status)
+    monkeypatch.setattr(sna, "STATIC_KEYFILE", keyfile)
+    keyfile.write_text(STATIC_KEYFILE, encoding="utf-8")  # no mtu= line
+
+    report = sna.compare(
+        {"network_mode": "static", "network_interface": "eth0", "network_mtu": "1200"}
+    )
+    entry = report["drift"]["network_mtu"]
+    # Still REPORTED as drift — it genuinely is one, and the exit code
+    # contract says 10 — but explicitly not adoptable, with the reason.
+    assert entry["adoptable"] is False
+    assert "REFUSED" in entry["reason"]
+
+
+def test_compare_refuses_to_adopt_an_mtu_the_renderer_would_drop(
+    keyfile, config, monkeypatch, tmp_path
+):
+    """The other direction: nmtui accepts an MTU the renderer will not.
+
+    500 is legal to NetworkManager (the Ethernet minimum is 68) and below
+    SpatiumDDI's 576 floor. Without this, ``--adopt`` was a fourth door
+    with no rule: the console printed "Adopted 1 setting(s) into STATE:
+    network_mtu = 500" and the next boot dropped it.
+    """
+    status = tmp_path / "network-status"
+    status.write_text("MTU=1400\nMTU_REQUESTED=1400\nMTU_APPLIED=applied\n", encoding="utf-8")
+    monkeypatch.setattr(sna, "NETWORK_STATUS", status)
+    monkeypatch.setattr(sna, "STATIC_KEYFILE", keyfile)
+    keyfile.write_text(
+        STATIC_KEYFILE.replace("[ethernet]\n", "[ethernet]\nmtu=500\n"), encoding="utf-8"
+    )
+
+    entry = sna.compare(
+        {"network_mode": "static", "network_interface": "eth0"}
+    )["drift"]["network_mtu"]
+    assert entry["live"] == "500"
+    assert entry["adoptable"] is False
+    assert "576" in entry["reason"]
+
+
+def test_an_ordinary_mtu_edit_stays_adoptable(keyfile, monkeypatch, tmp_path):
+    """The complement, and what keeps the two refusals honest."""
+    status = tmp_path / "network-status"
+    status.write_text("MTU=1400\nMTU_REQUESTED=1400\nMTU_APPLIED=applied\n", encoding="utf-8")
+    monkeypatch.setattr(sna, "NETWORK_STATUS", status)
+    monkeypatch.setattr(sna, "STATIC_KEYFILE", keyfile)
+    keyfile.write_text(
+        STATIC_KEYFILE.replace("[ethernet]\n", "[ethernet]\nmtu=9000\n"), encoding="utf-8"
+    )
+
+    entry = sna.compare(
+        {"network_mode": "static", "network_interface": "eth0"}
+    )["drift"]["network_mtu"]
+    assert entry["live"] == "9000"
+    assert entry["adoptable"] is True
+    assert entry["reason"] == ""
 
 
 def test_no_sidecar_suppresses_nothing(tmp_path):

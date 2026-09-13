@@ -37,8 +37,8 @@ from app.services.appliance.network_mtu import (
     fleet_summary,
     has_network_report,
     node_answer,
-    worst_severity,
 )
+from app.services.appliance.storage_health import worst_severity
 
 
 def health(mtu=None, applied="applied", requested=None):
@@ -119,6 +119,10 @@ def test_a_dropped_mtu_is_a_finding_on_its_own():
     assert findings[0].kind == "dropped"
     assert findings[0].severity == "warning"
     assert "1200" in findings[0].detail
+    # The SHARED helper from storage_health — duck-typed on ``.severity``
+    # and already what every other appliance surface calls. A local copy
+    # would be a second severity ranking nobody consults, and it would
+    # shadow the one ``supervisor.py`` already imports.
     assert worst_severity(findings) == "warning"
 
 

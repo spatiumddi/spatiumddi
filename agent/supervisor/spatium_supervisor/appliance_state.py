@@ -3275,6 +3275,26 @@ def read_network_state() -> dict[str, object] | None:
         if sep:
             fields[key.strip()] = value.strip()
 
+    # The sidecar must have been written by THIS boot.
+    #
+    # /etc is an overlay whose upperdir lives on /var, so it is shared
+    # across the A/B slots. Trial-boot a new slot, have it roll back, and
+    # the file written by the new slot's renderer survives into a running
+    # slot that never wrote it — and an abort anywhere in that long
+    # `set -eu` script leaves the previous boot's claim in place just the
+    # same. Either way the reading describes a configuration the running
+    # system is not using, and reporting it as fact is the "told it took
+    # effect, it did not" failure this whole feature exists to prevent.
+    # A stale file is UNKNOWN, which every surface already renders as
+    # nothing rather than as a clean bill of health.
+    stamped = fields.get("BOOT_ID", "")
+    try:
+        current = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+    except OSError:
+        current = ""
+    if not stamped or not current or stamped != current:
+        return None
+
     def _int(name: str) -> int | None:
         raw = fields.get(name, "")
         return int(raw) if raw.isdigit() else None
@@ -3582,19 +3602,21 @@ def collect() -> dict[str, object]:
         # an empty snapshot is the signal that clears a stale array off
         # every surface after the operator tears one down, and
         # ``md_supported`` is a real reading even with no arrays.
-        cluster_health = {
-            **(cluster_health or {}),
-            "storage": read_storage_health(),
-        }
         # #1017 — the effective MTU, folded into the same dict for the
         # same reason (#402: stored verbatim by the backend, no schema
-        # change). Shipped only when the sidecar was readable: absent
-        # means UNKNOWN, and the fleet check upstream must be able to
-        # tell that apart from "this node is at the default", or a
+        # change). Shipped only when the sidecar was readable and current:
+        # absent means UNKNOWN, and the fleet check upstream must be able
+        # to tell that apart from "this node is at the default", or a
         # supervisor that could not answer reads as agreeing.
+        #
+        # Built in ONE literal with the storage block rather than two
+        # adjacent shallow rebuilds of a dict that already carries the
+        # node/pod counts and the #402 partition list.
+        _extra: dict[str, object] = {"storage": read_storage_health()}
         _network = read_network_state()
         if _network is not None:
-            cluster_health = {**(cluster_health or {}), "network": _network}
+            _extra["network"] = _network
+        cluster_health = {**(cluster_health or {}), **_extra}
     k3s_version = read_k3s_version() if is_appliance else None
     kubeconfig = read_kubeconfig() if is_appliance else None
     k3s_api_cert_expires_at = read_k3s_api_cert_expiry() if is_appliance else None

@@ -2510,58 +2510,76 @@ _dhcp_lease_subnet() {
 # appliance comes up with NO IP (console-only recovery). A typo'd
 # prefix / IP / gateway failed the same silent way. Prints the problem(s)
 # on stdout + exits 1 on any error.
-# #1017 — the MTU rule, in one place because three doors need it: this
-# wizard (both network modes), ``--check-preseed`` via the parser, and
-# spatium-etc-render as the last line of defence over a hand-edited
-# STATE. Prints the reasons and exits 1; silent + 0 when acceptable.
+# #1017 — the MTU rule lives in spatium-preseed-parse as ``validate_mtu``
+# and is reached here through ``--check-field``, the #995 mechanism for
+# exactly this. The first cut transcribed the rule into an inline python
+# heredoc and the two copies had already drifted at birth — one accepted
+# "+1400" (which int() takes) where the other refused it.
 #
-# 576 is the IPv4 minimum reassembly buffer every host must accept
-# (RFC 791) and 9000 the conventional jumbo ceiling. The interesting
-# bound is the lower one: below 1280 IPv6 cannot run on the link at all
-# (RFC 8200), which is a REFUSAL rather than a warning when the operator
-# has pinned a static v6 address — that appliance is broken by
-# specification, not merely unusual. With IPv6 left on its RA / SLAAC
-# default there is no configured address to break and no explicit intent
-# to honour, so a 1200-byte tunnel — the case this feature exists for —
-# is allowed, and the operator is told IPv6 will not come up on it.
+# Three things come free with the wrapper, each of which the heredoc got
+# wrong: --check-field .strip()s the value, so " 1400" is validated the
+# way the preseed door validates it; _check_field sends the parser's
+# STDERR to the install log rather than into the captured output, so a
+# DeprecationWarning cannot read as a validation failure; and rc=3
+# ("the caller asked wrongly") is distinguished from rc=2 ("the value is
+# bad") instead of both arriving as text.
+#
+# Prints the reason and returns 1 when the value is unusable.
 _mtu_error() {
-    python3 - "$NET_MTU" "$NET6_MODE" "$NET6_IP" <<'PY' 2>&1
-import sys
+    _check_field mtu "$NET_MTU" "$NET6_MODE" "$NET6_IP" "$NET_MODE" "$NET_INTERFACE"
+}
 
-mtu_s, v6_mode, v6_ip = sys.argv[1].strip(), sys.argv[2], sys.argv[3].strip()
-errs = []
-
-if mtu_s:
-    # ``.isdigit()``, not ``int()``: int() tolerates a leading '+',
-    # surrounding whitespace and PEP-515 underscores, and the other two
-    # doors do not — the preseed parser refuses them and the renderer's
-    # POSIX digit test drops them at boot. Accepting "+1400" here would
-    # store it in STATE and have the renderer silently discard it, which
-    # is precisely the "told it took effect, it did not" failure this
-    # setting exists to avoid. Same trap the parser documents on
-    # network.prefix6.
-    if not mtu_s.isdigit():
-        errs.append(f"MTU must be a whole number (got {mtu_s!r}).")
-    else:
-        mtu = int(mtu_s)
-        if not 576 <= mtu <= 9000:
-            errs.append(
-                f"MTU must be between 576 and 9000 (got {mtu}). 1500 is the "
-                "Ethernet default; values below it are for tunnelled or "
-                "reduced-MTU links."
-            )
-        elif mtu < 1280 and v6_mode == "static" and v6_ip:
-            errs.append(
-                f"MTU {mtu} is below 1280, the IPv6 minimum link MTU "
-                "(RFC 8200), and this install pins a static IPv6 address "
-                f"({v6_ip}). IPv6 cannot run on that link. Raise the MTU to "
-                "1280 or more, or set IPv6 back to automatic."
-            )
-
-if errs:
-    print("\n".join(errs))
-    sys.exit(1)
-PY
+# Ask for the MTU once, validate, and CANONICALISE what we keep.
+#
+# The canonicalisation is the half that is easy to miss: whiptail returns
+# the entry buffer verbatim, so a pasted " 1400" was stored in STATE with
+# its space and then dropped at boot by the renderer's ASCII digit test —
+# the "told it took effect, it did not" failure this whole setting exists
+# to avoid, inside the setting itself. The parser validates the stripped
+# form, so the wizard must store the stripped form too.
+#
+# Returns 1 when the operator backs out, so both call sites can pass that
+# up as a Back.
+_ask_mtu() {
+    local prompt merr
+    prompt="MTU for ${NET_INTERFACE:-this interface} — leave BLANK for the default (1500 on ordinary Ethernet).\n\nSet this only to MATCH a link that needs a smaller MTU: a WireGuard / IPsec / GRE tunnel, PPPoE, or a provider underlay. Getting it wrong the other way is hard to spot — small requests keep working while large transfers hang.\n\nNot a performance setting. Applied at boot."
+    while true; do
+        NET_MTU=$(whiptail --backtitle "$BACKTITLE" --title "Interface MTU" \
+            --cancel-button "Back" \
+            --inputbox "$prompt" 18 72 -- "$NET_MTU" 3>&1 1>&2 2>&3) \
+            || return 1
+        # Canonicalise before validating AND before storing, so the value
+        # the Confirm screen shows is the value STATE gets is the value
+        # the renderer sees. The parser does the same on its own path
+        # (``str(int(mtu_s))``), and a door that validates one form while
+        # storing another is this feature's own failure mode.
+        #
+        # Whitespace: whiptail returns the entry buffer verbatim, so a
+        # pasted " 1400" reached STATE with its space and was dropped at
+        # boot by the renderer's ASCII digit test.
+        #
+        # Leading zeros: "01400" is a perfectly good int to Python — both
+        # the wizard and the parser accept it — and the renderer's
+        # digit-count pattern refuses it, so it was accepted here and
+        # dropped at boot. Worse if it had been written through:
+        # NetworkManager normalises "mtu=01400" to "mtu=1400" on its next
+        # save, after which the adopt tool sees live=1400 against
+        # state=01400 and offers phantom drift forever.
+        NET_MTU="$(printf '%s' "$NET_MTU" | tr -d '[:space:]')"
+        case "$NET_MTU" in
+            ''|*[!0-9]*) : ;;  # not a number — let the validator say so
+            *)
+                while [ "${#NET_MTU}" -gt 1 ] && [ "${NET_MTU#0}" != "$NET_MTU" ]; do
+                    NET_MTU="${NET_MTU#0}"
+                done
+                ;;
+        esac
+        if merr=$(_mtu_error); then
+            return 0
+        fi
+        whiptail --backtitle "$BACKTITLE" --title "MTU — invalid" \
+            --msgbox "$merr" 14 72 || true
+    done
 }
 
 _validate_static_net() {
@@ -2725,10 +2743,14 @@ ask_network() {
     NET6_MODE="auto"
     NET6_IP=""
     NET6_GATEWAY=""
-    # Same reasoning as the v6 reset above: a static -> Back -> dhcp walk
-    # must not carry a stale MTU forward onto a keyfile the operator is
-    # no longer configuring.
-    NET_MTU=""
+    # NET_MTU is deliberately NOT reset here. #995 lets the Confirm screen
+    # jump straight back into this function to fix one field, so clearing
+    # it up front discards an MTU the operator already set: they come back
+    # to correct the hostname, the MTU box is blank, Enter accepts the
+    # blank, and the MTU row silently vanishes from Confirm — on the last
+    # screen before an irreversible wipe. Every path below either re-asks
+    # with the current value pre-filled or clears it explicitly (any-port
+    # DHCP, which has nowhere to put one), so nothing stale survives.
 
     # #995 item 19 — the interface picker is offered in BOTH modes now.
     #
@@ -2790,18 +2812,7 @@ ask_network() {
     # instead, so a value refused for clashing with a static IPv6 address
     # is re-asked alongside the address it clashes with.
     if [ "$NET_MODE" = "dhcp" ] && [ -n "$NET_INTERFACE" ]; then
-        while true; do
-            NET_MTU=$(whiptail --backtitle "$BACKTITLE" --title "Interface MTU" \
-                --cancel-button "Back" \
-                --inputbox "MTU for $NET_INTERFACE — leave BLANK for the default (1500 on ordinary Ethernet).\n\nSet this only to MATCH a link that needs a smaller MTU: a WireGuard / IPsec / GRE tunnel, PPPoE, or a provider underlay. Getting it wrong the other way is hard to spot — small requests keep working while large transfers hang.\n\nNot a performance setting. Applied at boot." \
-                18 72 -- "$NET_MTU" 3>&1 1>&2 2>&3) \
-                || return 1
-            local merr
-            merr=$(_mtu_error) || true
-            [ -z "$merr" ] && break
-            whiptail --backtitle "$BACKTITLE" --title "MTU — invalid" \
-                --msgbox "$merr" 14 72 || true
-        done
+        _ask_mtu || return 1
     elif [ "$NET_MODE" = "dhcp" ]; then
         # Any-port DHCP has nowhere to put it; make sure a value from an
         # earlier pass through this screen cannot survive the change.
@@ -2881,26 +2892,21 @@ ask_network() {
             # a static IPv6 address is pinned (RFC 8200). Inside the loop
             # so that refusal re-offers both fields rather than trapping
             # the operator on whichever one they answered second.
-            NET_MTU=$(whiptail --backtitle "$BACKTITLE" --title "Interface MTU" \
-                --cancel-button "Back" \
-                --inputbox "MTU for $NET_INTERFACE — leave BLANK for the default (1500 on ordinary Ethernet).\n\nSet this only to MATCH a link that needs a smaller MTU: a WireGuard / IPsec / GRE tunnel, PPPoE, or a provider underlay. Getting it wrong the other way is hard to spot — small requests keep working while large transfers hang.\n\nNot a performance setting. Applied at boot." \
-                18 72 -- "$NET_MTU" 3>&1 1>&2 2>&3) \
-                || return 1
-            # Both validators run before either is reported, so a screen
-            # with two independent mistakes on it does not take two trips.
-            local nerr merr allerr
-            nerr=$(_validate_static_net) || true
-            merr=$(_mtu_error) || true
-            if [ -z "$nerr" ] && [ -z "$merr" ]; then
+            _ask_mtu || return 1
+            # EXIT STATUS decides, not output-emptiness. _validate_static_net
+            # ends its heredoc with ``2>&1``, so any chatter this ISO's
+            # python emits on stderr — a DeprecationWarning, a locale gripe
+            # — lands in the captured text. Gating on "did it print
+            # anything" would make a VALID static config permanently
+            # unacceptable and trap the operator in this loop with an
+            # unfixable message. The MTU is already validated by _ask_mtu
+            # above, through a wrapper that keeps stderr out of the way.
+            local nerr
+            if nerr=$(_validate_static_net); then
                 break
             fi
-            allerr="$nerr"
-            if [ -n "$merr" ]; then
-                allerr="${allerr:+$allerr
-}$merr"
-            fi
             whiptail --backtitle "$BACKTITLE" --title "Static network — invalid" \
-                --msgbox "Please correct these before continuing:\n\n$allerr" 16 72 || true
+                --msgbox "Please correct these before continuing:\n\n$nerr" 16 72 || true
         done
     fi
 }
@@ -6260,6 +6266,18 @@ check_preseed() {
                 while IFS= read -r line; do
                     [ -n "$line" ] && errors+=("network: $line")
                 done <<<"$nerr"
+            fi
+        fi
+
+        # #1017 — the MTU, for the same belt-and-braces reason. The
+        # linter exists to predict what the install will do, and
+        # ``ask_network``'s preseed branch runs this check and aborts on
+        # it; without it here a file that lints clean can still stop a
+        # headless install at "Preseed network MTU is invalid".
+        if [ -n "${PRESEED_HAS_NETWORK:-}" ] && [ -n "${NET_MTU:-}" ]; then
+            local merr
+            if ! merr=$(_mtu_error); then
+                errors+=("network.mtu: $merr")
             fi
         fi
 

@@ -90,10 +90,13 @@ if [ -n "$ROLE_VAL" ]; then
     CONTROL_PLANE_URL_VAL="$(get_cfg control_plane_url)"
     BOOTSTRAP_PAIRING_CODE_VAL="$(get_cfg bootstrap_pairing_code)"
     mkdir -p /etc/spatiumddi
+    # printf for the same reason as the network-status sidecar below:
+    # dash's echo expands backslash escapes, and both of these values
+    # come verbatim from the hand-editable STATE config.
     {
-        echo "ROLE=$ROLE_VAL"
-        echo "CONTROL_PLANE_URL=$CONTROL_PLANE_URL_VAL"
-        echo "BOOTSTRAP_PAIRING_CODE=$BOOTSTRAP_PAIRING_CODE_VAL"
+        printf '%s\n' "ROLE=$ROLE_VAL"
+        printf '%s\n' "CONTROL_PLANE_URL=$CONTROL_PLANE_URL_VAL"
+        printf '%s\n' "BOOTSTRAP_PAIRING_CODE=$BOOTSTRAP_PAIRING_CODE_VAL"
     } > /etc/spatiumddi/role-config
     chmod 0644 /etc/spatiumddi/role-config
     echo "role-config rendered (ROLE=$ROLE_VAL)"
@@ -152,28 +155,35 @@ _render_ipv6_block() {
 _effective_mtu() {
     _mtu="$(get_cfg network_mtu)"
     [ -n "$_mtu" ] || return 0
-    # POSIX-shell integer test: reject anything with a non-digit,
-    # including a leading '+'/'-' and a decimal point.
+    # Three tests, in this order, and the ORDER is the safety property.
+    #
+    # ``[ -lt ]`` does not fail safe: given a digit string too long for a
+    # signed 64-bit integer, dash and bash both print "Illegal number" and
+    # exit NON-ZERO, which reads as "not out of range" and falls through
+    # to writing the value — and ``set -e`` does not catch it, because the
+    # test sits in an ``if`` condition. So a 20-digit MTU reached the
+    # keyfile, NetworkManager rejected the profile, and every surface
+    # reported the MTU as applied.
+    #
+    # The fix is a DIGIT-COUNT pattern rather than a length comparison:
+    # four digits is the entire legal range (9000), so the numeric test
+    # below is never reached with a string it cannot handle. An earlier
+    # cut used ``[ ${#_mtu} -gt 5 ]``, which let ``01400`` through to the
+    # keyfile verbatim — NetworkManager normalises that to 1400 on its
+    # next save, after which the adopt tool sees live=1400 against
+    # state=01400 and offers permanent phantom drift on a box where
+    # nothing changed.
     case "$_mtu" in
-        ''|*[!0-9]*)
+        *[!0-9]*)
             echo "WARN: network_mtu '$_mtu' is not a whole number — ignoring" >&2
             return 0
             ;;
+        [0-9]|[0-9][0-9]|[0-9][0-9][0-9]|[0-9][0-9][0-9][0-9]) : ;;
+        *)
+            echo "WARN: network_mtu '$_mtu' is outside 576-9000 — ignoring" >&2
+            return 0
+            ;;
     esac
-    # Bound the LENGTH before comparing the value, because the shell's
-    # ``[ -lt ]`` does not fail safe: given a digit string too long for a
-    # signed 64-bit integer, dash and bash both print "Illegal number"
-    # and exit NON-ZERO, which reads as "not out of range" and falls
-    # through to writing the value. ``set -e`` does not catch it either —
-    # the test is inside an ``if`` condition. So a 20-digit MTU landed in
-    # the keyfile, NetworkManager rejected the profile, and every surface
-    # reported the MTU as applied. 4 digits covers the whole legal range
-    # (9000); 5 is allowed through to the numeric check so an operator
-    # who typed 99999 still gets the range message rather than this one.
-    if [ "${#_mtu}" -gt 5 ]; then
-        echo "WARN: network_mtu '$_mtu' is far outside 576-9000 — ignoring" >&2
-        return 0
-    fi
     if [ "$_mtu" -lt 576 ] || [ "$_mtu" -gt 9000 ]; then
         echo "WARN: network_mtu $_mtu is outside 576-9000 — ignoring" >&2
         return 0
@@ -278,6 +288,25 @@ EOF
         NET_KEYFILE_WRITTEN=yes
         echo "network → static $NET_IP_VAL/$NET_PREFIX_VAL on $NET_IFACE_VAL"
     else
+        # #1017 — remove the stale profile rather than leaving it loaded.
+        #
+        # Leaving it was the pre-existing behaviour and it made the status
+        # sidecar LIE: the previous boot's keyfile, complete with its
+        # ``mtu=``, is still what NetworkManager reads, while the sidecar
+        # reports MTU_APPLIED=n/a because this boot wrote nothing. The
+        # fleet check upstream maps n/a to "the link default", so a node
+        # genuinely running 1400 was compared as though it were not — the
+        # host-gw black hole the check exists to catch, scored as healthy.
+        #
+        # Removing it is also the honest outcome on its own terms: STATE
+        # no longer describes a usable static config, so continuing to
+        # serve one assembled from a previous STATE is exactly the drift
+        # #276 built this renderer to prevent. NM falls back to its own
+        # auto profile, which is what an unconfigured box gets.
+        if [ -f "$NM_KEYFILE" ]; then
+            rm -f "$NM_KEYFILE"
+            echo "  removed the stale static keyfile (its STATE is incomplete)"
+        fi
         echo "WARN: network_mode=static but ip/interface missing — skipping keyfile"
     fi
 elif [ "$NET_MODE_VAL" = "dhcp" ]; then
@@ -357,24 +386,45 @@ if [ "$NET_KEYFILE_WRITTEN" = yes ]; then
     fi
 else
     _mtu_applied="n/a"
-    # Nothing is in force when no keyfile was written, whatever STATE
-    # asked for. MTU_REQUESTED below still carries the operator's value
-    # so the mismatch is diagnosable; MTU is what is ACTUALLY applied,
-    # and reporting 1400 here would have the fleet-consistency check
-    # upstream agree that two nodes match when one of them is running
-    # the link default.
-    NET_MTU_EFFECTIVE=""
+fi
+# What is ACTUALLY in force, which is not NET_MTU_EFFECTIVE when no
+# keyfile was written. Kept as its own local rather than clobbering
+# NET_MTU_EFFECTIVE, whose defining comment promises every consumer reads
+# one value: reassigning it here would silently give it two meanings
+# either side of this line, and anything added below would get the wrong
+# one with no test able to see the difference.
+if [ "$_mtu_applied" = applied ]; then
+    _mtu_inforce="$NET_MTU_EFFECTIVE"
+else
+    _mtu_inforce=""
 fi
 mkdir -p /etc/spatiumddi
+# printf, NOT echo. This is /bin/sh = dash, whose echo EXPANDS backslash
+# escapes — so a hand-edited ``network_mtu: "x\nMTU=9000"`` in STATE
+# would emit a SECOND ``MTU=`` line here. Every reader of this file
+# assigns while iterating, so the last occurrence wins: the supervisor
+# would report 9000 on a node running the link default, and the fleet
+# check would compare it as such. That is the one invariant this sidecar
+# exists to hold, defeated downstream of the validation that exists
+# precisely because STATE is hand-editable.
 {
-    echo "INTERFACE=$(get_cfg network_interface)"
-    echo "MODE=$NET_MODE_VAL"
-    echo "MTU=$NET_MTU_EFFECTIVE"
-    echo "MTU_REQUESTED=$_mtu_requested"
-    echo "MTU_APPLIED=$_mtu_applied"
+    printf '%s\n' "INTERFACE=$(get_cfg network_interface)"
+    printf '%s\n' "MODE=$NET_MODE_VAL"
+    printf '%s\n' "MTU=$_mtu_inforce"
+    printf '%s\n' "MTU_REQUESTED=$_mtu_requested"
+    printf '%s\n' "MTU_APPLIED=$_mtu_applied"
+    # Which boot wrote this. /etc is an overlay whose upperdir lives on
+    # /var and is therefore SHARED ACROSS A/B SLOTS, so a trial boot of a
+    # new slot that then rolls back leaves this file behind, written by a
+    # renderer the running slot does not have. Without a boot identity
+    # that stale claim is indistinguishable from a fresh one, and every
+    # MTU surface reports a value the running system is not using. Readers
+    # compare it with /proc/sys/kernel/random/boot_id and treat a
+    # mismatch as "not reported" rather than as fact.
+    printf '%s\n' "BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
 } > /etc/spatiumddi/network-status
 chmod 0644 /etc/spatiumddi/network-status
-echo "network-status rendered (MTU=${NET_MTU_EFFECTIVE:-default} $_mtu_applied)"
+echo "network-status rendered (MTU=${_mtu_inforce:-default} $_mtu_applied)"
 
 # ── Supervisor identity on STATE ─────────────────────────────────────
 # The spatium-supervisor pod's persistent identity (Ed25519 keypair,

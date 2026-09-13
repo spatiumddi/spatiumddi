@@ -42,7 +42,8 @@ import ipaddress
 import re
 import secrets
 import uuid
-from dataclasses import replace
+from collections.abc import Sequence
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
@@ -104,15 +105,11 @@ from app.services.appliance.ca import (
 from app.services.appliance.firewall import firewall_bundle
 from app.services.appliance.lldp import lldp_bundle
 from app.services.appliance.network_mtu import (
-    MtuFleetSummary,
-    has_network_report,
-    network_report,
-)
-from app.services.appliance.network_mtu import (
     evaluate_node as evaluate_node_mtu,
 )
 from app.services.appliance.network_mtu import (
-    fleet_summary as mtu_fleet_summary,
+    fleet_summary_for_appliances,
+    network_report,
 )
 from app.services.appliance.ntp import ntp_bundle
 from app.services.appliance.resolver import resolver_bundle
@@ -2787,6 +2784,10 @@ class ApplianceRow(BaseModel):
     # the case it exists for is the one where that value was not a
     # number (the renderer dropped it). Typing it as an int makes it
     # null exactly when it is needed.
+    # NOTE for anyone adding a field here off ``cluster_health``: that
+    # column is stored VERBATIM from the heartbeat with no inner-shape
+    # validation, so every value read out of it must be coerced before it
+    # reaches a typed field — see ``mtu_fields``.
     mtu_requested: str | None = None
     #: ``applied`` / ``default`` / ``dropped`` / ``n/a``.
     mtu_applied: str | None = None
@@ -2867,49 +2868,48 @@ def _storage_worst_severity(row: Appliance) -> str | None:
     return worst_severity(_storage_findings(row))
 
 
-def _mtu_fields(row: Appliance) -> dict[str, Any]:
-    """#1017 — the MTU half of one appliance row.
+def mtu_fields(cluster_health: Any) -> dict[str, Any]:
+    """#1017 — the MTU half of one appliance row, from ONE read.
 
-    Its own function so the reading and the findings are derived from the
-    same report: reading ``cluster_health`` twice at the call site is how
-    a row ends up showing a value with no finding attached to it.
+    Shared with the copilot's row builder so the two surfaces cannot
+    disagree about how to read the same field, and resolved once so the
+    reading and the findings come from the same report — reading
+    ``cluster_health`` again at the call site is how a row ends up
+    showing a value with no finding attached to it.
+
+    Every value is coerced on the way out, because ``cluster_health`` is
+    stored verbatim from the heartbeat with no inner-shape validation: a
+    supervisor (buggy, downgraded, or a hand-edited row) reporting
+    ``{"mtu": "abc"}`` would otherwise raise ValidationError inside
+    ``_row_to_schema`` and 500 the list endpoint for the WHOLE fleet.
+    ``bool`` is excluded explicitly, being an ``int``.
     """
-    report = network_report(row.cluster_health) or {}
+    report = network_report(cluster_health)
+    data = report or {}
+    raw_mtu = data.get("mtu")
+    raw_applied = data.get("mtu_applied")
+    raw_requested = data.get("mtu_requested")
     return {
-        "mtu": report.get("mtu"),
-        "mtu_requested": (
-            str(report["mtu_requested"]) if report.get("mtu_requested") is not None else None
-        ),
-        "mtu_applied": report.get("mtu_applied"),
-        "mtu_reported": has_network_report(row.cluster_health),
+        "mtu": (raw_mtu if isinstance(raw_mtu, int) and not isinstance(raw_mtu, bool) else None),
+        "mtu_requested": (str(raw_requested) if isinstance(raw_requested, (str, int)) else None),
+        "mtu_applied": raw_applied if isinstance(raw_applied, str) else None,
+        "mtu_reported": report is not None,
         "mtu_findings": [
             {"severity": f.severity, "kind": f.kind, "detail": f.detail}
-            for f in evaluate_node_mtu(row.cluster_health)
+            for f in evaluate_node_mtu(cluster_health)
         ],
     }
 
 
-def _mtu_fleet(rows: list[Appliance]) -> MtuFleet:
+def _mtu_fleet(rows: Sequence[Appliance]) -> MtuFleet:
     """The fleet verdict over the rows a list endpoint already loaded.
 
-    Only APPROVED appliances are compared. A pending or rejected node is
-    not in the k3s cluster, so its MTU cannot black-hole anything — and
-    including one would report a mismatch the operator has no way to act
-    on short of approving the node first.
+    Membership is decided by ``network_mtu.in_cluster`` — shared with the
+    copilot tool, because a predicate this load-bearing living in two
+    places means the API and the copilot can give different verdicts for
+    the same cluster.
     """
-    summary: MtuFleetSummary = mtu_fleet_summary(
-        [
-            (r.hostname, r.cluster_health)
-            for r in rows
-            if r.state == APPLIANCE_STATE_APPROVED and r.revoked_at is None
-        ]
-    )
-    return MtuFleet(
-        reported=summary.reported,
-        answers=summary.answers,
-        consistent=summary.consistent,
-        detail=summary.detail,
-    )
+    return MtuFleet(**asdict(fleet_summary_for_appliances(rows)))
 
 
 def _row_to_schema(row: Appliance) -> ApplianceRow:
@@ -2977,7 +2977,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         ],
         storage_worst_severity=_storage_worst_severity(row),
         storage_reported=has_storage_report(row.cluster_health),
-        **_mtu_fields(row),
+        **mtu_fields(row.cluster_health),
         k3s_version=row.k3s_version,
         kubeconfig_set=row.kubeconfig_encrypted is not None,
         k3s_api_cert_expires_at=row.k3s_api_cert_expires_at,
@@ -3005,7 +3005,7 @@ async def list_appliances(current_user: CurrentUser, db: DB) -> ApplianceList:
     )
     return ApplianceList(
         appliances=[_row_to_schema(r) for r in rows],
-        mtu_fleet=_mtu_fleet(list(rows)),
+        mtu_fleet=_mtu_fleet(rows),
     )
 
 

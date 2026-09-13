@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -168,6 +169,12 @@ def test_no_mtu_configured_writes_no_mtu_line(tmp_path):
         # catch it because the test sits in an ``if`` condition.
         "99999999999999999999",
         "1" * 40,
+        # Leading zeros: a LENGTH gate let "01400" through to the keyfile
+        # verbatim, and NetworkManager normalises it to 1400 on its next
+        # save — after which the adopt tool sees live=1400 against
+        # state=01400 and offers permanent phantom drift.
+        "01400",
+        "0001400",
     ],
 )
 def test_a_value_the_renderer_cannot_trust_is_dropped_not_written(tmp_path, bad):
@@ -263,12 +270,23 @@ def test_the_sidecar_and_the_keyfile_agree_on_every_applied_value(tmp_path):
 
 
 def _mtu_error(mtu: str, v6_mode: str = "auto", v6_ip: str = "") -> str | None:
-    """Run the wizard's ``_mtu_error``; None when it accepts."""
+    """Run the WIZARD's ``_mtu_error``; None when it accepts.
+
+    It is now a thin caller of ``_check_field``, which shells out to
+    ``spatium-preseed-parse --check-field mtu`` — so this drives the real
+    plumbing (including the wrapper's ``.strip()`` and its
+    stderr-to-the-log discipline) rather than a transcribed copy.
+    """
     script = "\n".join(
         [
             "set -uo pipefail",
+            'log() { :; }',
+            f'INSTALL_LOG=/dev/null',
+            f'_preseed_parser_path() {{ printf "%s" "{PARSER}"; }}',
+            extract_fn("_check_field"),
             extract_fn("_mtu_error"),
             f'NET_MTU="{mtu}"; NET6_MODE="{v6_mode}"; NET6_IP="{v6_ip}"',
+            'NET_MODE="static"; NET_INTERFACE="eth0"',
             "_mtu_error",
         ]
     )
@@ -309,19 +327,95 @@ def test_the_wizard_allows_below_1280_when_static_ipv6_has_no_address():
 # ── the three doors agree ─────────────────────────────────────────────
 
 
+def _wizard_canonical(typed: str) -> str:
+    """What ``_ask_mtu`` would STORE for this keystroke sequence.
+
+    Sliced out of the shipped function so the parity test compares the
+    doors on the value that actually reaches STATE. The value arrives on
+    stdin so a real tab or newline reaches the shell.
+    """
+    fn = extract_fn("_ask_mtu")
+    body = fn[fn.index('NET_MTU="$(printf') : fn.index("if merr=")]
+    proc = subprocess.run(
+        ["bash", "-c", 'NET_MTU="$(cat)"\n' + body + '\nprintf "%s" "$NET_MTU"'],
+        input=typed,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.stdout
+
+
+def _parser_validate(value: str, v6_mode: str = "auto", v6_ip: str = "") -> str | None:
+    """Run the PARSER's own ``--check-field mtu``; None when it accepts.
+
+    The third door, executed rather than grepped. The CHANGELOG claims
+    all three agree, and the first cut of this file drove two — the
+    parser was covered by a substring match, so a divergence in its copy
+    of the rule could not fail anything.
+    """
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(PARSER),
+            "--check-field",
+            "mtu",
+            value,
+            v6_mode,
+            v6_ip,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return None if proc.returncode == 0 else (proc.stdout.strip() or proc.stderr.strip())
+
+
 @pytest.mark.parametrize(
     "value,acceptable",
-    [("1400", True), ("576", True), ("9000", True), ("575", False), ("9001", False), ("0", False)],
+    [
+        ("1400", True),
+        ("576", True),
+        ("9000", True),
+        ("575", False),
+        ("9001", False),
+        ("0", False),
+        ("+1400", False),
+        ("99999999999999999999", False),
+        # Canonicalised to 1400 on the way in, so every door accepts the
+        # STORED form. That is the point: typed at the prompt it is a
+        # legitimate way to write 1400, while the same string reaching
+        # the renderer from a hand-edited STATE is refused (see the
+        # dropped-value cases above) — which is exactly why the wizard
+        # must not store it verbatim.
+        ("01400", True),
+        ("0001400", True),
+        (" 1400 ", True),
+    ],
 )
-def test_the_wizard_and_the_renderer_reach_the_same_verdict(tmp_path, value, acceptable):
-    """One rule, three doors. A value one accepts and another drops is a
-    setting the operator was told took effect and did not — the exact
-    failure this feature exists to prevent, reproduced inside it.
+def test_all_three_doors_reach_the_same_verdict(tmp_path, value, acceptable):
+    """One rule, three doors, all three EXECUTED.
+
+    A value one door accepts and another drops is a setting the operator
+    was told took effect and did not — the exact failure this feature
+    exists to prevent, reproduced inside it. The wizard and the parser
+    now share one ``validate_mtu``, so the interesting comparison is
+    against the renderer, which is independent shell.
     """
+    value = _wizard_canonical(value)
     wizard_ok = _mtu_error(value) is None
+    parser_ok = _parser_validate(value) is None
     rendered = _run_render(tmp_path, _STATIC + f"\nnetwork_mtu: {value}")
     render_ok = rendered["mtu"] is not None
-    assert wizard_ok is render_ok is acceptable
+    assert wizard_ok is parser_ok is render_ok is acceptable
+
+
+def test_all_three_doors_agree_on_the_ipv6_floor():
+    """RFC 8200's 1280, at every door that can see the v6 answer."""
+    assert _mtu_error("1200", "static", "2001:db8::5") is not None
+    assert _parser_validate("1200", "static", "2001:db8::5") is not None
+    assert _mtu_error("1200") is None
+    assert _parser_validate("1200") is None
 
 
 # ── structural: the wiring that has no runtime surface here ───────────
@@ -348,9 +442,52 @@ def test_any_port_dhcp_is_not_offered_an_mtu():
     assert '[ "$NET_MODE" = "dhcp" ] && [ -n "$NET_INTERFACE" ]' in fn
 
 
-def test_the_preseed_parser_refuses_an_mtu_with_no_pinned_interface():
-    parser = PARSER.read_text(encoding="utf-8")
-    assert "network.mtu requires network.interface" in parser
+def test_an_mtu_with_no_pinned_dhcp_interface_is_refused():
+    """Executed at the parser, not grepped. etc-render writes no keyfile
+    for any-port DHCP, so the value would reach nothing.
+    """
+    proc = subprocess.run(
+        [sys.executable, str(PARSER), "--check-field", "mtu", "1400", "auto", "", "dhcp", ""],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 2
+    assert "pinned interface" in proc.stdout
+    # …and is fine once a port is named.
+    ok = subprocess.run(
+        [sys.executable, str(PARSER), "--check-field", "mtu", "1400", "auto", "", "dhcp", "eth0"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert ok.returncode == 0
+
+
+@pytest.mark.parametrize(
+    "typed,stored",
+    [
+        (" 1400", "1400"),
+        ("1400 ", "1400"),
+        ("\t1400\n", "1400"),
+        ("01400", "1400"),
+        ("0001400", "1400"),
+        ("0", "0"),
+        ("000", "0"),
+        ("1400", "1400"),
+        ("abc", "abc"),
+    ],
+)
+def test_the_wizard_canonicalises_what_it_stores(typed, stored):
+    """Executed, not grepped.
+
+    ``--check-field`` strips before validating and the parser stores
+    ``str(int(...))``, so the wizard must reach the SAME form or it
+    validates one value and writes another — this feature's own failure
+    mode, inside the feature. A non-numeric value is left alone for the
+    validator to report on.
+    """
+    assert _wizard_canonical(typed) == stored
 
 
 def test_the_adopt_tool_models_the_mtu():

@@ -94,6 +94,81 @@ the formatter handles the rest.
   answers exactly this and gained the field plus the fleet verdict) and
   not a feature module (#14 — it extends an existing resource). Applied
   at boot, and every surface says so.
+  **A ten-angle /code-review found the design right and the plumbing
+  wrong. Every confirmed finding is fixed; the ones worth knowing:**
+  **The fleet comparison spanned the wrong nodes** — it filtered on
+  *approved*, and approved is not "in the k3s cluster": an un-promoted
+  Additional node has `cluster_role IS NULL` and runs its own
+  single-node k3s, which APPLIANCE.md says outright. So this feature's
+  own headline deployment — a branch DNS appliance on a 1400-MTU tunnel
+  beside a control plane at the default — raised a permanent,
+  unclearable banner claiming flannel would black-hole traffic between
+  two boxes sharing no pod network. Membership is `cluster_role` now, in
+  one predicate both the REST list and the copilot call.
+  **The wizard validated one value and stored another.** It checked a
+  stripped copy and wrote the raw string, so a pasted `" 1400"` was
+  accepted, shown on Confirm, written to STATE and dropped at boot —
+  this feature's own failure mode, inside the feature. Leading zeros
+  were worse: `01400` is a fine `int` to both writing doors and is
+  refused by the renderer, and written through, NetworkManager
+  normalises it on its next save and the adopt tool then offers phantom
+  drift forever.
+  **The rule was transcribed instead of shared.** #995 built
+  `--check-field` precisely so the wizard carries no second copy of a
+  validator, and the two copies had already drifted at birth. There is
+  one `validate_mtu` now, which also closes the `isdigit()`/`int()`
+  domain gap in both directions (`'٤'` converts, so it would be stored
+  then dropped; `'²'` raises, which on the parse path was an uncaught
+  traceback) and applies the "DHCP needs a pinned interface" rule at
+  every door rather than one.
+  **`echo` is not `printf`.** The sidecar is written by `/bin/sh` =
+  dash, whose `echo` expands backslash escapes, so a hand-edited
+  `network_mtu` containing one emitted a SECOND `MTU=` line — and every
+  reader assigns while iterating, so the last wins. The supervisor would
+  report 9000 on a node at the link default: the one invariant the
+  sidecar exists to hold, defeated downstream of the validation that
+  exists because STATE is hand-editable.
+  **A skipped keyfile left the previous boot's MTU in force** while the
+  sidecar said `n/a`, so a node genuinely running 1400 was compared as
+  the link default. The stale profile is removed now.
+  **`--adopt` was a fourth door with no rule** — an nmtui `mtu=500` is
+  legal to NetworkManager and below our floor, so the console printed
+  "Adopted 1 setting(s)" and the next boot dropped it. And a suppressed
+  difference made `--check` print "Live profile matches STATE" directly
+  above the note contradicting it and exit 0 against a documented
+  exit-code contract, while `--adopt` dropped the note entirely.
+  Refusals are a field on the drift entry now, so every surface sees
+  them.
+  **The 576-9000 guard was bypassed by an over-long digit string.** The
+  shell's `[ -lt ]` does not fail safe — dash and bash both print
+  "Illegal number" and exit non-zero, which reads as "not out of range"
+  — so a 20-digit MTU reached the keyfile, NM rejected the profile, and
+  every surface reported it applied. `set -e` does not catch it inside
+  an `if`.
+  **The static-network loop had flipped from exit status to
+  output-emptiness** while both validators merge stderr into stdout, so
+  one `DeprecationWarning` from a future image's python would have made
+  a valid config permanently unacceptable and trapped the operator on
+  the screen with no way forward.
+  **The console chip ran a file read on the 0.5 s render tick**,
+  breaking an invariant that file documents twice, and sat ahead of
+  `Build` on a no-wrap line — so a refused MTU pushed the running
+  version off an 80-column serial console, on exactly the screen an
+  operator opens when something is wrong.
+  **Plus:** unvalidated JSONB reached a typed response model, so one
+  malformed heartbeat would have 500'd the appliance list for the whole
+  fleet; the copilot row did the double-read its REST sibling's
+  docstring forbids and shipped two of five fields; the tool description
+  never mentioned MTU, so the capability #13 compliance rests on was
+  unroutable; and the banner asserted flannel host-gw as a constant
+  while `Appliance.dataplane_backend` already records it per node.
+  **The tests changed too, and one change paid for itself.** The parity
+  test drove two doors while the claim was three, and compared what the
+  operator typed rather than what the wizard stores — it executes all
+  three on the stored value now, and that is what caught the
+  leading-zero divergence. The adopt-suppression tests called the helper
+  directly, so deleting the wiring inside `compare()` left them green;
+  they go through `compare()` now.
 
 ### Changed
 

@@ -67,6 +67,17 @@ from typing import TypedDict
 class DriftEntry(TypedDict):
     state: str
     live: str
+    #: False when adopting this difference would make things worse rather
+    #: than better — today, an MTU the RENDERER refused, or one
+    #: NetworkManager will accept and the renderer will not. Modelled as a
+    #: field on the entry rather than by deleting the entry and appending
+    #: to a parallel list: deleting it made ``--check`` print "Live
+    #: profile matches STATE" directly above the note contradicting it and
+    #: exit 0, against a documented "exit 10 = drift" contract, while
+    #: ``--adopt`` skipped the note entirely.
+    adoptable: bool
+    #: Why not. Empty when ``adoptable``.
+    reason: str
 
 
 class AdoptReport(TypedDict):
@@ -85,9 +96,6 @@ class AdoptReport(TypedDict):
     drift: dict[str, DriftEntry]
     unadoptable: list[str]
     extra_profiles: list[str]
-    #: Things worth saying that are neither drift nor unadoptable —
-    #: today, an MTU the RENDERER refused. See ``_mtu_suppression``.
-    notes: list[str]
 
 STATE_CONFIG = Path("/var/lib/spatium-state/spatium-config.yaml")
 #: What spatium-etc-render recorded about the last boot's network render
@@ -427,7 +435,12 @@ def drift_for(state: dict[str, str], live: dict[str, str]) -> dict[str, dict[str
     default was nearly missed.
     """
     return {
-        key: {"state": state.get(key, ""), "live": value}
+        key: {
+            "state": state.get(key, ""),
+            "live": value,
+            "adoptable": True,
+            "reason": "",
+        }
         for key, value in live.items()
         if _state_value(state, key) != value
     }
@@ -449,7 +462,6 @@ def compare(state: dict[str, str] | None = None) -> AdoptReport:
             "drift": {},
             "unadoptable": [],
             "extra_profiles": _extra_profiles(),
-            "notes": [],
         }
     if not keyfile.exists():
         return {
@@ -459,19 +471,33 @@ def compare(state: dict[str, str] | None = None) -> AdoptReport:
             "drift": {},
             "unadoptable": [],
             "extra_profiles": _extra_profiles(),
-            "notes": [],
         }
     kf = parse_keyfile(keyfile)
     live = _state_from_keyfile(kf)
     drift = drift_for(state, live)
-    notes: list[str] = []
-    # #1017 — a missing mtu= that the RENDERER caused is not the
-    # operator's edit, and adopting it would erase their value.
-    if "network_mtu" in drift and not drift["network_mtu"]["live"]:
-        suppression = _mtu_suppression()
-        if suppression is not None:
-            del drift["network_mtu"]
-            notes.append(suppression)
+    # #1017 — two ways an MTU difference must not be adopted, both marked
+    # on the entry so every surface (the renderer, the exit code, the
+    # console) sees them without a parallel channel to remember.
+    entry = drift.get("network_mtu")
+    if entry is not None:
+        if not entry["live"]:
+            # A missing mtu= that the RENDERER caused is not the
+            # operator's edit; adopting it would erase their value.
+            # The module attribute, read at CALL time. Passing it makes
+            # the path substitutable; relying on the default binds it at
+            # def time, which is what let the first cut of the tests
+            # exercise the helper directly while this wiring ran against
+            # a path that does not exist under test — so deleting the
+            # wiring entirely kept the suite green.
+            suppression = _mtu_suppression(NETWORK_STATUS)
+            if suppression is not None:
+                entry["adoptable"] = False
+                entry["reason"] = suppression
+        else:
+            refusal = _mtu_adopt_refusal(entry["live"])
+            if refusal is not None:
+                entry["adoptable"] = False
+                entry["reason"] = refusal
     return {
         "managed": True,
         "keyfile": str(keyfile),
@@ -479,8 +505,43 @@ def compare(state: dict[str, str] | None = None) -> AdoptReport:
         "drift": drift,
         "unadoptable": _unadoptable(kf),
         "extra_profiles": _extra_profiles(),
-        "notes": notes,
     }
+
+
+#: The 576-9000 / RFC-8200 rule, as the renderer applies it. A LOCAL copy
+#: on purpose and only here: this tool ships on the appliance beside
+#: ``spatium-etc-render`` and must not grow a dependency on the installer
+#: image's ``spatium-preseed-parse``, which is not present on an installed
+#: system. It is deliberately the LOOSER half — range only — because the
+#: v6 clause needs STATE context this function does not have, and the
+#: renderer re-checks everything at boot regardless. The point here is to
+#: stop the tool WRITING a value it knows the renderer will refuse, not to
+#: be a fourth authority.
+_MTU_MIN = 576
+_MTU_MAX = 9000
+
+
+def _mtu_adopt_refusal(value: str) -> str | None:
+    """Why this live MTU must not be written to STATE, or None.
+
+    Without this, ``--adopt`` was a fourth door with no rule: an nmtui
+    ``mtu=500`` (legal to NetworkManager — the Ethernet minimum is 68)
+    became drift, the console printed "Adopted 1 setting(s) into STATE:
+    network_mtu = 500", and the next boot's 576 floor dropped it. The
+    operator was told the save succeeded and the appliance silently went
+    back to the link default.
+    """
+    if not value:
+        return None
+    if not (value.isascii() and value.isdigit()):
+        return f"NetworkManager reports mtu={value!r}, which is not a whole number"
+    mtu = int(value)
+    if not _MTU_MIN <= mtu <= _MTU_MAX:
+        return (
+            f"MTU {mtu} is outside the {_MTU_MIN}-{_MTU_MAX} range SpatiumDDI "
+            "renders, so the next boot would refuse it"
+        )
+    return None
 
 
 def _mtu_suppression(path: Path = NETWORK_STATUS) -> str | None:
@@ -527,10 +588,19 @@ def _mtu_suppression(path: Path = NETWORK_STATUS) -> str | None:
             "/var/log/spatiumddi/etc-render.log."
         )
     if applied == "n/a":
+        # Reachable only from a MANAGED profile, so not the DHCP-any-port
+        # shape: ``compare()`` returns early with ``managed: False`` for
+        # that one, long before this is called. What actually gets here is
+        # a static stanza whose STATE is incomplete (no interface / no
+        # address), where the renderer writes no keyfile. Saying "DHCP
+        # with no pinned interface" here — as the first cut did — told an
+        # operator with a half-written static config the opposite of what
+        # was wrong.
         return (
-            f"MTU {requested} is in STATE but this install shape writes no "
-            "connection profile (DHCP with no pinned interface), so it "
-            "applies to nothing. Left in STATE rather than adopted away."
+            f"MTU {requested} is in STATE but no connection profile was "
+            "written at the last boot, so it applies to nothing — the "
+            "network settings in STATE are incomplete. Left in STATE "
+            "rather than adopted away."
         )
     return None
 
@@ -571,9 +641,13 @@ def _render(report: AdoptReport) -> str:
         for key in sorted(drift):
             entry = drift[key]
             state_val = entry["state"] or "(unset)"
-            lines.append(f"  {key}: STATE={state_val}  live={entry['live']}")
-        lines.append("")
-        lines.append("Adopt these into STATE with: spatium-network-adopt --adopt")
+            live_val = entry["live"] or "(unset)"
+            lines.append(f"  {key}: STATE={state_val}  live={live_val}")
+            if not entry["adoptable"]:
+                lines.append(f"      NOT adopted — {entry['reason']}")
+        if any(e["adoptable"] for e in drift.values()):
+            lines.append("")
+            lines.append("Adopt these into STATE with: spatium-network-adopt --adopt")
     elif report["managed"] and not report["reason"]:
         lines.append("Live profile matches STATE — nothing would revert.")
     unadoptable = report["unadoptable"]
@@ -583,11 +657,6 @@ def _render(report: AdoptReport) -> str:
         lines.append("whether or not you adopt:")
         for key in unadoptable:
             lines.append(f"  {key}")
-    notes = report.get("notes") or []
-    if notes:
-        lines.append("")
-        for note in notes:
-            lines.append(f"NOTE: {note}")
     extra = report["extra_profiles"]
     if extra:
         lines.append("")
@@ -628,13 +697,24 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.adopt:
         drift = report["drift"]
-        if not drift:
+        refused = {k: e for k, e in drift.items() if not e["adoptable"]}
+        adoptable = {k: e for k, e in drift.items() if e["adoptable"]}
+        if not adoptable:
             if args.json:
                 print(json.dumps({"adopted": [], **report}, indent=2))
             else:
-                print("Nothing to adopt — the live profile already matches STATE.")
+                if refused:
+                    # NOT "the live profile already matches STATE": it
+                    # demonstrably does not, and saying so here was how an
+                    # operator learned nothing about an MTU being refused
+                    # on every boot.
+                    print("Nothing adoptable — the differences below cannot be saved:")
+                    for key in sorted(refused):
+                        print(f"  {key}: {refused[key]['reason']}")
+                else:
+                    print("Nothing to adopt — the live profile already matches STATE.")
             return 0
-        updates = {key: str(entry["live"]) for key, entry in drift.items()}
+        updates = {key: str(entry["live"]) for key, entry in adoptable.items()}
         try:
             changed = write_state(updates)
         except (AdoptError, OSError) as exc:
@@ -646,6 +726,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Adopted {len(changed)} setting(s) into STATE:")
             for key in changed:
                 print(f"  {key} = {updates[key]}")
+            if refused:
+                print("")
+                print("NOT adopted:")
+                for key in sorted(refused):
+                    print(f"  {key}: {refused[key]['reason']}")
             unadoptable = report["unadoptable"]
             if unadoptable:
                 print("")
@@ -665,6 +750,10 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, indent=2))
     else:
         print(_render(report))
+    # Drift is drift whether or not it can be adopted — APPLIANCE.md
+    # documents this as "exit 0 converged, 10 drift", and a monitoring
+    # wrapper told 0 while a configured MTU is refused every boot is worse
+    # than one told nothing.
     return 10 if report["drift"] else 0
 
 

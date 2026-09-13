@@ -298,15 +298,23 @@ instead of encapsulating — so the pod network inherits the node MTU with
 black-holes pod-to-pod traffic and presents as random timeouts, with nothing
 else in the UI that would explain it.
 
-So the MTU is compared across the fleet rather than treated as a per-node
-detail. The supervisor reports what etc-render *applied* (from
+So the MTU is compared across the cluster rather than treated as a
+per-node detail. The supervisor reports what etc-render *applied* (from
 `/etc/spatiumddi/network-status`, read through the bind mount role-config
 already uses — no chart change), and the control plane raises a warning on
 **Appliance → Fleet** naming the nodes on each side. The per-node value
 appears in the Fleet drilldown and, when there is something to say, on the
 console's identity row.
 
-Two properties of that check are deliberate:
+**Only control-plane cluster members are compared**, not every approved
+appliance. An Additional node that has not been promoted runs its *own*
+single-node k3s and shares no flannel network with the control plane, so
+its MTU cannot black-hole anything there — and comparing it would put a
+permanent, unclearable warning on the commonest reason to set an MTU at
+all: a branch DNS appliance reached over a reduced-MTU tunnel. Promote it
+and it joins the comparison, which is exactly when it starts to matter.
+
+Three more properties of that check are deliberate:
 
 - **"Unset" is compared as itself, never as 1500.** Scoring an unconfigured
   node at the Ethernet default is a guess about hardware nobody read: an
@@ -316,7 +324,16 @@ Two properties of that check are deliberate:
 - **A node that has not reported is excluded, not assumed.** A supervisor
   too old to write the sidecar ships no reading. Folding that in as
   "default" would report a genuine mismatch as agreement on exactly the
-  nodes that could not answer.
+  nodes that could not answer. A *stale* sidecar counts as not reported
+  too: `/etc` is an overlay shared across the A/B slots, so a trial boot
+  that rolls back leaves a file the running slot never wrote, and the
+  reading carries the boot id it was written under.
+- **Anything else is compared rather than dropped.** Every applied-state
+  the renderer can record except a real measurement means "the link
+  default", so an unrecognised one — from a newer slot, or a truncated
+  field — is folded in rather than silently removed from the comparison.
+  A wrong warning is recoverable; a node quietly missing from the check
+  is the black hole it exists to catch.
 
 What is reported is what was **applied**, not what STATE asked for — the
 renderer drops a value it refuses, and reporting the request would have the

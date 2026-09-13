@@ -27,16 +27,20 @@ platform admin" error.
 from __future__ import annotations
 
 import uuid
+from dataclasses import asdict
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.v1.appliance.supervisor import mtu_fields
 from app.core.permissions import is_effective_superadmin
 from app.models.appliance import (
     APPLIANCE_STATE_APPROVED,
     APPLIANCE_STATE_PENDING_APPROVAL,
+    CLUSTER_ROLE_MEMBER,
+    CLUSTER_ROLE_PRIMARY,
     Appliance,
     ApplianceUpgradeImage,
 )
@@ -46,9 +50,6 @@ from app.services.ai.tools.base import register_tool
 from app.services.ai.tools.proposals import _persist_proposal, _proposal_result
 from app.services.appliance.network_mtu import (
     fleet_summary as mtu_fleet_summary,
-)
-from app.services.appliance.network_mtu import (
-    network_report,
 )
 
 
@@ -98,11 +99,12 @@ def _row_to_dict(row: Appliance) -> dict[str, Any]:
         "approved_at": (row.approved_at.isoformat() if row.approved_at else None),
         "last_seen_at": (row.last_seen_at.isoformat() if row.last_seen_at else None),
         # #1017 — the interface MTU etc-render actually APPLIED, not what
-        # STATE asked for. None means the supervisor never reported one,
-        # which is UNKNOWN and is not the same as "at the link default" —
-        # ``mtu_applied`` is what tells them apart.
-        "mtu": (network_report(row.cluster_health) or {}).get("mtu"),
-        "mtu_applied": (network_report(row.cluster_health) or {}).get("mtu_applied"),
+        # STATE asked for. Through the same helper the REST row uses, so
+        # the two surfaces cannot disagree about how to read the field,
+        # and so the copilot gets ``mtu_reported`` (UNKNOWN vs "no MTU
+        # set"), ``mtu_requested`` and the refusal reason rather than the
+        # bare value.
+        **mtu_fields(row.cluster_health),
         "last_seen_ip": row.last_seen_ip,
         "cert_serial": row.cert_serial,
         "cert_expires_at": (row.cert_expires_at.isoformat() if row.cert_expires_at else None),
@@ -194,12 +196,23 @@ class FindApplianceFleetArgs(BaseModel):
         "Returns every appliance row — pending + approved + rejected — "
         "with the supervisor's capabilities, assigned roles, group "
         "FKs, deployment kind, installed appliance version, slot info, "
-        "and last-seen timestamps. Filterable by state, by an assigned "
-        "role, or by a tag key/value. Use to answer questions like "
-        "'which boxes can run DHCP?', 'which appliances tagged "
-        "site=prod-east are running BIND9?', or 'what version is the "
-        "fleet on?'. The result is read-only — write actions go "
-        "through ``propose_approve_appliance`` / ``propose_assign_role``."
+        "last-seen timestamps, and each node's applied interface MTU. "
+        "Filterable by state, by an assigned role, or by a tag "
+        "key/value. Use to answer questions like 'which boxes can run "
+        "DHCP?', 'which appliances tagged site=prod-east are running "
+        "BIND9?', 'what version is the fleet on?', or 'are my nodes all "
+        "on the same MTU?'. The top-level ``mtu_fleet`` block answers "
+        "that last one for the CLUSTER — k3s runs flannel host-gw, so a "
+        "mixed-MTU cluster black-holes pod-to-pod traffic — and is "
+        "always computed over every control-plane cluster member, never "
+        "over the filtered page. Per row, ``mtu_reported: false`` means "
+        "the supervisor is too old to report: that is UNKNOWN and must "
+        "NOT be described as 'no MTU is set'. ``mtu_applied`` says which "
+        "of applied / default / dropped / n-a, and ``dropped`` means the "
+        "operator configured a value the appliance REFUSED, with the "
+        "reason in ``mtu_findings``. The result is read-only — write "
+        "actions go through ``propose_approve_appliance`` / "
+        "``propose_assign_role``."
     ),
     args_model=FindApplianceFleetArgs,
     category="admin",
@@ -215,15 +228,6 @@ async def find_appliance_fleet(
     if args.state is not None:
         stmt = stmt.where(Appliance.state == args.state)
     rows = list((await db.execute(stmt)).scalars().all())
-    # Kept before the filters below, for the fleet-wide MTU verdict: it
-    # is a statement about the CLUSTER, so it must not narrow with the
-    # caller's filters. Re-queried only when ``state`` narrowed the SQL
-    # itself.
-    if args.state is None:
-        all_rows = rows
-    else:
-        all_rows = list((await db.execute(select(Appliance))).scalars().all())
-
     # Role + tag filters are JSONB — easier to filter in Python than
     # to fold them into the SQL with @> operators (the role filter
     # would need a JSONB containment expression that's awkward to
@@ -236,17 +240,32 @@ async def find_appliance_fleet(
         else:
             rows = [r for r in rows if args.tag_key in (r.tags or {})]
 
-    # #1017 — the fleet MTU verdict, computed over every APPROVED
-    # appliance rather than over the filtered + truncated page. A
-    # consistency answer that changed with the caller's ``role`` filter
-    # or ``limit`` would be worse than none: the whole claim is about the
-    # cluster, and "consistent" derived from three of nine nodes is a
-    # green light nobody should act on.
+    # #1017 — the fleet MTU verdict, computed over every cluster MEMBER
+    # rather than over the filtered + truncated page. A consistency
+    # answer that changed with the caller's ``role`` filter or ``limit``
+    # would be worse than none: the whole claim is about the cluster, and
+    # "consistent" derived from three of nine nodes is a green light
+    # nobody should act on.
+    #
+    # Its own NARROW query — two columns, filtered in SQL — rather than a
+    # second ``select(Appliance)``. That model has ~90 columns including
+    # 15 JSONB, an encrypted kubeconfig and an upgrade-log tail, none
+    # deferred, so re-hydrating the fleet to read two fields shipped
+    # ~100 KB a second time and threw the decode away. Membership is
+    # cluster ROLE, not approval: an approved-but-unpromoted Additional
+    # node runs its own single-node k3s and shares no flannel network.
     mtu = mtu_fleet_summary(
         [
-            (r.hostname, r.cluster_health)
-            for r in all_rows
-            if r.state == APPLIANCE_STATE_APPROVED and r.revoked_at is None
+            (hostname or "", cluster_health)
+            for hostname, cluster_health in (
+                await db.execute(
+                    select(Appliance.hostname, Appliance.cluster_health).where(
+                        Appliance.state == APPLIANCE_STATE_APPROVED,
+                        Appliance.revoked_at.is_(None),
+                        Appliance.cluster_role.in_((CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)),
+                    )
+                )
+            ).all()
         ]
     )
 
@@ -254,12 +273,7 @@ async def find_appliance_fleet(
     return {
         "appliances": [_row_to_dict(r) for r in rows],
         "count": len(rows),
-        "mtu_fleet": {
-            "reported": mtu.reported,
-            "answers": mtu.answers,
-            "consistent": mtu.consistent,
-            "detail": mtu.detail,
-        },
+        "mtu_fleet": asdict(mtu),
     }
 
 
