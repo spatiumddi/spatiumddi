@@ -1,4 +1,4 @@
-.PHONY: charts-lint perf-test versions-check versions-upstream workflow-shell-check help up down dev build build-supervisor migrate lint test lint-backend lint-frontend test-backend test-cov test-durations \
+.PHONY: charts-lint perf-test versions-check versions-upstream workflow-shell-check image-upgrade-check help up down dev build build-supervisor migrate lint test lint-backend lint-frontend test-backend test-cov test-durations \
         openapi \
         lint-untyped-routes \
         lint-untyped-routes-baseline \
@@ -84,6 +84,7 @@ help:
 	@echo "  make versions-check     Assert every pin matches versions.json (part of make ci)"
 	@echo "  make versions-upstream  Current-vs-latest table for every pinned component"
 	@echo "  make workflow-shell-check  Refuse \$$? captured after a bare command under set -e"
+	@echo "  make image-upgrade-check   Refuse a shipped image that never upgrades its packages"
 	@echo "  make appliance      Build the OS-appliance qcow2 (Phase 1 — Debian 13 amd64)"
 	@echo "  make appliance-iso  Wrap the Phase 1 raw image as a hybrid USB/CD ISO (Phase 2)"
 	@echo ""
@@ -413,7 +414,7 @@ lint-untyped-routes-baseline: $(UNTYPED_LIST)
 
 FORCE:
 
-ci: ci-backend-lint ci-frontend-lint ci-frontend-build charts-lint perf-test versions-check workflow-shell-check
+ci: ci-backend-lint ci-frontend-lint ci-frontend-build charts-lint perf-test versions-check workflow-shell-check image-upgrade-check
 	@echo ""
 	@echo "✓ All CI checks passed — safe to push."
 
@@ -472,6 +473,16 @@ versions-upstream:
 workflow-shell-check:
 	@echo "→ Workflow shell-status linter (matches .github/workflows/ci.yml)"
 	@python3 scripts/lint_workflow_shell.py
+
+# Shipped-image package-upgrade guard (#1088). Every published image must
+# upgrade its base image's own packages AND declare the snapshot ARG that lets
+# the nightly bust the cached package layer — an upgrade line that never runs
+# is indistinguishable, in the built image, from no upgrade line at all. The
+# api image had neither and shipped 34 HIGH/CRITICAL findings whose fixes had
+# been on deb.debian.org for days. Same check CI's Backend Lint job runs.
+image-upgrade-check:
+	@echo "→ Shipped-image package-upgrade linter (matches .github/workflows/ci.yml)"
+	@python3 scripts/lint_image_upgrades.py
 
 # Perf — Tests (#968): hermetic tests under perf/ (no network, no appliance).
 # PyYAML + dnspython are what the orchestrator and report tests import
