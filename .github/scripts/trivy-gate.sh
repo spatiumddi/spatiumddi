@@ -33,15 +33,25 @@
 #          blocking. The next build — whose package layer is rebuilt
 #          against the current index — picks the fix up. Exit 0.
 #   FAIL   the image's package manager is not one this script can ask
-#          (only apk today), or the finding is a language package (a
-#          new PyPI/npm release is always installable). Availability is
-#          unknown, so the outcome is what it was before this script
-#          existed: refuse. Exit 1.
+#          (apk and apt today), the probe itself failed, or the finding
+#          is a language package (a new PyPI/npm release is always
+#          installable). Availability is unknown, so the outcome is what
+#          it was before this script existed: refuse. Exit 1.
+#
+# Debian/Ubuntu images are asked the same question a different way. apk's
+# `--simulate` reports only what it WOULD upgrade, so a package missing
+# from its output means "nothing newer exists"; `apt-cache policy` answers
+# for every package it is asked about, so a package missing from ITS
+# output means the index could not resolve the name at all — unknown
+# availability, which is a FAIL, not a DEFER. Same question, opposite
+# meaning for the same silence; getting that backwards would turn the
+# fail-closed branch into a fail-open one.
 #
 # A missing, empty or unparsable report is a hard failure: an image
 # nothing scanned is never a pass.
 #
-# Requires jq and docker (the image must be present locally). If trivy is
+# Requires jq and docker (the image must be present locally, and the probe
+# needs network access to the distro's mirrors). If trivy is
 # on PATH the familiar table is printed first (`trivy convert`); otherwise
 # a compact one is rendered from the JSON.
 set -euo pipefail
@@ -100,35 +110,95 @@ if [ -z "$findings" ]; then
 fi
 
 # ── What can the image's own package index install today? ──────────────
-# One `apk upgrade --simulate` against the live index yields, for every
-# upgradable package, the version `apk upgrade` WOULD install — the exact
-# thing the Dockerfile's `apk upgrade` line can reach. `--no-cache` fetches
-# a fresh index; `--user 0` because runtime images drop privileges and
-# apk needs root to resolve. Kept as "pkg<TAB>version" lines (no bash-4
-# associative arrays, so this also runs under macOS's bash 3).
+# Kept as "pkg<TAB>version" lines (no bash-4 associative arrays, so this
+# also runs under macOS's bash 3). `--user 0` throughout because runtime
+# images drop privileges and neither package manager resolves as non-root.
 available=""
 probe_ok=0
-if [ "$os_family" = "alpine" ]; then
-  if sim=$(docker run --rm --user 0 --entrypoint sh "$image" \
-             -c 'apk upgrade --simulate --no-cache 2>/dev/null'); then
-    probe_ok=1
-    available=$(printf '%s\n' "$sim" \
-      | sed -nE 's/^\([0-9]+\/[0-9]+\) Upgrading ([^ ]+) \(([^ ]+) -> ([^)]+)\)$/\1\t\3/p')
-  else
-    echo "::warning::could not run 'apk upgrade --simulate' in ${image}; availability unknown"
-  fi
-fi
 
-# Version the index would install for $1, empty if nothing newer.
+case "$os_family" in
+  alpine)
+    # One `apk upgrade --simulate` against the live index yields, for
+    # every upgradable package, the version `apk upgrade` WOULD install —
+    # the exact thing the Dockerfile's `apk upgrade` line can reach.
+    # `--no-cache` fetches a fresh index.
+    if sim=$(docker run --rm --user 0 --entrypoint sh "$image" \
+               -c 'apk upgrade --simulate --no-cache 2>/dev/null'); then
+      probe_ok=1
+      available=$(printf '%s\n' "$sim" \
+        | sed -nE 's/^\([0-9]+\/[0-9]+\) Upgrading ([^ ]+) \(([^ ]+) -> ([^)]+)\)$/\1\t\3/p')
+    else
+      echo "::warning::could not run 'apk upgrade --simulate' in ${image}; availability unknown"
+    fi
+    ;;
+  debian | ubuntu)
+    # `apt-cache policy` reports the CANDIDATE — the version `apt-get
+    # install`/`apt-get upgrade` would install — for each named package.
+    # Deliberately not `apt-get -s upgrade`: plain upgrade holds back any
+    # fix that needs a new dependency, and a held-back fix reported as
+    # "not on the mirrors yet" would DEFER forever on a finding a
+    # dist-upgrade or an explicit install could cure. The candidate is
+    # the strict reading, which is the direction this gate errs in.
+    #
+    # Only the packages actually flagged are asked about, so the probe
+    # stays one docker run regardless of image size. Shipped Dockerfiles
+    # end with `rm -rf /var/lib/apt/lists/*`, hence the `apt-get update`.
+    #
+    # Names are filtered to Debian's own policy character class before
+    # being interpolated into the shell command. A name outside it is not
+    # sanitised, it is DROPPED — so it is then absent from `available`
+    # and the loop below fails it as unverifiable, which is the direction
+    # that cannot publish something on the strength of an unparsed name.
+    pkgs=$(printf '%s\n' "$findings" \
+      | awk -F '\t' '$1 == "os-pkgs" && $2 ~ /^[a-z0-9][a-z0-9+.-]*$/ { print $2 }' \
+      | sort -u | tr '\n' ' ')
+    if [ -z "$pkgs" ]; then
+      # Nothing to ask about: every finding is a language package, which
+      # the verdict loop answers without the index. Probing anyway would
+      # emit a warning naming apt as the problem when apt is not involved.
+      probe_ok=1
+    elif pol=$(docker run --rm --user 0 --entrypoint sh "$image" -c "
+           apt-get update -qq >/dev/null 2>&1 || exit 1
+           apt-cache policy ${pkgs} 2>/dev/null"); then
+      probe_ok=1
+      # "pkgname:" at column 0, then an indented "Candidate: <version>".
+      # A package apt cannot resolve produces neither, so it is absent
+      # from `available` and the loop below fails it as unverifiable.
+      available=$(printf '%s\n' "$pol" | awk '
+        /^[^[:space:]]/          { pkg = $1; sub(/:$/, "", pkg); next }
+        /^[[:space:]]+Candidate:/ { if (pkg != "" && $2 != "(none)") print pkg "\t" $2; pkg = "" }')
+    else
+      echo "::warning::could not query the apt index in ${image}; availability unknown"
+    fi
+    ;;
+  *)
+    echo "::warning::no package-index probe for '${os_family:-unknown}'; availability unknown"
+    ;;
+esac
+
+# Version the index would install for $1, empty if it offered nothing.
 offered_for() {
   printf '%s\n' "$available" | awk -F '\t' -v p="$1" '$1 == p { print $2; exit }'
 }
 
-# apk's own comparator, so "-r1 vs -r0", "_p1" and friends are judged the
-# way apk judges them. Prints one of < = > per line of "A B" on stdin.
-apk_compare() {
-  docker run --rm -i --user 0 --entrypoint sh "$image" -c '
-    while read -r a b; do apk version -t "$a" "$b"; done'
+# The distro's OWN comparator, so "-r1 vs -r0", "+deb13u2", "~deb13u1",
+# "_p1" and friends are judged the way the package manager judges them.
+# Prints one of < = > per line of "A B" on stdin.
+version_compare() {
+  case "$os_family" in
+    alpine)
+      docker run --rm -i --user 0 --entrypoint sh "$image" -c '
+        while read -r a b; do apk version -t "$a" "$b"; done'
+      ;;
+    debian | ubuntu)
+      docker run --rm -i --user 0 --entrypoint sh "$image" -c '
+        while read -r a b; do
+          if dpkg --compare-versions "$a" gt "$b"; then echo ">"
+          elif dpkg --compare-versions "$a" eq "$b"; then echo "="
+          else echo "<"; fi
+        done'
+      ;;
+  esac
 }
 
 fails=0
@@ -143,22 +213,25 @@ while IFS=$'\t' read -r class pkg installed fixed id sev; do
   if [ "$class" != "os-pkgs" ]; then
     verdict=FAIL
     reason="language package — a newer release is always installable; update the pin"
-  elif [ "$os_family" != "alpine" ]; then
-    verdict=FAIL
-    reason="cannot query a ${os_family:-unknown} package index; treating as installable"
   elif [ "$probe_ok" -ne 1 ]; then
     verdict=FAIL
-    reason="package index probe failed; treating as installable"
+    reason="could not query the ${os_family:-unknown} package index; treating as installable"
   elif [ -z "$fixed" ]; then
     # Should not happen under --ignore-unfixed; if it does, the finding
     # is unfixed and the scan policy already says those do not block.
     verdict=DEFER
     reason="no fixed version known"
   elif offered=$(offered_for "$pkg") && [ -z "$offered" ]; then
-    verdict=DEFER
-    reason="the index offers nothing newer than ${installed} — fix announced, not yet published"
+    # Silence means different things to the two probes — see the header.
+    if [ "$os_family" = "alpine" ]; then
+      verdict=DEFER
+      reason="the index offers nothing newer than ${installed} — fix announced, not yet published"
+    else
+      verdict=FAIL
+      reason="the index does not list ${pkg}; treating as installable"
+    fi
   else
-    cmp=$(printf '%s %s\n' "$offered" "$fixed" | apk_compare) || cmp=""
+    cmp=$(printf '%s %s\n' "$offered" "$fixed" | version_compare) || cmp=""
     case "$cmp" in
       '>' | '=')
         verdict=FAIL
@@ -170,7 +243,7 @@ while IFS=$'\t' read -r class pkg installed fixed id sev; do
         ;;
       *)
         verdict=FAIL
-        reason="could not compare ${offered} with ${fixed} (apk said '${cmp}'); treating as installable"
+        reason="could not compare ${offered} with ${fixed} (got '${cmp}'); treating as installable"
         ;;
     esac
   fi

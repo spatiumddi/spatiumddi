@@ -60,6 +60,12 @@ scripts/lint_versions.py
 # function is not evidence that -e is on at an arbitrary later line).
 scripts/lint_workflow_shell.py
 
+# test_lint_image_upgrades.py (#1088) loads the shipped-image package-upgrade
+# guard and pins its negative cases — including the one that decides whether
+# the linter checks anything at all: a nightly.yml whose images heredoc has
+# been restructured must RAISE, not find zero images and report success.
+scripts/lint_image_upgrades.py
+
 # test_zone_name_scope.py (#986) loads the release-prep TLD regenerator and
 # pins that it uses the PRODUCT's payload guard rather than a second copy —
 # so a PR that gives the script its own parser has to run the test that says

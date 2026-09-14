@@ -345,16 +345,20 @@ jobs:
       # some-new / some-old images. Cost is one extra amd64 build, which
       # the shared buildx cache makes near-free.
       #
-      # APK_SNAPSHOT keeps that cache from defeating the scan. BuildKit
-      # keys a layer on its command text, so `RUN apk upgrade` is a cache
-      # hit from whenever this scope was last written — the package set
-      # of that first build, frozen. A fix Alpine publishes afterwards is
-      # then never installed but IS flagged by Trivy, and every later
-      # night fails on it. The Alpine Dockerfiles declare
-      # `ARG APK_SNAPSHOT` immediately before that RUN; passing the date
-      # tag rebuilds the package layer once a night (everything above it
-      # still caches), and passing the SAME value to both builds below
-      # makes the push's amd64 half the exact layers the scan saw.
+      # APK_SNAPSHOT / APT_SNAPSHOT keep that cache from defeating the
+      # scan. BuildKit keys a layer on its command text, so `RUN apk
+      # upgrade` (or `apt-get upgrade`) is a cache hit from whenever this
+      # scope was last written — the package set of that first build,
+      # frozen. A fix the distro publishes afterwards is then never
+      # installed but IS flagged by Trivy, and every later night fails on
+      # it. Each Dockerfile declares the ARG for its own package manager
+      # immediately before that RUN; passing the date tag rebuilds the
+      # package layer once a night (everything above it still caches),
+      # and passing the SAME value to both builds below makes the push's
+      # amd64 half the exact layers the scan saw. An image that declares
+      # neither ARG ignores both — which is how the api image went weeks
+      # without its apt layer executing (#1088); `make ci`'s Dockerfile
+      # guard now refuses a shipped image that declares no snapshot ARG.
       - name: Build amd64 for scanning
         uses: docker/build-push-action@v7
         with:
@@ -368,6 +372,7 @@ jobs:
           build-args: |
             VITE_APP_VERSION=${{ needs.gate.outputs.version }}
             APK_SNAPSHOT=${{ needs.gate.outputs.date_tag }}
+            APT_SNAPSHOT=${{ needs.gate.outputs.date_tag }}
           cache-from: type=gha,scope=nightly-${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=nightly-${{ matrix.image }}
 
@@ -422,6 +427,7 @@ jobs:
           build-args: |
             VITE_APP_VERSION=${{ needs.gate.outputs.version }}
             APK_SNAPSHOT=${{ needs.gate.outputs.date_tag }}
+            APT_SNAPSHOT=${{ needs.gate.outputs.date_tag }}
           cache-from: type=gha,scope=nightly-${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=nightly-${{ matrix.image }}
 

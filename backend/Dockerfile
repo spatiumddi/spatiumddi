@@ -66,7 +66,35 @@ WORKDIR /app
 # ``SET transaction_timeout = 0;`` and ``\restrict`` directives that
 # a postgres-16 server rejects on replay. When we eventually bump
 # the postgres image to 17, bump this pin in lockstep.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+#
+# ``apt-get upgrade`` runs BEFORE the installs so the base image's own
+# packages — perl-base, gzip, libpcre2, libsqlite3, libssh2, everything
+# ``python:3.12-slim`` brought with it — are patched against the current
+# Debian index rather than frozen at whatever the base image was baked
+# with. Without it those packages can only ever be fixed by upstream
+# rebuilding python:3.12-slim, which is not a schedule we control: the
+# nightly of 2026-09-14 refused to publish the api image on 34 HIGH /
+# CRITICAL findings (7 CVEs across perl, 2 libpcre2, 2 libsqlite3, 1
+# gzip, 1 libssh2) whose fixes had been sitting on deb.debian.org the
+# whole time. Every Alpine image in this repo has run ``apk upgrade``
+# for exactly this reason; the two Debian-family ones did not.
+#
+# ``APT_SNAPSHOT`` is what makes that upgrade actually run in CI, and it
+# is not optional decoration. BuildKit keys a layer on its RUN text, so
+# the ``type=gha`` cache the nightly uses serves this whole layer —
+# package set included — from whenever it was first built, until the
+# text changes. That is why the same nightly also reported ``perl`` at
+# 5.40.1-6 when the index had offered 5.40.1-6+deb13u1 for days: the
+# layer had not executed in weeks. The nightly passes its date tag so
+# the layer is rebuilt once a night against the current index
+# (everything above it still caches); local builds default to ``dev``.
+# Same knob, same reasoning as ``APK_SNAPSHOT`` in the Alpine images —
+# see agent/supervisor/images/supervisor/Dockerfile for the full story.
+ARG APT_SNAPSHOT=dev
+RUN echo "apt snapshot ${APT_SNAPSHOT}" >/dev/null \
+    && apt-get update \
+    && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends \
     ca-certificates wget gnupg \
     && install -d /usr/share/postgresql-common/pgdg \
     && wget -qO /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \

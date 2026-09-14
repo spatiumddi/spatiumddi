@@ -227,6 +227,17 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: python3 scripts/lint_workflow_shell.py
 
+      # #1088 — a published image whose Dockerfile never upgrades the base
+      # image's own packages can only be fixed by upstream rebuilding that
+      # base, and one that declares no snapshot ARG has its package layer
+      # served from the nightly's cache forever, so even an upgrade line that
+      # IS there never executes. Both failed silently on the api image: green
+      # build, published image, and a Trivy report weeks later blaming
+      # packages nobody touched. stdlib-only; runs from repo root.
+      - name: Shipped-image package-upgrade linter
+        working-directory: ${{ github.workspace }}
+        run: python3 scripts/lint_image_upgrades.py
+
       # Guards the appliance host-side runner scripts (issues #550/#553):
       # every systemd ExecStart runner must be executable in the built
       # image (git +x OR chmod'd in mkosi.postinst) and bash -n clean.

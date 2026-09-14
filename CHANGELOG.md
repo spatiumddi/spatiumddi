@@ -22,6 +22,79 @@ the formatter handles the rest.
 
 ## Unreleased
 
+### Security
+
+- **Every shipped image now patches its base image's own packages
+  (#1088).** The nightly of 2026-09-14 refused to publish the api
+  image on 34 HIGH/CRITICAL findings — 7 CVEs across `perl` /
+  `perl-base` / `perl-modules-5.40` / `libperl5.40`, 2 in
+  `libpcre2-8-0`, 2 in `libsqlite3-0`, 1 in `gzip`, 1 in
+  `libssh2-1t64` — every one of which had a fix sitting on
+  deb.debian.org the whole time. `backend/Dockerfile` installed a
+  package list and upgraded nothing, so those packages could only
+  ever be fixed by upstream rebuilding `python:3.12-slim`, which is
+  not a schedule we control. It now runs `apt-get upgrade` before
+  the installs, the way every Alpine image in the repo has run
+  `apk upgrade`. The same omission applied to the Technitium
+  image, whose Ubuntu base is pinned by digest — so nothing in that
+  file could ever have patched it either — and is fixed alongside.
+  **This changes published release images, not just the nightly:**
+  `release.yml` builds without a layer cache, so its api image was
+  freshly built and still shipped every one of those base-image
+  CVEs.
+- **The nightly's cache no longer freezes the api image's package
+  layer (#1088).** BuildKit keys a layer on its RUN text, so the
+  `type=gha` cache served `backend/Dockerfile`'s whole `apt-get`
+  layer — package set included — from whenever it was first built.
+  That is why the same run reported `perl` at `5.40.1-6` when the
+  index had offered `5.40.1-6+deb13u1` for days: the layer had not
+  executed in weeks. The Alpine images solve this with an
+  `ARG APK_SNAPSHOT` the nightly passes its date tag to; the two
+  Debian-family images declared no such ARG, so they **silently
+  ignored the build arg the workflow was already passing them**.
+  Both now declare `ARG APT_SNAPSHOT` and the nightly passes it.
+  An upgrade line that never runs is indistinguishable, in the
+  built image, from no upgrade line at all — which is why the two
+  halves above are one fix and not two.
+
+### Changed
+
+- **`trivy-gate.sh` can ask an apt index the question it could
+  already ask an apk one (#1088).** The gate sorts each finding into
+  "the index offers the fix today, so a rebuild would cure it" (FAIL)
+  versus "the distro's security database names a fix the mirrors do
+  not carry yet" (DEFER, reported and non-blocking). It only knew
+  `apk`, so every Debian finding took the catch-all
+  `cannot query a debian package index; treating as installable`
+  branch — correct as a refusal, but it told the operator nothing
+  about what to do, and once the images above are fixed it would
+  hard-fail the nightly on the first Debian CVE announced ahead of
+  its mirror, which is the exact Alpine failure the script was
+  written to prevent. Debian/Ubuntu images are now probed with
+  `apt-cache policy` and compared with `dpkg --compare-versions`.
+  **Silence means the opposite thing to the two probes**, which is
+  the one part that had to be got right: `apk upgrade --simulate`
+  lists only what it *would* upgrade, so a package missing from its
+  output means "nothing newer exists" (DEFER), while
+  `apt-cache policy` answers for every package it is asked about,
+  so a package
+  missing from *its* output means the index could not resolve the
+  name at all (FAIL). Reading the second like the first would turn
+  the fail-closed branch into a fail-open one.
+- **A linter refuses a shipped image that can never be patched
+  (#1088).** `scripts/lint_image_upgrades.py`, in `make ci` and CI's
+  Backend Lint job, asserts that every image in the nightly's own
+  matrix both upgrades its packages and declares a cache-busting
+  snapshot ARG that it actually interpolates. It reads the matrix
+  rather than a second copy of the image list, so a new image is
+  covered the moment it is added there. It matches against the
+  Dockerfile with full-line comments stripped — these files explain
+  at length *why* `apk upgrade` matters, so raw-text matching would
+  pass a file that only talks about it — and it raises rather than
+  reporting success if the matrix heredoc is ever restructured,
+  because a guard that evaluates nothing looks exactly like one that
+  passed (#1030).
+
 ### Added
 
 - **Removable (USB) backup disks on the appliance (#989 item 3).**

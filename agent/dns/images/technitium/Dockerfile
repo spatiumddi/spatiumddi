@@ -64,7 +64,22 @@ FROM technitium/dns-server:${TECHNITIUM_VERSION}@${TECHNITIUM_DIGEST} AS runtime
 # apt's copy alongside the vendored one is sufficient — verified via
 # `dotnet --list-runtimes` before/after. Bump this alongside
 # TECHNITIUM_VERSION and re-run `make trivy IMAGE=technitium`.
-RUN apt-get update \
+#
+# `apt-get upgrade` runs BEFORE the install for the same reason every
+# Alpine image in this repo runs `apk upgrade`: the upstream base is
+# pinned by digest, so nothing else in this file can ever patch the
+# packages it shipped with. `APT_SNAPSHOT` is what makes that upgrade
+# actually execute in CI — BuildKit keys a layer on its RUN text, so the
+# `type=gha` cache serves this whole layer, package set included, from
+# whenever it was first built until that text changes. The nightly
+# passes its date tag; local builds default to `dev`. Same knob as
+# `APK_SNAPSHOT` in the Alpine images. See #1088, where the api image
+# having neither published 34 HIGH/CRITICAL findings whose fixes had
+# been on the mirrors for days.
+ARG APT_SNAPSHOT=dev
+RUN echo "apt snapshot ${APT_SNAPSHOT}" >/dev/null \
+ && apt-get update \
+ && apt-get upgrade -y \
  && apt-get install -y --no-install-recommends \
       python3 gosu libcap2-bin tini aspnetcore-runtime-10.0 \
  && apt-get clean -y \
