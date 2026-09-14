@@ -42,7 +42,7 @@ jobs:
       - run: |
           cat > /tmp/images.json <<'IMAGES_EOF'
           [
-            {"image": "an-image", "context": ".", "file": "./Dockerfile", "target": ""}
+            {"image": "an-image", "context": ".", "file": "./Dockerfile", "target": "runtime"}
           ]
           IMAGES_EOF
 """
@@ -143,6 +143,78 @@ def test_an_upgrade_only_in_a_comment_does_not_count(
         # would be the knob if we did: ARG APK_SNAPSHOT=dev
         RUN apk add --no-cache tini
         """)
+    assert _run(lint, monkeypatch, tmp_path, body) == 1
+
+
+def test_an_upgrade_in_a_discarded_builder_stage_does_not_count(
+    lint: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Builder stages are thrown away — their packages never ship, and
+    ``COPY --from`` brings files, not a package database. Checking the whole
+    file passes an image whose only upgrade is in a stage nobody runs, which
+    is the shape most of these Dockerfiles actually have."""
+    body = textwrap.dedent("""\
+        FROM alpine:3.24 AS builder
+        ARG APK_SNAPSHOT=dev
+        RUN echo "${APK_SNAPSHOT}" >/dev/null && apk upgrade --no-cache
+
+        FROM alpine:3.24 AS runtime
+        RUN apk add --no-cache tini
+        COPY --from=builder /out /out
+        """)
+    assert _run(lint, monkeypatch, tmp_path, body) == 1
+
+
+def test_a_stage_inherits_its_local_parent(
+    lint: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The other direction: ``FROM base AS runtime`` DOES inherit base's
+    layers, so an upgrade there ships and must count."""
+    body = textwrap.dedent("""\
+        FROM alpine:3.24 AS base
+        ARG APK_SNAPSHOT=dev
+        RUN echo "${APK_SNAPSHOT}" >/dev/null && apk upgrade --no-cache
+
+        FROM base AS runtime
+        RUN apk add --no-cache tini
+        """)
+    assert _run(lint, monkeypatch, tmp_path, body) == 0
+
+
+def test_a_trailing_comment_does_not_count(
+    lint: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A ``#`` mid-line is a comment to the shell too, so the command is
+    named and not performed. The whole-line case has its own test above;
+    this is the half the first cut's docstring wrongly claimed was safe."""
+    body = textwrap.dedent("""\
+        FROM alpine:3.24 AS runtime
+        ARG APK_SNAPSHOT=dev
+        RUN echo "${APK_SNAPSHOT}" >/dev/null \\
+         && apk add --no-cache tini   # we deliberately do not apk upgrade here
+        """)
+    assert _run(lint, monkeypatch, tmp_path, body) == 1
+
+
+def test_a_quoted_hash_is_data_not_a_comment(
+    lint: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Truncating at every ``#`` would silently discard real commands."""
+    body = textwrap.dedent("""\
+        FROM alpine:3.24 AS runtime
+        ARG APK_SNAPSHOT=dev
+        RUN echo "snapshot ${APK_SNAPSHOT} #1" >/dev/null && apk upgrade --no-cache
+        """)
+    assert _run(lint, monkeypatch, tmp_path, body) == 0
+
+
+def test_a_target_the_dockerfile_does_not_define_is_reported(
+    lint: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Better than silently checking whichever stage happens to be last."""
+    body = (
+        "FROM alpine:3.24 AS other\nARG APK_SNAPSHOT=dev\nRUN echo ${APK_SNAPSHOT} && apk upgrade\n"
+    )
     assert _run(lint, monkeypatch, tmp_path, body) == 1
 
 

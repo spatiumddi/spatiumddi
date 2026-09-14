@@ -63,6 +63,64 @@ _UPGRADES = (
 # referenced is equally inert, so the reference is checked too.
 _SNAPSHOT_ARG = re.compile(r"^\s*ARG\s+(AP[KT]_SNAPSHOT)\b", re.MULTILINE)
 
+# ``FROM [--platform=…] <base> [AS <name>]``.
+_FROM = re.compile(
+    r"^\s*FROM\s+(?:--\S+\s+)*(\S+)(?:\s+AS\s+(\S+))?\s*$", re.IGNORECASE
+)
+
+
+def _stages(body: str) -> list[tuple[str | None, str, list[str]]]:
+    """Split a Dockerfile into ``(name, base, lines)`` per build stage."""
+    stages: list[tuple[str | None, str, list[str]]] = []
+    current: list[str] | None = None
+    for line in body.splitlines():
+        match = _FROM.match(line)
+        if match:
+            base, name = match.group(1), match.group(2)
+            current = []
+            stages.append((name.lower() if name else None, base.lower(), current))
+        elif current is not None:
+            current.append(line)
+    return stages
+
+
+def _shipped_body(body: str, target: str) -> str:
+    """The instructions that actually reach the published image.
+
+    A multi-stage Dockerfile's builder stages are DISCARDED — their
+    packages never ship, and ``COPY --from`` brings files, not a package
+    database. So checking the whole file passes an image whose only
+    ``apk upgrade`` lives in a builder, which is not a hypothetical
+    shape: it is what most of these Dockerfiles look like. The matrix
+    already records each image's ``target`` (empty = the last stage, the
+    Docker default), and the target's ancestry is followed because a
+    stage built ``FROM`` another one does inherit its layers.
+    """
+    stages = _stages(body)
+    if not stages:
+        return ""
+    by_name = {name: index for index, (name, _, _) in enumerate(stages) if name}
+
+    if target:
+        index = by_name.get(target.lower())
+        if index is None:
+            # Naming a stage that does not exist would make `docker build`
+            # fail; reporting it is better than checking the wrong stage.
+            raise KeyError(target)
+    else:
+        index = len(stages) - 1
+
+    chain = [index]
+    seen = {index}
+    while True:
+        base = stages[chain[0]][1]
+        parent = by_name.get(base)
+        if parent is None or parent in seen:
+            break
+        chain.insert(0, parent)
+        seen.add(parent)
+    return "\n".join("\n".join(stages[i][2]) for i in chain)
+
 
 def _images() -> list[dict[str, str]]:
     match = _IMAGES_BLOCK.search(NIGHTLY.read_text())
@@ -76,18 +134,43 @@ def _images() -> list[dict[str, str]]:
     return json.loads(body)
 
 
+def _strip_trailing_comment(line: str) -> str:
+    """Drop an unquoted ``#`` comment from the end of one line.
+
+    A trailing comment is a comment to the shell too, so ``&& apt-get
+    install foo  # we do not apt-get upgrade here`` contains the phrase
+    and performs none of it. Quote state is tracked because ``#`` inside
+    a string is data — ``echo "a#b"`` must not be truncated to ``echo "a``.
+    """
+    quote: str | None = None
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote:
+            if char == "\\" and quote == '"':
+                index += 1
+            elif char == quote:
+                quote = None
+        elif char in "'\"":
+            quote = char
+        elif char == "#" and (index == 0 or line[index - 1].isspace()):
+            return line[:index]
+        index += 1
+    return line
+
+
 def _strip_comments(text: str) -> str:
-    """Drop full-line ``#`` comments.
+    """Drop ``#`` comments, whole-line and trailing alike.
 
     These Dockerfiles carry long rationale comments that name the very
     commands being looked for (``apk upgrade``, ``APK_SNAPSHOT``), so matching
     against the raw text would pass an image whose comments merely DESCRIBE an
-    upgrade it does not perform. Trailing comments inside a RUN continuation
-    are left alone — they cannot introduce a false positive, since a match
-    there still sits in a real RUN block.
+    upgrade it does not perform — in either position.
     """
     return "\n".join(
-        line for line in text.splitlines() if not line.lstrip().startswith("#")
+        _strip_trailing_comment(line)
+        for line in text.splitlines()
+        if not line.lstrip().startswith("#")
     )
 
 
@@ -101,7 +184,20 @@ def main() -> int:
             findings.append(f"{rel}: listed in the nightly matrix but not on disk")
             continue
 
-        body = _strip_comments(path.read_text())
+        try:
+            body = _shipped_body(_strip_comments(path.read_text()), image.get("target", ""))
+        except KeyError as exc:
+            findings.append(
+                f"{rel} ({image['image']}): the matrix names target {exc.args[0]!r}, which "
+                "this Dockerfile does not define"
+            )
+            continue
+        if not body.strip():
+            findings.append(
+                f"{rel} ({image['image']}): no build stage found — if the file was "
+                "restructured, update this linter rather than letting it check nothing"
+            )
+            continue
 
         if not any(pattern.search(body) for pattern in _UPGRADES):
             findings.append(

@@ -38,14 +38,23 @@
 #          installable). Availability is unknown, so the outcome is what
 #          it was before this script existed: refuse. Exit 1.
 #
-# Debian/Ubuntu images are asked the same question a different way. apk's
-# `--simulate` reports only what it WOULD upgrade, so a package missing
-# from its output means "nothing newer exists"; `apt-cache policy` answers
-# for every package it is asked about, so a package missing from ITS
-# output means the index could not resolve the name at all — unknown
-# availability, which is a FAIL, not a DEFER. Same question, opposite
-# meaning for the same silence; getting that backwards would turn the
-# fail-closed branch into a fail-open one.
+# Debian/Ubuntu images are asked the same question a different way, and
+# two details there are load-bearing:
+#
+#   Silence means the OPPOSITE thing to the two probes. apk's
+#   `--simulate` reports only what it WOULD upgrade, so a package missing
+#   from its output means "nothing newer exists"; `apt-cache policy`
+#   answers for every package it is asked about, so a package missing
+#   from ITS output means the index could not resolve the name at all —
+#   unknown availability, which is a FAIL, not a DEFER. Reading the
+#   second like the first turns a fail-closed branch into a fail-open one.
+#
+#   The probe has to prove the index was LOADED, not merely that
+#   `apt-get update` returned. It returns 0 with every mirror
+#   unreachable, and `apt-cache policy` then answers from the local dpkg
+#   status file — Candidate == installed, which is non-empty, plausible,
+#   and reads as "the fix is not published yet" for every finding at
+#   once. See the probe for what is asserted instead.
 #
 # A missing, empty or unparsable report is a hard failure: an image
 # nothing scanned is never a pass.
@@ -114,6 +123,7 @@ fi
 # also runs under macOS's bash 3). `--user 0` throughout because runtime
 # images drop privileges and neither package manager resolves as non-root.
 available=""
+upgradable=""
 probe_ok=0
 
 case "$os_family" in
@@ -132,13 +142,23 @@ case "$os_family" in
     fi
     ;;
   debian | ubuntu)
-    # `apt-cache policy` reports the CANDIDATE — the version `apt-get
-    # install`/`apt-get upgrade` would install — for each named package.
-    # Deliberately not `apt-get -s upgrade`: plain upgrade holds back any
-    # fix that needs a new dependency, and a held-back fix reported as
-    # "not on the mirrors yet" would DEFER forever on a finding a
-    # dist-upgrade or an explicit install could cure. The candidate is
-    # the strict reading, which is the direction this gate errs in.
+    # Two answers, because they are different questions and the gap
+    # between them is a real state:
+    #
+    #   `apt-cache policy` CANDIDATE — the newest version the index can
+    #     install at all. This is availability, and so the FAIL/DEFER
+    #     decision.
+    #   `apt-get -s upgrade` — what plain `apt-get upgrade`, the line the
+    #     shipped Dockerfiles actually run, would install. apt holds a
+    #     package back when upgrading it would pull in a new dependency
+    #     or remove something, so this can be lower than the candidate.
+    #
+    # Deciding on the candidate alone (the first cut) makes a held-back
+    # fix a FAIL whose stated remedy — rebuild the package layer — does
+    # nothing, i.e. a permanently red nightly with a wrong instruction.
+    # Deciding on the simulate alone makes it a DEFER that never clears,
+    # on a fix an explicit install could have taken today. So the verdict
+    # comes from the candidate and the REASON from both.
     #
     # Only the packages actually flagged are asked about, so the probe
     # stays one docker run regardless of image size. Shipped Dockerfiles
@@ -158,13 +178,34 @@ case "$os_family" in
       # emit a warning naming apt as the problem when apt is not involved.
       probe_ok=1
     elif pol=$(docker run --rm --user 0 --entrypoint sh "$image" -c "
-           apt-get update -qq >/dev/null 2>&1 || exit 1
+           # THE PROBE MUST FAIL CLOSED, and neither obvious spelling of
+           # that does. \`apt-get update\` exits 0 when every mirror is
+           # unreachable (verified: --network none on debian:13-slim,
+           # rc=0, empty lists) — and \`apt-cache policy\` then answers
+           # from /var/lib/dpkg/status, reporting Candidate == INSTALLED.
+           # That is non-empty and plausible, so every finding would
+           # compare below its fix and DEFER: an offline runner would
+           # publish an image on CRITICALs whose fixes were on the
+           # mirrors the whole time. Error-Mode=any turns a fetch failure
+           # into a non-zero exit, and the grep then proves an index was
+           # actually LOADED — with none, the only package file listed is
+           # the local dpkg status.
+           apt-get update -qq -o APT::Update::Error-Mode=any >/dev/null 2>&1 || exit 1
+           apt-cache policy 2>/dev/null \
+             | grep -qE '^ *[0-9]+ (https?|ftp|file|cdrom):' || exit 1
+           echo '@@SIMULATE@@'
+           apt-get -s upgrade 2>/dev/null
+           echo '@@POLICY@@'
            apt-cache policy ${pkgs} 2>/dev/null"); then
       probe_ok=1
+      # "Inst <pkg> [<installed>] (<new> <origin> [<arch>])"
+      upgradable=$(printf '%s\n' "$pol" \
+        | sed -n '/^@@SIMULATE@@$/,/^@@POLICY@@$/p' \
+        | sed -nE 's/^Inst ([^ ]+) \[[^]]*\] \(([^ ]+) .*/\1\t\2/p')
       # "pkgname:" at column 0, then an indented "Candidate: <version>".
       # A package apt cannot resolve produces neither, so it is absent
       # from `available` and the loop below fails it as unverifiable.
-      available=$(printf '%s\n' "$pol" | awk '
+      available=$(printf '%s\n' "$pol" | sed -n '/^@@POLICY@@$/,$p' | awk '
         /^[^[:space:]]/          { pkg = $1; sub(/:$/, "", pkg); next }
         /^[[:space:]]+Candidate:/ { if (pkg != "" && $2 != "(none)") print pkg "\t" $2; pkg = "" }')
     else
@@ -176,9 +217,16 @@ case "$os_family" in
     ;;
 esac
 
-# Version the index would install for $1, empty if it offered nothing.
+# Newest version the index can install for $1, empty if it offered none.
 offered_for() {
   printf '%s\n' "$available" | awk -F '\t' -v p="$1" '$1 == p { print $2; exit }'
+}
+
+# Version a plain upgrade would install for $1 — apt only, and empty when
+# apt would hold the package back. The apk probe is already a simulated
+# upgrade, so there is nothing to hold back there and this stays empty.
+upgrade_offers() {
+  printf '%s\n' "$upgradable" | awk -F '\t' -v p="$1" '$1 == p { print $2; exit }'
 }
 
 # The distro's OWN comparator, so "-r1 vs -r0", "+deb13u2", "~deb13u1",
@@ -235,7 +283,24 @@ while IFS=$'\t' read -r class pkg installed fixed id sev; do
     case "$cmp" in
       '>' | '=')
         verdict=FAIL
+        # Distinguish "a rebuild takes this" from "a rebuild cannot": on
+        # apt a fix needing a new dependency is held back by plain
+        # `apt-get upgrade` forever, and telling the operator to rebuild
+        # would be an instruction that provably does nothing.
         reason="the index offers ${offered} — rebuild the package layer"
+        if [ "$os_family" != "alpine" ]; then
+          by_upgrade=$(upgrade_offers "$pkg")
+          held=yes
+          if [ -n "$by_upgrade" ]; then
+            cmp_up=$(printf '%s %s\n' "$by_upgrade" "$fixed" | version_compare) || cmp_up=""
+            case "$cmp_up" in
+              '>' | '=') held=no ;;
+            esac
+          fi
+          if [ "$held" = yes ]; then
+            reason="the index offers ${offered} but \`apt-get upgrade\` holds ${pkg} back${by_upgrade:+ at ${by_upgrade}} — needs an explicit install or dist-upgrade, not a rebuild"
+          fi
+        fi
         ;;
       '<')
         verdict=DEFER

@@ -81,19 +81,42 @@ the formatter handles the rest.
   missing from *its* output means the index could not resolve the
   name at all (FAIL). Reading the second like the first would turn
   the fail-closed branch into a fail-open one.
+  **The probe also has to prove the index was LOADED**, not merely
+  that `apt-get update` returned: it exits 0 with every mirror
+  unreachable (verified, `--network none`), and `apt-cache policy`
+  then answers from the local dpkg status file — Candidate ==
+  installed, which is non-empty, plausible, and reads as "not
+  published yet" for every finding at once. An offline runner would
+  publish an image on CRITICALs whose fixes were on the mirrors the
+  whole time. It now sets `APT::Update::Error-Mode=any` and asserts
+  a real package file is listed.
+  **The verdict comes from the candidate, the reason from both
+  probes.** apt holds a package back when upgrading it would pull
+  in a new dependency, so `apt-get upgrade` — the line the
+  Dockerfiles run — can install less than the index offers.
+  Deciding on the candidate alone makes that a FAIL whose stated
+  remedy (rebuild the package layer) provably does nothing;
+  deciding on the simulate alone makes it a DEFER that never
+  clears. It fails, and says the fix needs an explicit install or
+  a dist-upgrade.
 - **A linter refuses a shipped image that can never be patched
   (#1088).** `scripts/lint_image_upgrades.py`, in `make ci` and CI's
   Backend Lint job, asserts that every image in the nightly's own
   matrix both upgrades its packages and declares a cache-busting
   snapshot ARG that it actually interpolates. It reads the matrix
   rather than a second copy of the image list, so a new image is
-  covered the moment it is added there. It matches against the
-  Dockerfile with full-line comments stripped — these files explain
-  at length *why* `apk upgrade` matters, so raw-text matching would
-  pass a file that only talks about it — and it raises rather than
-  reporting success if the matrix heredoc is ever restructured,
-  because a guard that evaluates nothing looks exactly like one that
-  passed (#1030).
+  covered the moment it is added there. Three things it has to get
+  right, each a live false-pass in the first cut: it checks only
+  the stage that SHIPS (builder stages are discarded, so an
+  `apk upgrade` in one proves nothing — and that is the shape most
+  of these Dockerfiles have), following the target's ancestry
+  because a stage built `FROM` another does inherit its layers; it
+  strips `#` comments in both positions, whole-line and trailing,
+  since these files explain at length *why* `apk upgrade` matters
+  and a raw-text match passes a file that only talks about it; and
+  it raises rather than reporting success if the matrix heredoc is
+  ever restructured, because a guard that evaluates nothing looks
+  exactly like one that passed (#1030).
 
 ### Added
 

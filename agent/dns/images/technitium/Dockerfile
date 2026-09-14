@@ -68,14 +68,25 @@ FROM technitium/dns-server:${TECHNITIUM_VERSION}@${TECHNITIUM_DIGEST} AS runtime
 # `apt-get upgrade` runs BEFORE the install for the same reason every
 # Alpine image in this repo runs `apk upgrade`: the upstream base is
 # pinned by digest, so nothing else in this file can ever patch the
-# packages it shipped with. `APT_SNAPSHOT` is what makes that upgrade
-# actually execute in CI — BuildKit keys a layer on its RUN text, so the
+# packages it shipped with. `APT_SNAPSHOT` is what lets the upgrade
+# actually execute — BuildKit keys a layer on its RUN text, so a
 # `type=gha` cache serves this whole layer, package set included, from
-# whenever it was first built until that text changes. The nightly
-# passes its date tag; local builds default to `dev`. Same knob as
+# whenever it was first built until that text changes. Same knob as
 # `APK_SNAPSHOT` in the Alpine images. See #1088, where the api image
 # having neither published 34 HIGH/CRITICAL findings whose fixes had
 # been on the mirrors for days.
+#
+# WHICH BUILDS HONOUR IT, because it is not "CI" as a whole:
+#   nightly.yml   passes the date tag — the layer rebuilds once a night.
+#   release.yml   uses no layer cache at all, so it always rebuilds.
+#   build-dns-images.yml (the PR-time Trivy lane) passes NOTHING and
+#     caches on `type=gha`, so what it scans can be an old package set.
+#     Arming it needs more than a build-arg: that lane runs Trivy with a
+#     bare `exit-code: 1` and no trivy-gate.sh, so a fix announced ahead
+#     of its mirror would hard-fail every PR with nothing a rebuild could
+#     do — the failure the gate exists to prevent. Both halves together,
+#     or neither.
+# Local builds default to `dev`.
 ARG APT_SNAPSHOT=dev
 RUN echo "apt snapshot ${APT_SNAPSHOT}" >/dev/null \
  && apt-get update \
