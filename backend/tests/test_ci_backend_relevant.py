@@ -58,6 +58,7 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_lint_versions.py": "scripts/lint_versions.py",
     "test_lint_workflow_shell.py": "scripts/lint_workflow_shell.py",
     "test_lint_image_upgrades.py": "scripts/lint_image_upgrades.py",
+    "test_trivy_scheduled_report.py": ".github/workflows/trivy-scheduled.yml",
     "test_dhcp_packet_loss.py": "agent/dhcp/spatium_dhcp_agent/metrics.py",
     "test_ntp_initial_seed.py": ("appliance/mkosi.extra/usr/local/bin/spatiumddi-firstboot"),
     # #972 — the HELD endpoint is mounted at the application root, so it needs

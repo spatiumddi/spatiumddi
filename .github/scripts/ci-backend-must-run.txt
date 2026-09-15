@@ -87,6 +87,13 @@ docs/PRIVACY.md
 # denied — none of them runs backend tests.
 .github/workflows/ci.yml
 
+# test_trivy_scheduled_report.py (#1095) pins the weekly scan's report shape:
+# JSON rendering rather than a byte-capped table, and rc=1 validated against
+# the report before it is called "findings". Both failures are invisible in a
+# green run — the workflow succeeds and files an issue naming no CVE — so the
+# edit that would reintroduce them must run the test that says it must not.
+.github/workflows/trivy-scheduled.yml
+
 # The two shipped nginx templates (#972). `backend/tests/test_e911_held.py`
 # asserts both carry a `location /held` block: the HELD endpoint is mounted at
 # the application root rather than under /api/, so without one it falls through
