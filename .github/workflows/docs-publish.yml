@@ -2,9 +2,16 @@
 #
 # The documentation is served from TWO GitHub Pages sites:
 #
-#   * https://www.spatiumddi.com/            — organization site, which
-#     GitHub only ever serves from a repo named `<org>.github.io`. That repo
-#     holds no source of its own — this workflow mirrors `docs/` into it.
+#   * https://www.spatiumddi.com/            — served from the
+#     `spatiumnorth/spatiumddi.github.io` repo, which holds no source of its
+#     own; this workflow mirrors `docs/` into it. NOTE: that repo was named
+#     for the OLD org. GitHub serves an *organization* site only from a repo
+#     named `<org>.github.io`, so after the spatiumddi→spatiumnorth rename it
+#     is no longer one — the custom domain is what keeps this URL working.
+#     Renaming it to `spatiumnorth.github.io` would restore a true org-root
+#     site, but an org rename does NOT rename the repo: it must be done by
+#     hand, and TARGET_REPO below has to change in the same step or this
+#     workflow fails at the clone.
 #   * https://www.spatiumddi.com/spatiumddi/  — project site, built by
 #     GitHub directly from this repo's `main` branch, `/docs` path. Needs no
 #     workflow.
@@ -19,7 +26,7 @@
 #
 # Auth: GITHUB_TOKEN is scoped to the repo running the workflow and cannot
 # push to another repo, so this uses an SSH deploy key registered on the
-# spatiumnorth.github.io repo with write access. The private half lives in the
+# spatiumddi.github.io repo with write access. The private half lives in the
 # DOCS_DEPLOY_KEY secret. To rotate: generate a new ed25519 pair, replace the
 # deploy key on the target repo, then update the secret here.
 name: Publish docs site
@@ -56,10 +63,11 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # The repo must keep the <org>.github.io name — that is what makes GitHub
-  # serve it as the organization site. www.spatiumddi.com is the custom
-  # domain configured on top of it, not the repo's name.
-  TARGET_REPO: git@github.com:spatiumnorth/spatiumnorth.github.io.git
+  # Kept at the old repo NAME on purpose: renaming the org moved this repo to
+  # the spatiumnorth owner but left it called `spatiumddi.github.io`, and that
+  # is the only site repo that exists. Pointing at `spatiumnorth.github.io`
+  # before creating/renaming it fails the clone on every main push and tag.
+  TARGET_REPO: git@github.com:spatiumnorth/spatiumddi.github.io.git
   # The branch GitHub Pages is configured to serve on the site repo.
   TARGET_BRANCH: main
 
@@ -129,7 +137,7 @@ jobs:
 
           mkdir -p site/.github
           cat > site/.github/README.md <<'EOF'
-          # spatiumnorth.github.io
+          # spatiumddi.github.io
 
           **Generated — do not edit this repository directly.**
 

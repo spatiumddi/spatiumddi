@@ -78,7 +78,16 @@ async def _run_check() -> dict[str, Any]:
             url = f"https://api.github.com/repos/{settings.github_repo}/releases/latest"
             now = datetime.now(UTC)
             try:
-                async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_SECONDS) as client:
+                # follow_redirects: GitHub answers 301 for a repo that has moved — which
+                # an org rename makes routine. httpx does not follow by default and
+                # raise_for_status() does not reject a 3xx, so the redirect BODY was
+                # parsed as a release: no tag_name, so the check recorded "up to date"
+                # with no error and logged success. A silent false negative on an
+                # update notifier is worse than a loud failure; following the redirect
+                # removes it and keeps a stale github_repo working.
+                async with httpx.AsyncClient(
+                    timeout=_HTTP_TIMEOUT_SECONDS, follow_redirects=True
+                ) as client:
                     resp = await client.get(
                         url,
                         headers={"Accept": "application/vnd.github+json"},

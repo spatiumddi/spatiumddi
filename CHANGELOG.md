@@ -52,9 +52,29 @@ the formatter handles the rest.
   `.env.example`, so an install that copied it carries
   `spatiumddi/spatiumddi` in its own `.env`, which overrides the new
   default and pins the daily release check and the appliance
-  slot-image catalogue to the old path. Neither client follows
-  redirects, so the old path does not quietly keep working. Update the
-  value, or remove the line to take the default.
+  slot-image catalogue to the old path. Update the value, or remove
+  the line to take the default.
+- **The release check reported a permanently up-to-date install when
+  its repo had moved.** GitHub answers `301` for a renamed repo, which
+  an org rename makes routine — and httpx does not follow redirects by
+  default while `raise_for_status()` does not reject a `3xx`. So the
+  redirect body was parsed as a release: no `tag_name`, so the task
+  stored no version, set `update_available=False`, cleared
+  `latest_check_error` and logged `update_check_ok`. The one default-on
+  connection in the product would have gone on reporting a healthy
+  “you are up to date” forever, which on a notifier whose job is
+  surfacing security fixes is worse than a loud failure. Both GitHub
+  clients (`tasks/update_check.py`, `services/appliance/releases.py`)
+  now follow redirects, which removes the false negative and keeps a
+  stale `GITHUB_REPO` working rather than silently wrong.
+- **The appliance image pruner stopped reclaiming pre-rename images.**
+  Its prefix guard exempts non-SpatiumDDI images so kubelet image-GC
+  owns them; narrowed to the new org alone, every accumulated
+  `ghcr.io/spatiumddi/*` release already on a deployed appliance —
+  exactly what the timer exists to reclaim — would have been classified
+  as third-party infra and kept forever, while still reporting nothing
+  stale to prune. It now matches both orgs; the in-use and
+  slot-version guards are unchanged, so nothing live can be removed.
 
 ### Fixed
 
