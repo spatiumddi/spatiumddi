@@ -76,11 +76,19 @@ the formatter handles the rest.
   reason rather than a general one: **the metallb chart is never
   installed by this CLI.** `bake-chart.sh` packages it and
   helm-controller installs it on the node via klipper-helm — already
-  4.1.4 — so the appliance has been on the new order, and on that
-  first-attempt-fails / retry-converges behaviour, since before this
-  branch. helm-controller retries, which is why it converges. Nothing
-  in CI installs it either; `charts-render-check.sh` only templates
-  it. Worth its own issue for the appliance; it is not this pin's to
+  4.1.4 — so the appliance has been on the new order since before this
+  branch. Nothing in CI installs it either; `charts-render-check.sh`
+  only templates it.
+  **A default appliance never reaches the failure at all**, which an
+  arm64 ISO built from this branch and booted confirms rather than
+  assumes: `metallb.enabled` is `false` by default and firstboot
+  renders the HelmChart that way, so the chart produces no
+  `IPAddressPool` and no `L2Advertisement`, the namespace stays empty,
+  and `helm-install-spatium-metallb` completes first time — the release
+  secret is at `v1`, so there was no retry. The ordering can only bite
+  where an operator sets a control-plane VIP (#272 multi-node HA),
+  which is what flips metallb on. That case is untested here and is
+  worth its own issue against the appliance; it is not this pin's to
   fix, and this pin does not make it worse.
   Also exercised under 4.3.0: `helm lint` + `dependency update` +
   `package` for all three charts (the `bake-chart.sh` and
