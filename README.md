@@ -6,7 +6,8 @@
 
 <p align="center">
   <strong>Self-hosted DNS, DHCP, and IPAM — one control plane, real servers underneath.</strong><br/>
-  A modern, open-source alternative to commercial DDI platforms.
+  A modern, open-source alternative to commercial DDI platforms.<br/>
+  Built in the open by <a href="https://www.spatiumnorth.com">SpatiumNorth</a>, Montréal.
 </p>
 
 <p align="center">
@@ -48,6 +49,7 @@
 ## Contents
 
 - [Why I built this](#why-i-built-this) — the story
+- [About SpatiumNorth](#about-spatiumnorth) — the company behind it
 - [Why SpatiumDDI](#why-spatiumddi) — the elevator pitch
 - [Privacy: your data stays yours](#privacy-your-data-stays-yours) — no telemetry, no analytics, no phone-home
 - [Support the project](#support-the-project) — sponsors, tip jar, getting involved
@@ -76,9 +78,13 @@ The open source world has excellent standalone tools — NetBox for IPAM, BIND9 
 
 If SpatiumDDI ends up being useful to you, that's the whole point. If you want to file an issue, send a PR, or just tell me what's broken, I'd genuinely appreciate it.
 
+## About SpatiumNorth
+
+SpatiumDDI is built by [SpatiumNorth](https://www.spatiumnorth.com), a Montréal-based software company that builds infrastructure software in the open. The whole product ships under Apache 2.0 — every feature, free wherever you run it — and the company charges for the part that actually costs something: support, deployment and migration, from the people who wrote the code. If your organization wants that, see [pricing](https://www.spatiumnorth.com/spatiumddi/pricing) or [get in touch](https://www.spatiumnorth.com/contact); managed service providers can [partner](https://www.spatiumnorth.com/spatiumddi/partners) to run it for their clients. The code lives here, in the open, as it always has.
+
 ## Support the project
 
-SpatiumDDI is built on nights and weekends with no commercial backing — every release ships off my own time, my own homelab hardware, and a steady supply of chocolate. If the project is saving your team work, or you just want to keep me building, there are a few ways to chip in. Anything is genuinely appreciated and goes straight back into the hardware-to-test-against fund.
+SpatiumDDI started on nights and weekends and homelab hardware, and the software is free and stays free. If it's saving your team work and you want to chip in, there are two ways, depending on who you are.
 
 **Individuals** — small tips help cover the boring stuff (a domain, a homelab SSD, the occasional cloud VM I spin up to test a deploy topology I don't have locally). No tier system, no perks list, no obligation — just a "thanks, here's a coffee" button if the project saved you an afternoon. Every contribution is genuinely appreciated.
 
@@ -86,7 +92,7 @@ SpatiumDDI is built on nights and weekends with no commercial backing — every 
   <a href="https://buymeacoffee.com/mzac"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?logo=buy-me-a-coffee&logoColor=000000" alt="Buy me a coffee" /></a>
 </p>
 
-**Organizations** — if your team is running SpatiumDDI in production and you'd like to sponsor specific features, get priority on bug reports, or just say hi, [open an issue](https://github.com/spatiumnorth/spatiumddi/issues/new) or reach out directly. Happy to talk.
+**Organizations** — if your team runs SpatiumDDI in production, the way to back the project is the support your operators will want anyway: that's what [SpatiumNorth](https://www.spatiumnorth.com) sells — support, deployment and migration from the people who wrote the code. See [pricing](https://www.spatiumnorth.com/spatiumddi/pricing) or [contact us](https://www.spatiumnorth.com/contact). Want to sponsor a specific feature or just say hi? Still happy to talk — [open an issue](https://github.com/spatiumnorth/spatiumddi/issues/new).
 
 ## Why SpatiumDDI
 
@@ -1473,5 +1479,5 @@ Bundled components (BIND9, PowerDNS, Technitium, ISC Kea, k3s, and the appliance
 ---
 
 <p align="center">
-  Built with ❤️ by the SpatiumDDI community · <a href="https://www.spatiumddi.com">www.spatiumddi.com</a>
+  Built with ❤️ by <a href="https://www.spatiumnorth.com">SpatiumNorth</a> and the SpatiumDDI community · <a href="https://www.spatiumddi.com">docs</a> · <a href="https://www.spatiumnorth.com">spatiumnorth.com</a>
 </p>
