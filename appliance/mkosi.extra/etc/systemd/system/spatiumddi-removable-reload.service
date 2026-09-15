@@ -1,6 +1,6 @@
 [Unit]
 Description=Apply pending SpatiumDDI removable-disk mount config (issue #989)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/989
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/989
 # The runner writes .mount units into /etc/systemd/system, which on the
 # appliance is the /var-backed overlay upper layer (Phase 8a) — so it
 # needs etc.mount up, exactly like the chrony sibling. The trigger and

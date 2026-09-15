@@ -491,7 +491,7 @@ SpatiumDDI queries **all three every pass and unions the results** rather than m
 
 A Dnsmasq "host" doubles as a static DNS entry, so only rows carrying a MAC are mirrored as reservations. Kea reports lease state numerically (`0` = active); it is normalised to the same vocabulary the ISC path produces.
 
-> **Why this is called out at such length.** Until [#797](https://github.com/spatiumddi/spatiumddi/issues/797) this integration queried the ISC endpoints *only*. On any 25.7+ firewall they 404, the client treated that as an empty table, and the sync reported success with zero leases on every pass — indefinitely, and with nothing in the UI to suggest anything was wrong.
+> **Why this is called out at such length.** Until [#797](https://github.com/spatiumnorth/spatiumddi/issues/797) this integration queried the ISC endpoints *only*. On any 25.7+ firewall they 404, the client treated that as an empty table, and the sync reported success with zero leases on every pass — indefinitely, and with nothing in the UI to suggest anything was wrong.
 
 ### When a sync succeeds but mirrors nothing
 
@@ -648,7 +648,7 @@ Full firewall rule authoring / reordering (OPNsense alias membership + PAN-OS DA
 
 ## Firewall block-list feeds (#606)
 
-The **feed inversion** — the credential-free enforcement path. Instead of SpatiumDDI holding write credentials and pushing to the device (the #601 model above), the device polls a SpatiumDDI-hosted URL and applies whatever it returns. Feature module `security.firewall_feeds`, which ships **disabled** ([#1069](https://github.com/spatiumddi/spatiumddi/issues/1069)) — it is an enforcement surface, and it pairs with Active block sync, which has always been off. Even enabled, no feed serves anything until an operator creates one.
+The **feed inversion** — the credential-free enforcement path. Instead of SpatiumDDI holding write credentials and pushing to the device (the #601 model above), the device polls a SpatiumDDI-hosted URL and applies whatever it returns. Feature module `security.firewall_feeds`, which ships **disabled** ([#1069](https://github.com/spatiumnorth/spatiumddi/issues/1069)) — it is an enforcement surface, and it pairs with Active block sync, which has always been off. Even enabled, no feed serves anything until an operator creates one.
 
 A `FirewallFeed` row exposes `GET /api/v1/firewall-feeds/feeds/{id}/blocklist.txt` — an **unauthenticated** (session-less) endpoint authed purely by a per-feed token (`?token=` or `Authorization: Bearer`). It renders the active `NetworkBlock` set of the feed's kind (`ip` today) as plain text, one IP/CIDR per line — the same desired-state intent the #601 push reconcilers converge, fed by rogue-DHCP (#370), new-device watch (#459), and manual entries. The token is Fernet-encrypted at rest, shown once on create, revealed again through a password-confirmed endpoint, and rotatable (invalidating the old URL). Each poll stamps `last_polled_at` / `last_polled_ip` / `poll_count` so operators can confirm a firewall is actually consuming the feed.
 
@@ -668,7 +668,7 @@ When **any** integration toggle is on, the dashboard renders an **Integrations p
 
 ## Roadmap — additional integrations
 
-Tier 1 status (tracked in [CLAUDE.md §Integration roadmap](https://github.com/spatiumddi/spatiumddi/blob/main/CLAUDE.md)): **UniFi Network Application**, **OPNsense** and **NetBird** have shipped as read-only mirrors (gated by the `integrations.unifi` / `integrations.opnsense` / `integrations.netbird` feature modules); **pfSense** remains. All target the same homelab / SMB audience and fit the Kubernetes/Docker/Proxmox/Tailscale reconciler shape. See CLAUDE.md for per-integration scope notes.
+Tier 1 status (tracked in [CLAUDE.md §Integration roadmap](https://github.com/spatiumnorth/spatiumddi/blob/main/CLAUDE.md)): **UniFi Network Application**, **OPNsense** and **NetBird** have shipped as read-only mirrors (gated by the `integrations.unifi` / `integrations.opnsense` / `integrations.netbird` feature modules); **pfSense** remains. All target the same homelab / SMB audience and fit the Kubernetes/Docker/Proxmox/Tailscale reconciler shape. See CLAUDE.md for per-integration scope notes.
 
 The **enterprise-firewall family** has since shipped on the same reconciler shape — **Palo Alto PAN-OS / Panorama** (#605) plus **Fortinet FortiGate** and **Cisco Meraki MX** (#606, Phase 1), each with its own section above. Check Point and Cisco FTD / FMC are the remaining Phase 2 vendors.
 

@@ -1,6 +1,6 @@
 [Unit]
 Description=/root (bind from /var/root — Phase 8a slot-safe binding, issue #138)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/138
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/138
 DefaultDependencies=no
 After=var.mount
 Before=local-fs.target umount.target

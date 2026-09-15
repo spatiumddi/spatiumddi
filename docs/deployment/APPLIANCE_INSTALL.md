@@ -61,7 +61,7 @@ reachable time source; a clock nothing corrects breaks TLS and pairing.
 ## 1. Get the ISO
 
 Download the image for your architecture from the
-[latest release](https://github.com/spatiumddi/spatiumddi/releases/latest):
+[latest release](https://github.com/spatiumnorth/spatiumddi/releases/latest):
 
 | Architecture | Asset | Firmware |
 |---|---|---|
@@ -72,8 +72,8 @@ Both are also published under un-versioned names that always point at the
 current release:
 
 ```
-https://github.com/spatiumddi/spatiumddi/releases/latest/download/spatiumddi-appliance-amd64.iso
-https://github.com/spatiumddi/spatiumddi/releases/latest/download/spatiumddi-appliance-arm64.iso
+https://github.com/spatiumnorth/spatiumddi/releases/latest/download/spatiumddi-appliance-amd64.iso
+https://github.com/spatiumnorth/spatiumddi/releases/latest/download/spatiumddi-appliance-arm64.iso
 ```
 
 Every night that `main` moves, a `nightly-YYYY.MM.DD` pre-release ships the

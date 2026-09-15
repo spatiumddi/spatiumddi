@@ -829,7 +829,7 @@ This allows a small deployment where one VM runs DHCP + DNS agents simultaneousl
 
 ## 5. Maintenance Mode
 
-Maintenance mode (issue #57) is a system-wide **read-only switch**, implemented as an ASGI middleware in [`backend/app/core/maintenance_mode.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/core/maintenance_mode.py) (`MaintenanceModeMiddleware`, wired in `app/main.py`). It is toggled by writing `PlatformSettings.maintenance_mode_enabled` / `maintenance_message` through the settings router (`PUT /api/v1/settings`); `maintenance_started_at` is server-stamped on enable and cleared on disable (it is never operator-set directly).
+Maintenance mode (issue #57) is a system-wide **read-only switch**, implemented as an ASGI middleware in [`backend/app/core/maintenance_mode.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/core/maintenance_mode.py) (`MaintenanceModeMiddleware`, wired in `app/main.py`). It is toggled by writing `PlatformSettings.maintenance_mode_enabled` / `maintenance_message` through the settings router (`PUT /api/v1/settings`); `maintenance_started_at` is server-stamped on enable and cleared on disable (it is never operator-set directly).
 
 When maintenance mode is **on**:
 
@@ -861,7 +861,7 @@ Performance: the middleware reads the flag from a short-TTL process-local cache.
 
 ## 6. Platform Settings
 
-`PlatformSettings` is a singleton table (always exactly one row, `id=1`), defined in [`backend/app/models/settings.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/models/settings.py). It backs the `/api/v1/settings` surface (`GET` + `PUT`). The model carries a large number of flat columns spanning branding, security, IPAM/DNS/DHCP defaults, scheduled-task gating, integrations, and per-appliance host-config (SNMP, NTP, APT, syslog, SSH, resolver, …). Below is a representative slice — every field named here is a real column; see the model for the full set.
+`PlatformSettings` is a singleton table (always exactly one row, `id=1`), defined in [`backend/app/models/settings.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/models/settings.py). It backs the `/api/v1/settings` surface (`GET` + `PUT`). The model carries a large number of flat columns spanning branding, security, IPAM/DNS/DHCP defaults, scheduled-task gating, integrations, and per-appliance host-config (SNMP, NTP, APT, syslog, SSH, resolver, …). Below is a representative slice — every field named here is a real column; see the model for the full set.
 
 **Branding**
 
@@ -1064,7 +1064,7 @@ GET /api/v1/version
     "version": "2026.04.13-1",
     "update_available": true,
     "latest_version": "2026.05.01-1",  # null if up to date, check disabled, or check failed
-    "latest_release_url": "https://github.com/spatiumddi/spatiumddi/releases/tag/2026.05.01-1",
+    "latest_release_url": "https://github.com/spatiumnorth/spatiumddi/releases/tag/2026.05.01-1",
     "latest_checked_at": "2026-04-13T02:00:00Z",  # null if never checked
     "release_check_enabled": true,
     "latest_check_error": null         # most recent error, if any

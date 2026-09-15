@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Export the SpatiumDDI OpenAPI document (issue #903).
 
-The native app lives in its own repo (``spatiumddi/spatiumddi-mobile``), so
+The native app lives in its own repo (``spatiumnorth/spatiumddi-mobile``), so
 the schema is no longer a file a client can read off the working tree — it is
 the contract between two repos, and it has to be versioned and fetchable.
 ``.github/workflows/release.yml`` runs this on every CalVer tag and attaches

@@ -1,6 +1,6 @@
 [Unit]
 Description=/home (bind from /var/home — Phase 8a slot-safe binding, issue #138)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/138
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/138
 DefaultDependencies=no
 # Must run AFTER /var is mounted (where /var/home lives) and BEFORE
 # local-fs.target completes (which gates many other services).

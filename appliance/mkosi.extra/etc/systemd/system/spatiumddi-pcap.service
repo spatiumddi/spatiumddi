@@ -1,6 +1,6 @@
 [Unit]
 Description=Run a pending SpatiumDDI appliance-host packet capture (issue #59)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/59
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/59
 # The trigger dir + the runner's output live under /var/lib/spatiumddi,
 # available after local-fs. No /etc overlay dependency — the runner writes
 # only under /var/lib/spatiumddi/release-state (the pcap is uploaded back

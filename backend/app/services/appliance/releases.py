@@ -137,7 +137,14 @@ async def _fetch_raw_releases() -> list[dict] | None:
         "X-GitHub-Api-Version": "2022-11-28",
     }
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        # follow_redirects: GitHub answers 301 for a repo that has moved — which
+        # an org rename makes routine. httpx does not follow by default and
+        # raise_for_status() does not reject a 3xx, so the redirect BODY was
+        # parsed as a release: no tag_name, so the check recorded "up to date"
+        # with no error and logged success. A silent false negative on an
+        # update notifier is worse than a loud failure; following the redirect
+        # removes it and keeps a stale github_repo working.
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
             resp = await client.get(url, headers=headers)
             resp.raise_for_status()
             data = resp.json()

@@ -31,7 +31,7 @@ All services communicate on the `spatiumddi` Docker bridge network. Only the fro
 
 ```bash
 # Clone the repository
-git clone https://github.com/spatiumddi/spatiumddi.git
+git clone https://github.com/spatiumnorth/spatiumddi.git
 cd spatiumddi
 
 # Create your environment file

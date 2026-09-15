@@ -1,6 +1,6 @@
 # Fleet Firewall — Declarative Per-Role Policy Compiled to nftables
 
-> Expands [#285](https://github.com/spatiumddi/spatiumddi/issues/285) (the four-port k3s-HA seed) into fine-grained, per-role, fleet-wide appliance firewall management. Closes the LAN-wide etcd/kubelet exposure as Phase 1; lands a structured policy engine as the larger arc.
+> Expands [#285](https://github.com/spatiumnorth/spatiumddi/issues/285) (the four-port k3s-HA seed) into fine-grained, per-role, fleet-wide appliance firewall management. Closes the LAN-wide etcd/kubelet exposure as Phase 1; lands a structured policy engine as the larger arc.
 
 ---
 
@@ -394,7 +394,7 @@ A new top-level **Firewall** surface under the Fleet sidebar **Services** group 
 
 ## 6. Safety rails + IPv6 + injection-safety + audit/compliance
 
-> **Shipped, partially, as [#1009](https://github.com/spatiumddi/spatiumddi/issues/1009) — and one sentence below is wrong.**
+> **Shipped, partially, as [#1009](https://github.com/spatiumnorth/spatiumddi/issues/1009) — and one sentence below is wrong.**
 > The SSH half of this section is now real, under the name `ssh_lockdown`
 > rather than `firewall_mgmt_lockdown`, reusing the existing
 > `ssh_allowed_source_networks` (#157) as its CIDR source rather than adding
@@ -414,7 +414,7 @@ A new top-level **Firewall** surface under the Fleet sidebar **Services** group 
 > baked sentinel.
 >
 > **What retiring the floor cost, and what paid for it —
-> [#1013](https://github.com/spatiumddi/spatiumddi/issues/1013).** §6.1's
+> [#1013](https://github.com/spatiumnorth/spatiumddi/issues/1013).** §6.1's
 > LAN-wide floor is named in the risk register (R1, and by implication
 > everything below it) as the mitigation for *other* firewall mistakes,
 > including a bad Web-UI scope from #285 Phase 6. Making it retireable removed

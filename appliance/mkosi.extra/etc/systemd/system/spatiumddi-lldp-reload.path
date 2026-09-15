@@ -1,6 +1,6 @@
 [Unit]
 Description=Watch for SpatiumDDI LLDP config-reload trigger (issue #343)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/343
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/343
 # Skip on the live ISO — lldpd isn't part of the installer environment.
 ConditionKernelCommandLine=!boot=live
 

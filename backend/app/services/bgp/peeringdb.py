@@ -30,7 +30,7 @@ from app.services.bgp.cache import set_ as cache_set
 logger = structlog.get_logger(__name__)
 
 _BASE_URL = "https://www.peeringdb.com/api"
-_USER_AGENT = "SpatiumDDI/0.1 (+https://github.com/spatiumddi/spatiumddi; bgp-enrichment)"
+_USER_AGENT = "SpatiumDDI/0.1 (+https://github.com/spatiumnorth/spatiumddi; bgp-enrichment)"
 _TIMEOUT = httpx.Timeout(15.0, connect=5.0, read=15.0)
 
 

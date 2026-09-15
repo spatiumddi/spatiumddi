@@ -1,6 +1,6 @@
 [Unit]
 Description=Watch for SpatiumDDI timezone-reload trigger (issue #165)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/165
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/165
 # Skip on the live ISO — installer environment doesn't drive timezone
 # via SpatiumDDI; the wizard sets /etc/timezone directly.
 ConditionKernelCommandLine=!boot=live

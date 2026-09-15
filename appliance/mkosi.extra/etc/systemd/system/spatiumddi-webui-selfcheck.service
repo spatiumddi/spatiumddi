@@ -1,6 +1,6 @@
 [Unit]
 Description=Check the Web UI is reachable through the firewall (issue #779)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/779
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/779
 # Reasons about the kernel-active ruleset, so the base config must have
 # been applied. Deliberately NOT ordered after the supervisor or k3s —
 # independence from the supervisor is the whole point (#777 is a live

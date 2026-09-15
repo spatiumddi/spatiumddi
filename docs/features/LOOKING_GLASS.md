@@ -5,7 +5,7 @@ title: BGP Looking Glass
 
 # BGP Looking Glass
 
-Issue [#566](https://github.com/spatiumddi/spatiumddi/issues/566). A per-appliance-node
+Issue [#566](https://github.com/spatiumnorth/spatiumddi/issues/566). A per-appliance-node
 **receive-only** BGP collector that peers with the operator's edge/core routers,
 accepts their routing table, and turns the live Adj-RIB-In into an operator surface
 where every prefix, origin ASN, and BGP community is a clickable link back into
@@ -34,7 +34,7 @@ observability tool into a transit path on the operator's network.
 
 ## Architecture
 
-The collector (`agent/looking-glass/`, image `ghcr.io/spatiumddi/looking-glass`)
+The collector (`agent/looking-glass/`, image `ghcr.io/spatiumnorth/looking-glass`)
 reuses the DNS/DHCP agent architecture wholesale: PSK→JWT bootstrap, ConfigBundle
 ETag long-poll + Redis wake, absence-reconcile telemetry push, ready-marker
 readiness gate, and the same supervisor role model (`can_run_looking_glass`

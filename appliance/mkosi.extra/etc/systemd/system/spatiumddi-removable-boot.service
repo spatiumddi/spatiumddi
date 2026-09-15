@@ -1,6 +1,6 @@
 [Unit]
 Description=Re-arm SpatiumDDI removable-disk mounts after the /etc overlay (issue #989)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/989
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/989
 ConditionKernelCommandLine=!boot=live
 # The whole point: the .mount units and their <device>.device.wants/
 # symlinks live in the /var-backed /etc overlay UPPER layer, which is

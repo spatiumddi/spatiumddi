@@ -12,7 +12,7 @@ the author checking their work on GitHub sees a working link.
 Source links are still welcome. They just have to be absolute, so they
 work in both places:
 
-    [record_ops.py](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/services/dns/record_ops.py)
+    [record_ops.py](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/services/dns/record_ops.py)
 
 Run with --list to see every offender.
 """
@@ -25,7 +25,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DOCS = ROOT / "docs"
-REPO = "https://github.com/spatiumddi/spatiumddi"
+REPO = "https://github.com/spatiumnorth/spatiumddi"
 
 INLINE = re.compile(r"\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 REFDEF = re.compile(r"^\[[^\]]+\]:\s*(\S+)", re.MULTILINE)

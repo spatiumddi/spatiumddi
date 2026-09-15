@@ -1,6 +1,6 @@
 [Unit]
 Description=Apply pending SpatiumDDI slot upgrade (Phase 8b-3)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/138
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/138
 # No docker dependency — slot upgrade writes to a block device, not
 # any container.
 

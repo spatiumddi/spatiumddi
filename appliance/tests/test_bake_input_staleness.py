@@ -214,7 +214,7 @@ def test_the_three_dns_images_do_not_share_one_coarse_mapping():
     got = {}
     for name in ("dns-bind9", "dns-powerdns", "dns-technitium"):
         r = subprocess.run(
-            ["bash", "-c", _preamble() + f'image_source_paths "ghcr.io/spatiumddi/{name}"'],
+            ["bash", "-c", _preamble() + f'image_source_paths "ghcr.io/spatiumnorth/{name}"'],
             capture_output=True,
             text=True,
             check=True,
@@ -232,61 +232,61 @@ def test_the_three_dns_images_do_not_share_one_coarse_mapping():
 
 
 def test_a_commit_moves_the_input_timestamp(repo: Path):
-    before, rc = _inputs_mtime(repo, "ghcr.io/spatiumddi/spatiumddi-api")
+    before, rc = _inputs_mtime(repo, "ghcr.io/spatiumnorth/spatiumddi-api")
     assert rc == 0
     time.sleep(1.1)
     (repo / "backend/f.txt").write_text("v2\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "touch backend")
-    after, _ = _inputs_mtime(repo, "ghcr.io/spatiumddi/spatiumddi-api")
+    after, _ = _inputs_mtime(repo, "ghcr.io/spatiumnorth/spatiumddi-api")
     assert after > before
 
 
 def test_an_uncommitted_edit_moves_the_input_timestamp(repo: Path):
     """The commonest shape of "I forgot to rebuild". A commit-time-only
     comparison would report the image as fresh."""
-    before, _ = _inputs_mtime(repo, "ghcr.io/spatiumddi/spatiumddi-api")
+    before, _ = _inputs_mtime(repo, "ghcr.io/spatiumnorth/spatiumddi-api")
     time.sleep(1.1)
     (repo / "backend/f.txt").write_text("dirty\n")
-    after, _ = _inputs_mtime(repo, "ghcr.io/spatiumddi/spatiumddi-api")
+    after, _ = _inputs_mtime(repo, "ghcr.io/spatiumnorth/spatiumddi-api")
     assert after > before
 
 
 def test_an_untracked_file_moves_the_input_timestamp(repo: Path):
-    before, _ = _inputs_mtime(repo, "ghcr.io/spatiumddi/spatiumddi-api")
+    before, _ = _inputs_mtime(repo, "ghcr.io/spatiumnorth/spatiumddi-api")
     time.sleep(1.1)
     (repo / "backend/brand_new.py").write_text("x\n")
-    after, _ = _inputs_mtime(repo, "ghcr.io/spatiumddi/spatiumddi-api")
+    after, _ = _inputs_mtime(repo, "ghcr.io/spatiumnorth/spatiumddi-api")
     assert after > before
 
 
 def test_an_edit_elsewhere_does_not_move_this_image(repo: Path):
     """The filed bug in one assertion: the api image must not be reported
     stale because the frontend changed."""
-    before, _ = _inputs_mtime(repo, "ghcr.io/spatiumddi/spatiumddi-api")
+    before, _ = _inputs_mtime(repo, "ghcr.io/spatiumnorth/spatiumddi-api")
     time.sleep(1.1)
     (repo / "frontend/f.txt").write_text("v2\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "touch frontend")
-    after, _ = _inputs_mtime(repo, "ghcr.io/spatiumddi/spatiumddi-api")
+    after, _ = _inputs_mtime(repo, "ghcr.io/spatiumnorth/spatiumddi-api")
     assert after == before
 
 
 def test_a_bind9_only_change_does_not_move_powerdns(repo: Path):
-    before, _ = _inputs_mtime(repo, "ghcr.io/spatiumddi/dns-powerdns")
+    before, _ = _inputs_mtime(repo, "ghcr.io/spatiumnorth/dns-powerdns")
     time.sleep(1.1)
     (repo / "agent/dns/images/bind9/f.txt").write_text("v2\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "bind9 only")
-    after, _ = _inputs_mtime(repo, "ghcr.io/spatiumddi/dns-powerdns")
-    bind_after, _ = _inputs_mtime(repo, "ghcr.io/spatiumddi/dns-bind9")
+    after, _ = _inputs_mtime(repo, "ghcr.io/spatiumnorth/dns-powerdns")
+    bind_after, _ = _inputs_mtime(repo, "ghcr.io/spatiumnorth/dns-bind9")
     assert after == before
     assert bind_after > before
 
 
 def test_shared_agent_code_moves_all_three_dns_images(repo: Path):
     before = {
-        n: _inputs_mtime(repo, f"ghcr.io/spatiumddi/{n}")[0]
+        n: _inputs_mtime(repo, f"ghcr.io/spatiumnorth/{n}")[0]
         for n in ("dns-bind9", "dns-powerdns", "dns-technitium")
     }
     time.sleep(1.1)
@@ -294,7 +294,7 @@ def test_shared_agent_code_moves_all_three_dns_images(repo: Path):
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "shared agent")
     for name, was in before.items():
-        now, _ = _inputs_mtime(repo, f"ghcr.io/spatiumddi/{name}")
+        now, _ = _inputs_mtime(repo, f"ghcr.io/spatiumnorth/{name}")
         assert now > was, name
 
 
@@ -305,7 +305,7 @@ def test_an_unmapped_image_reports_rc_2_not_a_bogus_timestamp(repo: Path):
     """rc 2 is what makes the caller fall back to the wall-clock rule and
     NAME the image. Echoing 0 instead would read as "inputs have never
     moved" — permanently fresh, silently unguarded."""
-    _, rc = _inputs_mtime(repo, "ghcr.io/spatiumddi/some-new-image")
+    _, rc = _inputs_mtime(repo, "ghcr.io/spatiumnorth/some-new-image")
     assert rc == 2
 
 
@@ -314,7 +314,7 @@ def test_outside_a_git_repo_reports_rc_1(tmp_path: Path):
     rather than answer 0."""
     plain = tmp_path / "notarepo"
     (plain / "backend").mkdir(parents=True)
-    r = _run(plain, _CALL.format(image="ghcr.io/spatiumddi/spatiumddi-api"))
+    r = _run(plain, _CALL.format(image="ghcr.io/spatiumnorth/spatiumddi-api"))
     assert "rc=1" in r.stdout
 
 
@@ -426,10 +426,10 @@ def test_an_uncommitted_deletion_moves_the_input_timestamp(repo: Path):
     and not rebuilding left the image judged FRESH, which is exactly the
     "I forgot to rebuild" case the guard exists for. Resolved from the
     parent directory's mtime, which unlink() updates."""
-    before, _ = _inputs_mtime(repo, "ghcr.io/spatiumddi/spatiumddi-api")
+    before, _ = _inputs_mtime(repo, "ghcr.io/spatiumnorth/spatiumddi-api")
     time.sleep(1.1)
     (repo / "backend/f.txt").unlink()
-    after, _ = _inputs_mtime(repo, "ghcr.io/spatiumddi/spatiumddi-api")
+    after, _ = _inputs_mtime(repo, "ghcr.io/spatiumnorth/spatiumddi-api")
     assert after > before
 
 
@@ -439,7 +439,7 @@ def test_a_deletion_does_not_make_the_image_permanently_stale(repo: Path):
     run, including immediately after the rebuild that was supposed to
     clear it."""
     (repo / "backend/f.txt").unlink()
-    first, _ = _inputs_mtime(repo, "ghcr.io/spatiumddi/spatiumddi-api")
+    first, _ = _inputs_mtime(repo, "ghcr.io/spatiumnorth/spatiumddi-api")
     time.sleep(1.1)
-    second, _ = _inputs_mtime(repo, "ghcr.io/spatiumddi/spatiumddi-api")
+    second, _ = _inputs_mtime(repo, "ghcr.io/spatiumnorth/spatiumddi-api")
     assert first == second

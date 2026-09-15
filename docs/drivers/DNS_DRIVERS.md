@@ -2,7 +2,7 @@
 
 ## Overview
 
-DNS drivers implement the `DNSDriver` abstract base class in [`app/drivers/dns/base.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dns/base.py). They are responsible for translating SpatiumDDI's internal DNS model into backend-neutral config + per-record ops. The critical constraint: **no DNS driver may restart the DNS daemon** as part of normal record or zone operations.
+DNS drivers implement the `DNSDriver` abstract base class in [`app/drivers/dns/base.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/drivers/dns/base.py). They are responsible for translating SpatiumDDI's internal DNS model into backend-neutral config + per-record ops. The critical constraint: **no DNS driver may restart the DNS daemon** as part of normal record or zone operations.
 
 The control-plane driver is a *thin* translator (CLAUDE.md non-negotiable #10): it takes SpatiumDDI DB models and emits a canonical `ConfigBundle` (plus per-record `RecordChange` ops) in neutral types. For agent-managed drivers (BIND9, PowerDNS) the actual daemon lifecycle — `nsupdate`, `rndc`, the PowerDNS REST API — runs inside the agent container; the control-plane `apply_record_change` is a formulate-only no-op that logs the op. For agentless drivers (Windows DNS, the cloud providers) `apply_record_change` runs synchronously from the control plane.
 
@@ -10,7 +10,7 @@ The control-plane driver is a *thin* translator (CLAUDE.md non-negotiable #10): 
 
 ## 1. Abstract Base Class
 
-The neutral data shapes and the ABC both live in [`app/drivers/dns/base.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dns/base.py). The driver speaks only in these frozen dataclasses — `RecordData`, `ZoneData`, `RecordChange`, `RecordChangeResult`, `ConfigBundle`, `ServerOptions`, plus the BIND9 config pieces (`ViewData`, `AclData`, `TsigKey`, `TrustAnchorData`, `DNSSECPolicyData`, `EffectiveBlocklistData`). A couple of the central ones:
+The neutral data shapes and the ABC both live in [`app/drivers/dns/base.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/drivers/dns/base.py). The driver speaks only in these frozen dataclasses — `RecordData`, `ZoneData`, `RecordChange`, `RecordChangeResult`, `ConfigBundle`, `ServerOptions`, plus the BIND9 config pieces (`ViewData`, `AclData`, `TsigKey`, `TrustAnchorData`, `DNSSECPolicyData`, `EffectiveBlocklistData`). A couple of the central ones:
 
 ```python
 @dataclass(frozen=True)
@@ -127,7 +127,7 @@ class DNSDriver(ABC):
 | Update RPZ (blocking) | `rndc reload <rpz-zone>` after writing RPZ zone file | Zone-level reload only |
 | **Full daemon restart** | ❌ NEVER for normal operations | Only for: initial install, major version upgrade |
 
-### Record ops carry the whole RRset ([#773](https://github.com/spatiumddi/spatiumddi/issues/773))
+### Record ops carry the whole RRset ([#773](https://github.com/spatiumnorth/spatiumddi/issues/773))
 
 A record op names one record, but none of the three agent wire protocols
 can express "change this RR and leave its siblings alone" from a payload
@@ -315,7 +315,7 @@ the control-plane preview template `named.conf.j2`.
 ### 2.7 dnsdist front for PowerDNS (issue #146 Phase 2)
 
 PowerDNS Authoritative has no RRL, so rate limiting in front of a PowerDNS
-group is an opt-in **dnsdist front** (`ghcr.io/spatiumddi/dns-dnsdist`, Alpine
+group is an opt-in **dnsdist front** (`ghcr.io/spatiumnorth/dns-dnsdist`, Alpine
 + dnsdist) — a **separate container** that forwards to pdns:53 over the
 network. **pdns never moves port** (no shared netns, no restart race): the
 front owns the published `:53` and forwards to `dns-powerdns:53`.
@@ -337,7 +337,7 @@ dnsdist Deployment fronting the hostNetwork pdns DaemonSet) is a follow-up.
 
 ## 3. Windows DNS Driver
 
-Located at [`app/drivers/dns/windows.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dns/windows.py). Class: `WindowsDNSDriver`. Two capability tiers coexist on the same driver class; which one applies at runtime depends on whether `DNSServer.credentials_encrypted` is set.
+Located at [`app/drivers/dns/windows.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/drivers/dns/windows.py). Class: `WindowsDNSDriver`. Two capability tiers coexist on the same driver class; which one applies at runtime depends on whether `DNSServer.credentials_encrypted` is set.
 
 ### 3.1 Path A — RFC 2136 (always available)
 
@@ -383,7 +383,7 @@ Required security group for the service account: `DnsAdmins` on the domain (or a
 
 ### 3.4 Driver registry classification
 
-In [`app/drivers/dns/__init__.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dns/__init__.py):
+In [`app/drivers/dns/__init__.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/drivers/dns/__init__.py):
 
 ```python
 AGENTLESS_DRIVERS: frozenset[str] = frozenset(
@@ -407,7 +407,7 @@ If the push fails, the 502 response prevents the DB commit — the Windows DNS s
 
 ### 3.6 Shared AXFR helper
 
-[`drivers/dns/_axfr.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dns/_axfr.py) extracts the AXFR → `RecordData` logic used by both BIND9 and Windows Path A. Filters SOA + apex NS; absolutises CNAME / NS / PTR / MX / SRV targets.
+[`drivers/dns/_axfr.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/drivers/dns/_axfr.py) extracts the AXFR → `RecordData` logic used by both BIND9 and Windows Path A. Filters SOA + apex NS; absolutises CNAME / NS / PTR / MX / SRV targets.
 
 ### 3.7 Batched WinRM dispatch
 
@@ -430,7 +430,7 @@ BIND9 + any future driver gets the plural interface for free via the default loo
 
 **Windows batch sizing — length-measured chunks (issue #426).** The real constraint isn't WinRM's envelope cap (`MaxEnvelopeSize` defaults to 500 KB) but the way `pywinrm.run_ps` ships the script: UTF-16-LE → base64 → `powershell.exe -EncodedCommand <b64>` → **single CMD.EXE command line, hard-capped at ~8191 chars by Windows**. Base64 costs ×1.33, UTF-16-LE costs ×2, so each raw script char eats ~2.67 chars of command-line budget.
 
-Rather than a fixed op count, `_pack_record_chunks` greedily packs each chunk and measures the **actual built script** against `MAX_ENCODED_COMMAND` (7800, in [`drivers/_winrm.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/_winrm.py)) via `encoded_command_len`, so a chunk of large TXT (DKIM/SPF/DMARC) records can't silently overflow the cmdline. `_WINRM_MAX_BATCH_OPS = 25` is a coarse sanity cap on top of the length check. A single op that won't fit even alone still ships as a one-op chunk; the dispatcher catches the resulting too-long error and fails just that op. (The previous fixed count of 6 had no length check — a few big TXT records would blow the cap and fail the whole chunk.)
+Rather than a fixed op count, `_pack_record_chunks` greedily packs each chunk and measures the **actual built script** against `MAX_ENCODED_COMMAND` (7800, in [`drivers/_winrm.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/drivers/_winrm.py)) via `encoded_command_len`, so a chunk of large TXT (DKIM/SPF/DMARC) records can't silently overflow the cmdline. `_WINRM_MAX_BATCH_OPS = 25` is a coarse sanity cap on top of the length check. A single op that won't fit even alone still ships as a one-op chunk; the dispatcher catches the resulting too-long error and fails just that op. (The previous fixed count of 6 had no length check — a few big TXT records would blow the cap and fail the whole chunk.)
 
 **Script layout.** One invocation carries data-only JSON with short keys (`i/op/z/n/t/v/ttl/pr/w/p`) and a single dispatch wrapper:
 
@@ -455,11 +455,11 @@ $r | ConvertTo-Json -Compress -Depth 3
 
 `$ErrorActionPreference = 'Continue'` ensures a per-op `throw` doesn't abort the enclosing script; the try/catch per op records the error into the result array. Chunk-wide script errors (syntax, base64 decode) still raise from `_run_ps` and propagate to the caller.
 
-**Lifting the ceiling — pypsrp.** Future upgrade path: swap `pywinrm` for `pypsrp`. PSRP uses the WSMan Runspace protocol instead of CMD.EXE and removes the 8K limit entirely — would yield ~100 ops/batch on the same envelope settings. Tracked as a TODO comment in [`drivers/dns/windows.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dns/windows.py).
+**Lifting the ceiling — pypsrp.** Future upgrade path: swap `pywinrm` for `pypsrp`. PSRP uses the WSMan Runspace protocol instead of CMD.EXE and removes the 8K limit entirely — would yield ~100 ops/batch on the same envelope settings. Tracked as a TODO comment in [`drivers/dns/windows.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/drivers/dns/windows.py).
 
 **RFC 2136 path — `asyncio.gather`.** The 2136 write path is cheap per-op but was still serial. Record ops now run in parallel via `asyncio.gather`; no batching needed because the dnspython update framing is already compact.
 
-**Dispatch.** `enqueue_record_ops_batch(db, zone, ops)` in [`services/dns/record_ops.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/services/dns/record_ops.py) groups pending ops by zone and calls `apply_record_changes` once per group. Zone serial bumps once per batch instead of N times. **State-aware commit**: the caller zips through the returned op rows and keeps the DB row only when the op came back `state == "failed"` — a server rejected the delete, so the record is still published and reporting "deleted" would leave a zombie the next "Sync with server" pulls back. Every other outcome deletes locally: `applied` (agentless, inline), `pending` (agent-based — the agent applies it on its next long-poll; gating on `applied` here was the #950 / #962 defect, which reported every agent-side delete as failed) and `None` (no primary to push to — DB-only cruft, #623).
+**Dispatch.** `enqueue_record_ops_batch(db, zone, ops)` in [`services/dns/record_ops.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/services/dns/record_ops.py) groups pending ops by zone and calls `apply_record_changes` once per group. Zone serial bumps once per batch instead of N times. **State-aware commit**: the caller zips through the returned op rows and keeps the DB row only when the op came back `state == "failed"` — a server rejected the delete, so the record is still published and reporting "deleted" would leave a zombie the next "Sync with server" pulls back. Every other outcome deletes locally: `applied` (agentless, inline), `pending` (agent-based — the agent applies it on its next long-poll; gating on `applied` here was the #950 / #962 defect, which reported every agent-side delete as failed) and `None` (no primary to push to — DB-only cruft, #623).
 
 **Results.**
 
@@ -472,11 +472,11 @@ $r | ConvertTo-Json -Compress -Depth 3
 
 ## 4. PowerDNS Driver
 
-Located at [`app/drivers/dns/powerdns.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dns/powerdns.py). Class: `PowerDNSDriver`. Shipped in issue #127.
+Located at [`app/drivers/dns/powerdns.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/drivers/dns/powerdns.py). Class: `PowerDNSDriver`. Shipped in issue #127.
 
 PowerDNS is a second authoritative driver running side-by-side with BIND9. It is **agent-managed** the same way BIND9 is — there is one DNS agent per server, the agent owns the local PowerDNS daemon (`pdns_server`), and the control plane never opens a connection to PowerDNS directly. The agent talks to PowerDNS's REST API on `127.0.0.1:8081`; the control plane talks to the agent through the existing long-poll `/config` channel.
 
-The shipped image (`ghcr.io/spatiumddi/dns-powerdns`) bundles `pdns 5.0.x` with the `pdns-backend-lmdb` backend. **Upgrading this image across the 4.x → 5.x boundary migrates the LMDB schema one way** — see §4.9. LMDB is a single-file embedded zone store — no external Postgres, no shared credentials, full operational symmetry with BIND9's "zone files on local disk" model. A `gpgsql`-backend image variant is on the Phase 5+ wishlist for operators who want PowerDNS-pod-replicas-against-shared-Postgres HA, but is not the default.
+The shipped image (`ghcr.io/spatiumnorth/dns-powerdns`) bundles `pdns 5.0.x` with the `pdns-backend-lmdb` backend. **Upgrading this image across the 4.x → 5.x boundary migrates the LMDB schema one way** — see §4.9. LMDB is a single-file embedded zone store — no external Postgres, no shared credentials, full operational symmetry with BIND9's "zone files on local disk" model. A `gpgsql`-backend image variant is on the Phase 5+ wishlist for operators who want PowerDNS-pod-replicas-against-shared-Postgres HA, but is not the default.
 
 ### 4.1 Update Strategy: REST API (never daemon restart)
 
@@ -557,7 +557,7 @@ PowerDNS does the full DNSSEC dance internally:
 
 After signing, the agent enumerates DS records via `GET /cryptokeys` and POSTs them back to the control plane through the new `POST /api/v1/dns/agents/dnssec-state` endpoint. The control plane caches them in `dns_zone.dnssec_ds_records` (JSONB) so the operator-facing zone-edit page renders them without round-tripping the agent.
 
-**Backup integration.** DNSSEC keys live in the agent's LMDB store, **not** in the control-plane backup. Restoring a DNSSEC-signed zone to a fresh agent regenerates keys and produces NEW DS records, which must be re-published to the parent registrar. The restore endpoint surfaces this as a `RestoreOutcomeResponse.warnings[]` advisory. See [issue #127 Phase 4d](https://github.com/spatiumddi/spatiumddi/issues/127).
+**Backup integration.** DNSSEC keys live in the agent's LMDB store, **not** in the control-plane backup. Restoring a DNSSEC-signed zone to a fresh agent regenerates keys and produces NEW DS records, which must be re-published to the parent registrar. The restore endpoint surfaces this as a `RestoreOutcomeResponse.warnings[]` advisory. See [issue #127 Phase 4d](https://github.com/spatiumnorth/spatiumddi/issues/127).
 
 ### 4.6 Catalog zones (RFC 9432)
 
@@ -648,7 +648,7 @@ These are infrastructure-DNS drivers, distinct from the *Cloud (AWS / Azure / GC
 
 ### 4A.1 Agentless shape (reuses Windows-DNS Path B)
 
-The shared base [`drivers/dns/_cloud_base.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dns/_cloud_base.py) (`CloudDNSDriverBase`) mirrors how `windows_dns` Path B already works (§3 above):
+The shared base [`drivers/dns/_cloud_base.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/drivers/dns/_cloud_base.py) (`CloudDNSDriverBase`) mirrors how `windows_dns` Path B already works (§3 above):
 
 - **No ConfigBundle / long-poll.** The `render_*` methods return `""` and the `reload_*` methods are no-ops — agentless drivers never render daemon config. `validate_config` accepts anything.
 - **Credentials in the existing column.** The per-provider credential dict is Fernet-encrypted in the existing `DNSServer.credentials_encrypted` column — no new credential store. `_load_credentials` decrypts it, raising a clean `CloudDNSError` when unset vs. when the API rejects the key.
@@ -705,7 +705,7 @@ Third authoritative driver, alongside BIND9 and PowerDNS. Same agent-colocated s
 Unlike PowerDNS's rrset-REPLACE PATCH semantics, Technitium's `/api/zones/records/add` **appends** at a given `(name, type)` by default (round-robin A records coexist without a GET-merge-PATCH dance) and only wipes the rrset when `overwrite=true` is passed explicitly. The agent driver exploits this:
 
 - **Bulk reconcile** (`swap_and_reload`, fired on structural config changes): fetch the zone's full record set via `GET /api/zones/records/get?listZone=true`, diff by `(domain, type, params)` fingerprint against the desired bundle state, then `POST` deletes for what's extra and adds for what's missing. No `update` endpoint call needed — a changed value is just delete-old + add-new, computed from the full diff.
-- **Incremental ops** (`apply_record_op`, fired per live edit): the op carries the complete desired `rrset` (see §2, [#773](https://github.com/spatiumddi/spatiumddi/issues/773)), so `create`/`update` is member 0 with `overwrite=true` — which clears — followed by an `add` per remaining member with `overwrite=false`, and `delete` is a single value-scoped `delete` of the op's own value (the survivors are already on the server; wiping and rebuilding them would open a window where the name serves less than it should). Before #773 this path was one `add` with `overwrite=true`, which is what collapsed every multi-value RRset to its last value.
+- **Incremental ops** (`apply_record_op`, fired per live edit): the op carries the complete desired `rrset` (see §2, [#773](https://github.com/spatiumnorth/spatiumddi/issues/773)), so `create`/`update` is member 0 with `overwrite=true` — which clears — followed by an `add` per remaining member with `overwrite=false`, and `delete` is a single value-scoped `delete` of the op's own value (the survivors are already on the server; wiping and rebuilding them would open a window where the name serves less than it should). Before #773 this path was one `add` with `overwrite=true`, which is what collapsed every multi-value RRset to its last value.
 - Zone apex `NS`/`SOA` are **daemon-managed** — Technitium auto-creates its own SOA + one NS pointing at its own hostname on `/api/zones/create`, so the bundle's apex NS/SOA are intentionally excluded from every reconcile pass (pushing them would create duplicate/foreign records). Off-apex `NS` (delegations) reconcile normally.
 
 ### 4B.2 Auth — agent-provisioned bearer token
@@ -837,7 +837,7 @@ Only `Primary` zones are imported. Secondary / Stub / Forwarder / Catalog are re
 
 `pull_zone_records` AXFRs the zone off the Technitium host, the same path BIND9's drift uses. Technitium's own REST API would be the more natural source — it is exactly what the live-pull importer reads — but that API listens on loopback `:5380` inside the agent's container and only the co-located agent can reach it, so the control plane goes over DNS.
 
-**The transfer is TSIG-signed** ([#734](https://github.com/spatiumddi/spatiumddi/issues/734)). `allow transfer` defaults to `none` → `zoneTransfer: Deny`, which used to mean drift could never read anything on a stock install. So when the group has TSIG keys, `_zone_options_payload` renders `zoneTransfer: Allow` **plus** `zoneTransferTsigKeyNames`, and the control plane signs with the group key.
+**The transfer is TSIG-signed** ([#734](https://github.com/spatiumnorth/spatiumddi/issues/734)). `allow transfer` defaults to `none` → `zoneTransfer: Deny`, which used to mean drift could never read anything on a stock install. So when the group has TSIG keys, `_zone_options_payload` renders `zoneTransfer: Allow` **plus** `zoneTransferTsigKeyNames`, and the control plane signs with the group key.
 
 That is a *narrowing*, not an opening, and the reason is in Technitium's own source: `DnsServer.cs` runs two gates in sequence, `IsZoneTransferAllowed` (address/policy) and then `IsTsigAuthenticated`, and the second returns "no auth needed" **only** when the key-name set is empty. So `Allow` + non-empty key names means *any source, but the request must be signed by one of these keys* — the same posture BIND9 renders as `allow-transfer { key "…"; };`, and stricter than an address ACL, which admits anyone who can occupy the address.
 
@@ -852,27 +852,27 @@ Technitium's API takes structured per-type params rather than PowerDNS's single 
 ### 4B.5 Still outstanding
 
 The v1 fast-follow list has been worked off. **Shipped since:** online DNSSEC
-signing ([#740](https://github.com/spatiumddi/spatiumddi/issues/740), §4B.3b),
+signing ([#740](https://github.com/spatiumnorth/spatiumddi/issues/740), §4B.3b),
 native DoT/DoH/DoQ listeners plus encrypted upstream forwarding
-([#741](https://github.com/spatiumddi/spatiumddi/issues/741), §4B.3c),
+([#741](https://github.com/spatiumnorth/spatiumddi/issues/741), §4B.3c),
 secondary / stub / catalog zones and TSIG transfer
-([#743](https://github.com/spatiumddi/spatiumddi/issues/743), §4B.3a), and the
+([#743](https://github.com/spatiumnorth/spatiumddi/issues/743), §4B.3a), and the
 live-pull importer + native blocklist wiring
-([#744](https://github.com/spatiumddi/spatiumddi/issues/744), §4B.3d).
+([#744](https://github.com/spatiumnorth/spatiumddi/issues/744), §4B.3d).
 
 What is left:
 
-- **Query-log shipping** ([#742](https://github.com/spatiumddi/spatiumddi/issues/742)) — Technitium's query logging is API/DB-backed (`/api/logs/query*`), not a tailable text file like BIND9's `query_log_file` or PowerDNS's redirected stderr capture, so it needs a poll-and-diff shipper rather than the existing file-tailing `QueryLogShipper`. Until it lands, a Technitium group's queries do not reach the Logs page's **DNS Queries** tab.
+- **Query-log shipping** ([#742](https://github.com/spatiumnorth/spatiumddi/issues/742)) — Technitium's query logging is API/DB-backed (`/api/logs/query*`), not a tailable text file like BIND9's `query_log_file` or PowerDNS's redirected stderr capture, so it needs a poll-and-diff shipper rather than the existing file-tailing `QueryLogShipper`. Until it lands, a Technitium group's queries do not reach the Logs page's **DNS Queries** tab.
 - **ANAME / APP / FWD record types** — Technitium-proprietary, and a different shape than PowerDNS's ALIAS/LUA rather than a drop-in equivalent, so they need their own design pass.
 - **Views** — declined outright, not deferred. Technitium has no view concept, which is also why per-view blocklists collapse into one flat set (§4B.3d).
 
 ### 4B.6 Image
 
-`ghcr.io/spatiumddi/dns-technitium` builds `FROM technitium/dns-server:<pinned>` (Ubuntu 24.04 + .NET 10, **not Alpine** — see `docs/deployment/DNS_AGENT.md` §7 for why) with the `spatium_dns_agent` wheel layered on top. Healthcheck queries the RFC 6761 reserved `invalid.` TLD rather than a CHAOS-class query — confirmed empirically that Technitium REFUSES `id.server`/`version.bind` CH TXT entirely, unlike BIND9/PowerDNS.
+`ghcr.io/spatiumnorth/dns-technitium` builds `FROM technitium/dns-server:<pinned>` (Ubuntu 24.04 + .NET 10, **not Alpine** — see `docs/deployment/DNS_AGENT.md` §7 for why) with the `spatium_dns_agent` wheel layered on top. Healthcheck queries the RFC 6761 reserved `invalid.` TLD rather than a CHAOS-class query — confirmed empirically that Technitium REFUSES `id.server`/`version.bind` CH TXT entirely, unlike BIND9/PowerDNS.
 
 ---
 
-## 4C. Technitium — agentless (`technitium_api`), issue [#810](https://github.com/spatiumddi/spatiumddi/issues/810)
+## 4C. Technitium — agentless (`technitium_api`), issue [#810](https://github.com/spatiumnorth/spatiumddi/issues/810)
 
 Two Technitium drivers ship, and the difference is **who owns the daemon**:
 
@@ -922,7 +922,7 @@ SECURITY: the URL is operator-supplied and the *server* dials it, so create/upda
 
 ### 4C.4 The trap: errors arrive as HTTP 200
 
-Technitium answers `{"status": "error" | "invalid-token" | "2fa-required", …}` with a **200 status line**. A driver that trusts `raise_for_status()` reads every auth failure as an empty success — and an empty zone list handed to a sync diff is exactly the [#430](https://github.com/spatiumddi/spatiumddi/issues/430) shape that proposes deleting everything SpatiumDDI knows about. Non-negotiable #5 in one sentence.
+Technitium answers `{"status": "error" | "invalid-token" | "2fa-required", …}` with a **200 status line**. A driver that trusts `raise_for_status()` reads every auth failure as an empty success — and an empty zone list handed to a sync diff is exactly the [#430](https://github.com/spatiumnorth/spatiumddi/issues/430) shape that proposes deleting everything SpatiumDDI knows about. Non-negotiable #5 in one sentence.
 
 `_unwrap` is the only path responses are read through, and it distinguishes:
 
@@ -969,7 +969,7 @@ Technitium's own internal zones (`localhost`, the RFC 1918 reverse stubs) carry 
 
 ### 4C.8 Not in scope for this driver
 
-DNSSEC signing, forwarders and the native blocklists stay on the agent-managed driver. `capabilities()` advertises `dnssec_online: false` and `technitium_api` is absent from `_DRIVER_GATED_OPERATIONS["dnssec_sign"]`, so the sign/unsign endpoints refuse it rather than half-working. Also deferred: query-log polling (`/api/logs/query` is paginated with time filters, so a control-plane poll-and-diff shipper is straightforward here in a way it is not on the agent path — see [#742](https://github.com/spatiumddi/spatiumddi/issues/742)), Technitium's DHCP API (a separate driver, not part of this one), clustering (`node` param on most calls), and DNS Apps.
+DNSSEC signing, forwarders and the native blocklists stay on the agent-managed driver. `capabilities()` advertises `dnssec_online: false` and `technitium_api` is absent from `_DRIVER_GATED_OPERATIONS["dnssec_sign"]`, so the sign/unsign endpoints refuse it rather than half-working. Also deferred: query-log polling (`/api/logs/query` is paginated with time filters, so a control-plane poll-and-diff shipper is straightforward here in a way it is not on the agent path — see [#742](https://github.com/spatiumnorth/spatiumddi/issues/742)), Technitium's DHCP API (a separate driver, not part of this one), clustering (`node` param on most calls), and DNS Apps.
 
 ---
 
@@ -1059,7 +1059,7 @@ A group is single-driver, so servers of the two kinds live in separate groups.
 There is no dedicated driver-exception hierarchy. Drivers raise plain exceptions and let the caller decide how to surface them:
 
 - **BIND9 / Windows DNS** raise stdlib `RuntimeError` / `ValueError` on bad input or a hard failure (e.g. `BIND9Driver.apply_record_change` raises `RuntimeError` when no TSIG key is configured rather than ever sending an unsigned update; the Windows PowerShell helpers `raise ValueError` on an unsupported op / record type).
-- **Cloud drivers** (`CloudDNSDriverBase` and its subclasses) raise `CloudDNSError` ([`drivers/dns/_cloud_base.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dns/_cloud_base.py)) — each provider's `_unwrap` / `_wrap_errors` / `_wrap_call` helper normalises the raw SDK/HTTP fault into an operator-facing `CloudDNSError` message first (§4A.5).
+- **Cloud drivers** (`CloudDNSDriverBase` and its subclasses) raise `CloudDNSError` ([`drivers/dns/_cloud_base.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/drivers/dns/_cloud_base.py)) — each provider's `_unwrap` / `_wrap_errors` / `_wrap_call` helper normalises the raw SDK/HTTP fault into an operator-facing `CloudDNSError` message first (§4A.5).
 
 Rules every driver follows:
 
@@ -1069,7 +1069,7 @@ Rules every driver follows:
 
 **Per-op isolation lives in `apply_record_changes`, not in the driver methods.** The default batch loop on `DNSDriver` (§1) catches each per-op exception and records it as `RecordChangeResult(ok=False, error=str(exc))` so one bad record never poisons the rest of the batch. Whole-batch failures (connection refused, auth, a malformed generated script) still propagate by raising from the driver.
 
-The service layer turns those outcomes into persisted state. [`services/dns/record_ops.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/services/dns/record_ops.py) writes a `DNSRecordOp` row per op, marking it `state="applied"` (clearing `last_error`) on success or `state="failed"` with the truncated `last_error` on exception, so operators get a per-op audit trail either way. A whole-batch exception marks every row in the batch `failed` with the same error. Retry, where applicable, is the caller's concern (e.g. Celery task retries on the agent push path) — the driver itself does not retry.
+The service layer turns those outcomes into persisted state. [`services/dns/record_ops.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/services/dns/record_ops.py) writes a `DNSRecordOp` row per op, marking it `state="applied"` (clearing `last_error`) on success or `state="failed"` with the truncated `last_error` on exception, so operators get a per-op audit trail either way. A whole-batch exception marks every row in the batch `failed` with the same error. Retry, where applicable, is the caller's concern (e.g. Celery task retries on the agent push path) — the driver itself does not retry.
 
 ---
 

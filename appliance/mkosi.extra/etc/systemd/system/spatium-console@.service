@@ -1,6 +1,6 @@
 [Unit]
 Description=SpatiumDDI appliance console dashboard (%I)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/134
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/134
 # Same gates as spatium-console.service. The serial console matters
 # most for headless installs (Proxmox `serial0`, IPMI SoL, RPi UART,
 # cloud VM consoles) — operators on those paths benefit from the

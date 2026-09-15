@@ -1,6 +1,6 @@
 [Unit]
 Description=Join this node to the SpatiumDDI control-plane cluster (#272 Phase 7b)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/272
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/272
 # k3s reconfigure; the runner stops/starts k3s itself.
 
 [Service]

@@ -1,6 +1,6 @@
 [Unit]
 Description=Apply pending SpatiumDDI SSH authorized_keys / sshd config (issue #157)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/157
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/157
 # Defensive — the runner writes to /etc/ssh/sshd_config.d/spatiumddi.conf
 # and /etc/nftables.d/50-spatium-ssh.nft, both of which need the /etc
 # overlay (Phase 8a, lower=/usr/lib/etc.image, upper=/var/persist/etc)

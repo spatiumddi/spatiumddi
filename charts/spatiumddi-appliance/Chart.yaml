@@ -19,7 +19,7 @@ appVersion: "0.0.0-dev"
 kubeVersion: ">=1.35.0-0"
 home: https://www.spatiumddi.com/
 sources:
-  - https://github.com/spatiumddi/spatiumddi
+  - https://github.com/spatiumnorth/spatiumddi
 icon: https://www.spatiumddi.com/assets/logo-icon.svg
 keywords:
   - ipam

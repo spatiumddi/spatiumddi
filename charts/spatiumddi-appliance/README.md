@@ -3,7 +3,7 @@
 Helm chart that reconciles the SpatiumDDI **appliance's local k3s
 cluster** to the operator's role assignment.
 
-Issued in [issue #183](https://github.com/spatiumddi/spatiumddi/issues/183)
+Issued in [issue #183](https://github.com/spatiumnorth/spatiumddi/issues/183)
 Phase 2. Phase 1 baked k3s into the slot image; Phase 2 ships this
 chart; Phase 3 wires the supervisor as the CRD reconciler that
 turns operator role assignments on the control plane into Helm

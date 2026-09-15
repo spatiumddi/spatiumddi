@@ -1,6 +1,6 @@
 [Unit]
 Description=Recheck Web UI firewall reachability (issue #779)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/779
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/779
 # Don't run in the live installer environment.
 ConditionKernelCommandLine=!boot=live
 

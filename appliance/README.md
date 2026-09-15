@@ -22,7 +22,7 @@ the supervisor PATCHes onto the chart on heartbeat.
 > covers it.
 
 > **Status:** Phase 1 of the appliance roadmap (issue
-> [#134](https://github.com/spatiumddi/spatiumddi/issues/134)).
+> [#134](https://github.com/spatiumnorth/spatiumddi/issues/134)).
 > Proving ground — feedback drives Phases 2–6 (ISO installer, arm64 +
 > Pi, role-split images, cloud images, fleet management).
 >
@@ -119,7 +119,7 @@ of the migration, see the **"Why k3s"** section in
 - **Docker** with privileged-container support on the **build host
   only** — the appliance itself ships zero docker. mkosi + qemu-
   utils + apt keyring + grub variants live inside the published
-  builder image (`ghcr.io/spatiumddi/appliance-builder:latest`).
+  builder image (`ghcr.io/spatiumnorth/appliance-builder:latest`).
   The bake step uses host docker to `docker save` SpatiumDDI's
   service images into containerd-readable `.tar.zst` archives.
 - **helm** + **zstd** on the build host — `make appliance-bake-
@@ -142,7 +142,7 @@ From the repo root:
 make appliance
 ```
 
-Pulls `ghcr.io/spatiumddi/appliance-builder:latest`, runs mkosi
+Pulls `ghcr.io/spatiumnorth/appliance-builder:latest`, runs mkosi
 inside it, and writes:
 
 - `appliance/build/spatiumddi-appliance_0.1.0.raw`   (2.1 GiB sparse, 1.1 GiB consumed)
@@ -166,7 +166,7 @@ Three things that target handles, each of which is a real failure if you
 drive the steps by hand:
 
 **1. The builder must run NATIVE — the emulated path is a dead end.**
-`ghcr.io/spatiumddi/appliance-builder` is published for both
+`ghcr.io/spatiumnorth/appliance-builder` is published for both
 architectures (since #991), so on arm64 you get an arm64 builder and
 mkosi cross-builds x86-64 inside it. Do *not* reach for
 `--platform linux/amd64` on the builder: under qemu-user or Rosetta,
@@ -367,7 +367,7 @@ cloud-init `write_files` — see
 
 ## What this MVP does NOT do (yet)
 
-Tracked in [#134](https://github.com/spatiumddi/spatiumddi/issues/134):
+Tracked in [#134](https://github.com/spatiumnorth/spatiumddi/issues/134):
 
 - **arm64 / Raspberry Pi** (Phase 3) — builder image is amd64-only
 - **Role-split images** (Phase 4) — single all-in-one only

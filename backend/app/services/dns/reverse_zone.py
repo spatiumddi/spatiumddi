@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup, DNSZone
@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from app.models.auth import User
+    from app.services.soft_delete import SoftDeleteBatch
 
 logger = structlog.get_logger(__name__)
 
@@ -273,3 +274,135 @@ async def ensure_reverse_zone_for_subnet(
         at=datetime.now(UTC).isoformat(),
     )
     return zone
+
+
+# ── Retirement (spatiumddi#1066) ──────────────────────────────────────────────
+#
+# A subnet's auto-created reverse zone used to outlive the subnet on the
+# default (soft) delete: the batch carried the subnet and its DHCP scopes only,
+# so the zone stayed listed, linked to a subnet the API answered 404 for, still
+# rendered to the agents. The permanent path deleted it with a bare set-based
+# DELETE — no queued-op sweep, no agent wake, and no thought for a sibling
+# subnet sharing the aggregated /24. Both paths now go through here.
+
+
+def reverse_zone_network(name: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
+    """The network an octet-aligned ``in-addr.arpa`` (nibble-aligned
+    ``ip6.arpa``) zone name covers — the inverse of
+    :func:`compute_reverse_zone_name`. ``None`` for any other name."""
+    labels = name.lower().rstrip(".").split(".")
+    if labels[-2:] == ["in-addr", "arpa"]:
+        octets = labels[:-2][::-1]
+        if not 1 <= len(octets) <= 3 or not all(o.isdigit() and int(o) <= 255 for o in octets):
+            return None
+        addr = ".".join(octets + ["0"] * (4 - len(octets)))
+        return ipaddress.ip_network(f"{addr}/{8 * len(octets)}")
+    if labels[-2:] == ["ip6", "arpa"]:
+        nibbles = labels[:-2][::-1]
+        if not 1 <= len(nibbles) <= 32 or not all(
+            len(n) == 1 and n in "0123456789abcdef" for n in nibbles
+        ):
+            return None
+        hexstr = "".join(nibbles).ljust(32, "0")
+        addr = ":".join(hexstr[i : i + 4] for i in range(0, 32, 4))
+        return ipaddress.ip_network(f"{addr}/{4 * len(nibbles)}")
+    return None
+
+
+async def surviving_sharer(db: AsyncSession, zone: DNSZone, subnet: Subnet) -> uuid.UUID | None:
+    """The id of another live subnet whose addresses fall inside the network
+    ``zone`` covers — a /25 beside the one being deleted in an aggregated /24
+    zone — or ``None``. Such a zone must outlive the subnet: it is re-linked
+    to the survivor (the same-space one first) instead of retired, the way
+    :func:`ensure_reverse_zone_for_subnet` already re-links a dangling zone
+    to the next subnet that needs it."""
+    covered = reverse_zone_network(zone.name)
+    if covered is None:
+        return None
+    row = (
+        await db.execute(
+            text(
+                "SELECT id FROM subnet WHERE id != CAST(:sid AS uuid) "
+                "AND deleted_at IS NULL AND network <<= CAST(:covered AS cidr) "
+                "ORDER BY (space_id = CAST(:space AS uuid)) DESC, network LIMIT 1"
+            ),
+            {"sid": str(subnet.id), "covered": str(covered), "space": str(subnet.space_id)},
+        )
+    ).first()
+    return row[0] if row else None
+
+
+async def retire_auto_reverse_zones(
+    db: AsyncSession, subnet: Subnet, *, batch: SoftDeleteBatch | None = None
+) -> tuple[list[DNSZone], list[DNSZone], set[uuid.UUID]]:
+    """Take the reverse zones ``subnet`` auto-created out of service with it.
+
+    For every zone linked to the subnet and marked ``is_auto_generated``:
+
+    * a zone another live subnet still lives in is re-linked to that
+      survivor and stays (``reverse_zone_relinked``);
+    * otherwise it is retired — with ``batch`` (the soft path) it is appended
+      to the subnet's own deletion batch with its records, so the trash shows
+      one deletion and a restore brings subnet and zone back together; without
+      one (the permanent path) it is hard-deleted the way the zone-delete
+      operation does it: agentless servers told, queued ops swept, records
+      deleted set-based, the zone row deleted.
+
+    Returns ``(retired, relinked, dns_group_ids_to_wake)``; the caller wakes
+    the groups after its commit so the agents re-render without waiting for
+    the safety tick.
+    """
+    from sqlalchemy import delete as sa_delete  # noqa: PLC0415
+
+    from app.models.dns import DNSRecord  # noqa: PLC0415
+    from app.services.dns.record_ops import sweep_zone_ops  # noqa: PLC0415
+    from app.services.soft_delete import add_to_batch  # noqa: PLC0415
+
+    zones = (
+        (
+            await db.execute(
+                select(DNSZone).where(
+                    DNSZone.linked_subnet_id == subnet.id,
+                    DNSZone.is_auto_generated.is_(True),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    retired: list[DNSZone] = []
+    relinked: list[DNSZone] = []
+    wake: set[uuid.UUID] = set()
+    for zone in zones:
+        survivor = await surviving_sharer(db, zone, subnet)
+        if survivor is not None:
+            zone.linked_subnet_id = survivor
+            relinked.append(zone)
+            logger.info(
+                "reverse_zone_relinked",
+                zone_id=str(zone.id),
+                name=zone.name,
+                from_subnet_id=str(subnet.id),
+                subnet_id=str(survivor),
+                reason="linked subnet deleted; a live subnet still lives in the zone",
+            )
+            continue
+        await sweep_zone_ops(db, zone, zone.group_id)
+        if batch is not None:
+            await add_to_batch(db, batch, zone)
+        else:
+            from app.api.v1.dns.router import _push_zone_to_agentless_servers  # noqa: PLC0415
+
+            await _push_zone_to_agentless_servers(db, zone, "delete")
+            await db.execute(sa_delete(DNSRecord).where(DNSRecord.zone_id == zone.id))
+            await db.delete(zone)
+        wake.add(zone.group_id)
+        retired.append(zone)
+        logger.info(
+            "reverse_zone_retired",
+            zone_id=str(zone.id),
+            name=zone.name,
+            subnet_id=str(subnet.id),
+            mode="trash" if batch is not None else "delete",
+        )
+    return retired, relinked, wake

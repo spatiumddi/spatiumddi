@@ -1,6 +1,6 @@
 [Unit]
 Description=Apply pending SpatiumDDI rsyslog forwarding config (issue #156)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/156
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/156
 # Defensive — the runner writes to /etc/rsyslog.d/50-spatium-forward.conf
 # and /etc/rsyslog.d/spatium-ca/*.pem, both of which need the /etc
 # overlay (Phase 8a, lower=/usr/lib/etc.image, upper=/var/persist/etc)

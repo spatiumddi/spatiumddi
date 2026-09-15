@@ -7,7 +7,7 @@ containers, nftables drop-in management, and slot / system telemetry
 reporting. None of that is implemented yet; this module currently
 boots, logs its idle state, and sleeps.
 
-See https://github.com/spatiumddi/spatiumddi/issues/170 for the full
+See https://github.com/spatiumnorth/spatiumddi/issues/170 for the full
 design.
 """
 
