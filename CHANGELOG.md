@@ -22,6 +22,27 @@ the formatter handles the rest.
 
 ## Unreleased
 
+### Changed
+
+- **helm 3.21.4 → 3.22.0 (#1091).** Build-time tool only; nothing
+  ships it. Five copies, none Dependabot-visible, all moved
+  together — `versions.json` plus the Makefile's `alpine/helm`
+  image and the `version:` input in `ci.yml`, `release.yml`,
+  `build-appliance.yml` and `agent-e2e.yml`. All three charts lint
+  and template clean under it.
+  **This is the terminal Helm 3 feature release** — published
+  2026-09-10, matching the project's stated final 3.x feature
+  release of 2026-09-09. After it, 3.x receives security fixes
+  only, until 2027-02-10. So this is a floor, not a resting place;
+  the move to 4.x is #1098.
+  The manifest's note claiming we stay on 3.x because the appliance
+  is "independent of this binary" is **wrong**, and is corrected
+  here rather than repeated: the appliance renders through k3s's
+  helm-controller, which spawns `klipper-helm` — and the pinned
+  `v0.13.3-build20260727` ships **Helm 4.1.4**. We already package
+  with 3 and install with 4, so a 4.x move closes that gap instead
+  of opening one. See #1098.
+
 ### Fixed
 
 - **The weekly Trivy issue reported a CVE count and zero CVEs
