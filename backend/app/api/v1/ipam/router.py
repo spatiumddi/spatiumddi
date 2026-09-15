@@ -2053,16 +2053,22 @@ class SubnetCreate(BaseModel):
     )
     # Reverse-zone auto-create controls (see services/dns/reverse_zone.py).
     # The matching reverse zone is created automatically when dns_group_id or
-    # dns_zone_id is supplied (or inherited via a future IPAM column); opt out
-    # with skip_reverse_zone=True.
+    # dns_zone_id (below — the subnet's DNS binding) is supplied; opt out with
+    # skip_reverse_zone=True. ``dns_group_id`` is the legacy singular form: it
+    # names the group the reverse zone goes into and, when ``dns_group_ids``
+    # is empty, seeds it too (spatiumddi#1066).
     dns_group_id: uuid.UUID | None = None
-    dns_zone_id: uuid.UUID | None = None
     skip_reverse_zone: bool = False
     dns_servers: list[str] | None = None
     domain_name: str | None = None
     tags: dict[str, Any] = {}
     custom_fields: dict[str, Any] = {}
     dns_group_ids: list[str] = []
+    # The subnet's primary forward zone. ONE declaration: a second
+    # ``uuid.UUID | None`` copy used to sit with the reverse-zone controls
+    # above, and create_subnet excluded the field from the row for that
+    # meaning, so the binding a POST named was never stored (spatiumddi#1066).
+    # Text like every zone id in the IPAM tree; validated as a UUID string.
     dns_zone_id: str | None = None
     dns_additional_zone_ids: list[str] = []
     dns_inherit_settings: bool = True
@@ -2116,6 +2122,19 @@ class SubnetCreate(BaseModel):
         if v not in allowed:
             raise ValueError(f"ipv6_allocation_policy must be one of: {', '.join(sorted(allowed))}")
         return v
+
+    @field_validator("dns_zone_id")
+    @classmethod
+    def validate_dns_zone_id_create(cls, v: str | None) -> str | None:
+        # The binding is stored as text but must name a zone: a body that
+        # sends garbage here used to be accepted because the field was
+        # dropped on the floor (spatiumddi#1066); now it is refused.
+        if v is None or v == "":
+            return None
+        try:
+            return str(uuid.UUID(str(v)))
+        except ValueError as exc:
+            raise ValueError("dns_zone_id must be the UUID of a DNS zone") from exc
 
     @field_validator("subnet_role")
     @classmethod
@@ -4170,6 +4189,21 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
     if body.ddns_enabled:
         body.ddns_inherit_settings = False
 
+    # spatiumddi#1066 — the DNS binding the body names is the binding the row
+    # keeps. ``dns_zone_id`` was declared twice on SubnetCreate (a reverse-zone
+    # control shadowing the binding) and excluded from the row for the first
+    # meaning, so a subnet created with a zone stored none and resolved its
+    # forward zone from the space while the reverse zone was still created
+    # from the very field that was dropped. The legacy singular
+    # ``dns_group_id`` keeps driving the reverse-zone auto-create and now also
+    # seeds ``dns_group_ids`` when no list was given; a primary zone makes the
+    # subnet's own DNS settings the effective ones, exactly what a PUT of the
+    # same fields does with ``dns_inherit_settings=false``.
+    if body.dns_group_id is not None and not body.dns_group_ids:
+        body.dns_group_ids = [str(body.dns_group_id)]
+    if body.dns_zone_id:
+        body.dns_inherit_settings = False
+
     subnet = Subnet(
         **{
             **body.model_dump(
@@ -4177,7 +4211,6 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
                     "skip_auto_addresses",
                     "skip_reverse_zone",
                     "dns_group_id",
-                    "dns_zone_id",
                     "template_id",
                 }
             ),
@@ -4285,7 +4318,7 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
             subnet,
             current_user,
             dns_group_id=body.dns_group_id,
-            dns_zone_id=body.dns_zone_id,
+            dns_zone_id=uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None,
         )
 
     await db.commit()
@@ -5225,17 +5258,21 @@ async def update_subnet(
         setattr(subnet, field, val)
         changes_for_audit[field] = str(val) if isinstance(val, uuid.UUID) else val
 
-    # spatiumddi#1065 — an opt-in sent for THIS subnet makes the subnet's own
-    # DDNS settings the effective ones, the same rule create_subnet applies:
-    # ``ddns_enabled: true`` turns DDNS inheritance off. Until now a PUT of
-    # the form's body (the flag, no toggle) or of a GET body with the flag
-    # flipped was stored with inheritance still on and changed nothing; the
-    # response now shows the flag cleared. A ``false`` is not an opt-in and
-    # does not touch inheritance, so ``{"ddns_inherit_settings": true}`` on
-    # its own still re-inherits.
+    # spatiumddi#1065 / #1066 — an opt-in or a binding sent for THIS subnet
+    # makes the subnet's own settings the effective ones, the same rule
+    # create_subnet applies: ``ddns_enabled: true`` turns DDNS inheritance
+    # off, a primary ``dns_zone_id`` turns DNS inheritance off. Until now a
+    # PUT of the form's body (the flag, no toggle) or of a GET body with the
+    # flag flipped was stored with inheritance still on and changed nothing;
+    # the response now shows the flag cleared. A ``false`` is not an opt-in
+    # and a null zone is not a binding — neither touches inheritance, so
+    # ``{"ddns_inherit_settings": true}`` on its own still re-inherits.
     if body.ddns_enabled is True:
         subnet.ddns_inherit_settings = False
         changes_for_audit["ddns_inherit_settings"] = False
+    if body.dns_zone_id:
+        subnet.dns_inherit_settings = False
+        changes_for_audit["dns_inherit_settings"] = False
 
     # Planned decommission date (issue #46). Explicitly applied (not via
     # the exclude_none dump) so an operator CAN clear it back to null.
