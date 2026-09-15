@@ -302,7 +302,7 @@ async def _apply_delete_subnet(
     )
     from app.drivers.dhcp import is_agentless
     from app.models.dhcp import DHCPConfigOp, DHCPScope, DHCPServer
-    from app.models.dns import DNSRecord, DNSZone
+    from app.models.dns import DNSRecord
     from app.models.ipam import IPAddress, Subnet
     from app.services.dhcp.config_bundle import build_config_bundle
     from app.services.dhcp.lease_cleanup import delete_leases_for_scope
@@ -322,9 +322,20 @@ async def _apply_delete_subnet(
         # wake convergence waits for the 12s safety tick (#512). The push +
         # group-id capture both run BEFORE apply_soft_delete stamps the batch —
         # see _push_agentless_scope_deletes.
-        from app.core.agent_wake import collect_wake, dhcp_group_channel  # noqa: PLC0415
+        from app.core.agent_wake import (  # noqa: PLC0415
+            collect_wake,
+            dhcp_group_channel,
+            dns_group_channel,
+        )
+        from app.services.dns.reverse_zone import retire_auto_reverse_zones  # noqa: PLC0415
 
         batch = await collect_soft_delete_batch(db, subnet)
+        # spatiumddi#1066 — the reverse zone this subnet auto-created rides
+        # the same batch (restore brings both back) unless a sibling subnet
+        # still lives in it, in which case it is re-linked and stays.
+        _retired, _relinked, dns_wake_group_ids = await retire_auto_reverse_zones(
+            db, subnet, batch=batch
+        )
         wake_group_ids = await _push_agentless_scope_deletes(db, batch)
         await _purge_leases_for_scope_batch(db, batch)
         apply_soft_delete(batch, user.id)
@@ -342,6 +353,8 @@ async def _apply_delete_subnet(
         await db.commit()
         for gid in wake_group_ids:
             collect_wake(dhcp_group_channel(gid))
+        for gid in dns_wake_group_ids:
+            collect_wake(dns_group_channel(gid))
         return {"subnet_id": str(args.subnet_id), "mode": "soft_delete"}
 
     require_superadmin(user)
@@ -420,12 +433,14 @@ async def _apply_delete_subnet(
                 )
         await db.execute(sa_delete(DNSRecord).where(DNSRecord.id.in_(record_ids)))
 
-    await db.execute(
-        sa_delete(DNSZone).where(
-            DNSZone.linked_subnet_id == args.subnet_id,
-            DNSZone.is_auto_generated.is_(True),
-        )
-    )
+    # spatiumddi#1066 — the subnet's auto-created reverse zone: re-linked to
+    # a sibling that still lives in it, else deleted the way the zone-delete
+    # operation does it (agentless servers told, queued ops swept, records
+    # deleted set-based, the group woken) instead of a bare row DELETE.
+    from app.core.agent_wake import collect_wake, dns_group_channel  # noqa: PLC0415
+    from app.services.dns.reverse_zone import retire_auto_reverse_zones  # noqa: PLC0415
+
+    _retired, _relinked, dns_wake_group_ids = await retire_auto_reverse_zones(db, subnet)
 
     db.add(
         _audit(
@@ -464,6 +479,8 @@ async def _apply_delete_subnet(
             )
 
     await db.commit()
+    for gid in dns_wake_group_ids:
+        collect_wake(dns_group_channel(gid))
     return {"subnet_id": str(args.subnet_id), "mode": "delete"}
 
 
