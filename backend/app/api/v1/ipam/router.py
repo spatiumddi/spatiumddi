@@ -4150,6 +4150,17 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
         # Override to enforce consistency
         body.vlan_id = vlan_obj.vlan_id
 
+    # spatiumddi#1065 — a subnet-level DDNS opt-in is a request for THIS
+    # subnet's DDNS settings, so it turns the family's inheritance off:
+    # ``ddns_enabled`` is only ever read when ``ddns_inherit_settings`` is
+    # false (services/dns/ddns.resolve_effective_ddns), and the subnet form
+    # sends the flag without any inherit toggle, so a body saying
+    # ``ddns_enabled: true`` and nothing about inheriting was stored and
+    # ignored. Same lock the IPAM-template path applies on create
+    # (services/ipam/templates.py); the response shows the flag cleared.
+    if body.ddns_enabled:
+        body.ddns_inherit_settings = False
+
     subnet = Subnet(
         **{
             **body.model_dump(
@@ -5204,6 +5215,18 @@ async def update_subnet(
         val = getattr(body, field)
         setattr(subnet, field, val)
         changes_for_audit[field] = str(val) if isinstance(val, uuid.UUID) else val
+
+    # spatiumddi#1065 — an opt-in sent for THIS subnet makes the subnet's own
+    # DDNS settings the effective ones, the same rule create_subnet applies:
+    # ``ddns_enabled: true`` turns DDNS inheritance off. Until now a PUT of
+    # the form's body (the flag, no toggle) or of a GET body with the flag
+    # flipped was stored with inheritance still on and changed nothing; the
+    # response now shows the flag cleared. A ``false`` is not an opt-in and
+    # does not touch inheritance, so ``{"ddns_inherit_settings": true}`` on
+    # its own still re-inherits.
+    if body.ddns_enabled is True:
+        subnet.ddns_inherit_settings = False
+        changes_for_audit["ddns_inherit_settings"] = False
 
     # Planned decommission date (issue #46). Explicitly applied (not via
     # the exclude_none dump) so an operator CAN clear it back to null.
