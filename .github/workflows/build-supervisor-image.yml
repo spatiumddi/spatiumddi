@@ -23,6 +23,12 @@ on:
   pull_request:
     paths:
       - "agent/supervisor/**"
+      # #1093 — the workflow itself, so a change to how this lane
+      # BUILDS or SCANS is exercised by the lane. Without it, the
+      # PR that rewired this gate ran none of these jobs: the one
+      # change guaranteed to need the proof was the one change that
+      # could not get it.
+      - ".github/workflows/build-supervisor-image.yml"
   workflow_dispatch:
 
 # Read-only (#1022): this workflow builds and scans, it never publishes.
@@ -67,10 +73,26 @@ jobs:
           cache-to: type=gha,mode=max,scope=spatium-supervisor
 
       - name: Trivy scan
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ghcr.io/spatiumddi/spatium-supervisor:pr-scan
-          format: table
+          format: json
+          output: trivy-report.json
           severity: HIGH,CRITICAL
-          exit-code: "1"
+          exit-code: "0"
           ignore-unfixed: true
+
+      # #1093 — the gate, not Trivy's own exit code. Trivy's "fixed" means
+      # the distro's security database names a fix, NOT that the package is
+      # on the mirrors yet; for Alpine the two diverge by hours after every
+      # security commit. A bare ``exit-code: 1`` therefore fails the PR on
+      # findings nothing could have installed — the nightly-20260905 failure,
+      # relocated to a lane that blocks unrelated work. The gate asks the
+      # image's own package index whether each fix is installable today:
+      # yes -> fail, not yet -> defer with a warning. Anything it cannot
+      # verify still fails.
+      - name: Gate on the scan
+        run: >-
+          .github/scripts/trivy-gate.sh
+          "trivy-report.json"
+          "ghcr.io/spatiumddi/spatium-supervisor:pr-scan"

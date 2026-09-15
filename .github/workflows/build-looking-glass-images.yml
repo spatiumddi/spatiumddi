@@ -23,6 +23,12 @@ on:
   pull_request:
     paths:
       - "agent/looking-glass/**"
+      # #1093 — the workflow itself, so a change to how this lane
+      # BUILDS or SCANS is exercised by the lane. Without it, the
+      # PR that rewired this gate ran none of these jobs: the one
+      # change guaranteed to need the proof was the one change that
+      # could not get it.
+      - ".github/workflows/build-looking-glass-images.yml"
   workflow_dispatch:
 
 # Read-only (#1022): this workflow builds and scans, it never publishes.
@@ -47,6 +53,18 @@ jobs:
       # workflow_dispatch only (see docs/DEVELOPMENT.md, trigger policy), so that
       # step was reachable solely by hand and pushed ``:<branch>`` / ``:sha-*``
       # tags nothing consumes. release.yml and nightly.yml own publishing.
+
+      # #1093 — bust the package layer once a week. BuildKit keys a layer on
+      # its RUN text, so the ``type=gha`` cache below serves this image's
+      # ``apk upgrade`` / ``apt-get upgrade`` — package set included — from
+      # whenever this scope was first written. A PR scan of that layer is
+      # wrong in BOTH directions: it misses a CVE the current index would
+      # flag, and it keeps reporting one that was fixed weeks ago. Weekly
+      # rather than daily: daily would defeat caching for no extra signal.
+      - name: Compute package snapshot key
+        id: snap
+        run: echo "snapshot=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+
       - name: Build (single-arch, load locally for Trivy)
         uses: docker/build-push-action@v7
         with:
@@ -59,11 +77,14 @@ jobs:
           push: false
           load: true
           tags: ghcr.io/spatiumddi/looking-glass:pr-scan
+          build-args: |
+            APK_SNAPSHOT=${{ steps.snap.outputs.snapshot }}
+            APT_SNAPSHOT=${{ steps.snap.outputs.snapshot }}
           cache-from: type=gha,scope=looking-glass-${{ matrix.flavor }}
           cache-to: type=gha,mode=max,scope=looking-glass-${{ matrix.flavor }}
 
       - name: Trivy scan
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           # Reference the locally-loaded image from the PR build step
           # above — same fix as build-dns-images.yml/build-dhcp-images.yml:
@@ -71,10 +92,26 @@ jobs:
           # (metadata-action emits ``sha-<short>``, not raw full SHAs, and
           # on PR nothing gets pushed) so Trivy 404s with MANIFEST_UNKNOWN.
           image-ref: ghcr.io/spatiumddi/looking-glass:pr-scan
-          format: table
+          format: json
+          output: trivy-report.json
           severity: HIGH,CRITICAL
-          # Fail the PR on any HIGH/CRITICAL CVE that has a fix available —
-          # `ignore-unfixed: true` keeps us unblocked on vulns that have no
-          # upstream patch yet (base image issues we can't fix locally).
-          exit-code: "1"
+          # The verdict belongs to the gate step below; a non-zero exit
+          # here would stop the job before it runs. `ignore-unfixed`
+          # still drops vulns with no upstream patch at all.
+          exit-code: "0"
           ignore-unfixed: true
+
+      # #1093 — the gate, not Trivy's own exit code. Trivy's "fixed" means
+      # the distro's security database names a fix, NOT that the package is
+      # on the mirrors yet; for Alpine the two diverge by hours after every
+      # security commit. A bare ``exit-code: 1`` therefore fails the PR on
+      # findings nothing could have installed — the nightly-20260905 failure,
+      # relocated to a lane that blocks unrelated work. The gate asks the
+      # image's own package index whether each fix is installable today:
+      # yes -> fail, not yet -> defer with a warning. Anything it cannot
+      # verify still fails.
+      - name: Gate on the scan
+        run: >-
+          .github/scripts/trivy-gate.sh
+          "trivy-report.json"
+          "ghcr.io/spatiumddi/looking-glass:pr-scan"

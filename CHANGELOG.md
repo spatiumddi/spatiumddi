@@ -22,6 +22,50 @@ the formatter handles the rest.
 
 ## Unreleased
 
+### Fixed
+
+- **PR-time Trivy lanes scanned a frozen package layer, and trusted
+  Trivy's exit code (#1093).** Four workflows build an image on a PR
+  and scan it — DNS, DHCP, looking-glass, supervisor. All four cache
+  on `type=gha`, and BuildKit keys a layer on its RUN text, so each
+  image's `apk upgrade` / `apt-get upgrade` was served from whenever
+  that scope was first written. Three of the four passed no snapshot
+  build-arg at all. Scanning that layer is wrong in **both**
+  directions: it misses a CVE the current index would flag, and it
+  keeps reporting one fixed weeks ago — telling the operator to do
+  something already done, which is #1029's class.
+  They also decided with `exit-code: "1"`. Trivy's "fixed" means the
+  distro's security database names a fix, not that the package is on
+  the mirrors yet, so that fails a PR on findings nothing could have
+  installed — the nightly-20260905 failure relocated to a lane that
+  blocks unrelated work. All four now emit JSON and hand the verdict
+  to `trivy-gate.sh`, which asks the image's own index whether each
+  fix is installable today: installable → fail, not yet → defer with
+  a warning, unverifiable → fail.
+  The Trivy action was also pinned off `@master`. An unpinned
+  third-party action is the same "tooling moves under us" class as
+  the unpinned `aquasec/trivy:latest` in #1095, and there it was
+  load-bearing: an unrecognised flag exits 1, which these lanes would
+  have read as findings.
+  Timed deliberately: the nightly (snapshot-busted) and the weekly
+  (uncached) had just scanned all nine images clean, so arming these
+  lanes could not newly break any PR.
+  **None of the four listed its own workflow file in `paths:`**, so
+  the PR rewiring this gate would have run none of them — the change
+  most needing the proof was the one that could not get it. They now
+  self-trigger, which `build-appliance-builder.yml` was already
+  doing, so this restores a convention rather than inventing one.
+
+- **`nightly.yml` filed a doubly-wrong failure report on a dry run
+  (#1094).** The failure step lacked the `dry_run` guard every
+  sibling side-effecting step carries, and hardcoded ``failed on
+  `main` ``. A dry run publishes nothing and prunes nothing, so one
+  that fails means a candidate build failed — the dry run doing its
+  job — not that the nightly is broken; and a dispatch takes `--ref`,
+  which is the whole point of a dry run. The #1090 dry run was on
+  `issue-1088` and would have filed exactly this had it failed. It
+  now skips on dry runs and reports `github.ref_name`.
+
 ### Changed
 
 - **helm 3.21.4 → 3.22.0 (#1091).** Build-time tool only; nothing
