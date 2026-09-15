@@ -7,9 +7,10 @@ the configured source (Cloudflare or RIPE NCC).
 
 Per-AS reconcile shape:
 
-  1. Pull ROAs originated by this AS from the source service
-     (in-memory cached at the source layer for 5 minutes so a sweep
-     doesn't refetch the multi-MB JSON per ASN).
+  1. Pull ROAs originated by this AS from the source service (the sweep
+     primes the source layer's cache with the whole due set first, so the
+     ~100 MB dump is streamed ONCE per sweep and never held in memory —
+     only the due ASNs' slices are kept, for 5 minutes; spatiumddi#1054).
   2. INSERT new ``(prefix, max_length, trust_anchor)`` rows.
   3. UPDATE existing rows in place — bump ``last_checked_at`` and
      recompute ``state``.
@@ -343,6 +344,15 @@ async def _run_refresh() -> dict[str, Any]:
         transitions_total = 0
         errors = 0
         all_transitions: list[dict[str, Any]] = []
+
+        # One streamed fetch for the whole due set (spatiumddi#1054): the
+        # source layer indexes only these ASNs' ROAs, so the per-AS calls
+        # below are cache hits and the global dump is never held in memory.
+        # A failed prime is not an error here — each per-AS call retries it
+        # and, failing that, reports "no ROAs this tick" exactly as before.
+        from app.services.rpki_roa import prime_roas  # noqa: PLC0415
+
+        await prime_roas({int(r.number) for r in rows}, source)
 
         for asn_row in rows:
             try:

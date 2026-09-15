@@ -209,6 +209,23 @@ async def collect_soft_delete_batch(db: AsyncSession, root: Any) -> SoftDeleteBa
     return batch
 
 
+async def add_to_batch(db: AsyncSession, batch: SoftDeleteBatch, root: Any) -> None:
+    """Append ``root`` and its cascade descendants to an existing batch.
+
+    For a row that must ride ANOTHER root's deletion: a subnet's auto-created
+    reverse zone goes into the subnet's batch (spatiumddi#1066) so the trash
+    shows one deletion and one restore brings both back, records included.
+    """
+
+    for obj in await _collect_descendants(db, root):
+        batch.rows.append(
+            SoftDeleteRow(obj=obj, resource_type=_resource_type(obj), display=_row_display(obj))
+        )
+    batch.rows.append(
+        SoftDeleteRow(obj=root, resource_type=_resource_type(root), display=_row_display(root))
+    )
+
+
 def apply_soft_delete(batch: SoftDeleteBatch, user_id: uuid.UUID | None) -> datetime:
     """Stamp every row in the batch. Caller is responsible for the audit log + commit."""
 
