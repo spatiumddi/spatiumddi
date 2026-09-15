@@ -1,6 +1,6 @@
 [Unit]
 Description=Weekly prune of unreferenced k3s container images (issue #441)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/441
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/441
 ConditionKernelCommandLine=!boot=live
 
 [Timer]

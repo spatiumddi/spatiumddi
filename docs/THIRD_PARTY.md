@@ -16,11 +16,11 @@ it is, which artifact it ships in, what license it carries, and why it is there.
 
 | File | Purpose | Authoritative for |
 |---|---|---|
-| [`NOTICE`](https://github.com/spatiumddi/spatiumddi/blob/main/NOTICE) | Legal attribution notice, shipped in the repo root and in every image | License obligations |
+| [`NOTICE`](https://github.com/spatiumnorth/spatiumddi/blob/main/NOTICE) | Legal attribution notice, shipped in the repo root and in every image | License obligations |
 | This page | Operator-facing catalogue — versions, artifact placement, rationale | Understanding what runs where |
 
 If the two ever disagree about a license, `NOTICE` wins and the discrepancy is
-a bug worth [filing](https://github.com/spatiumddi/spatiumddi/issues).
+a bug worth [filing](https://github.com/spatiumnorth/spatiumddi/issues).
 
 Neither file enumerates every transitive dependency. They cover components that
 are **bundled, shipped, or directly depended on** — the things an operator can
@@ -36,8 +36,8 @@ The "Where" column throughout this page refers to these:
 
 | Artifact | What it is |
 |---|---|
-| **API image** | `ghcr.io/spatiumddi/spatiumddi-api` — FastAPI control plane, Celery worker, Celery beat, and the migrate job. One image, four roles |
-| **Frontend image** | `ghcr.io/spatiumddi/spatiumddi-frontend` — the built React SPA behind nginx |
+| **API image** | `ghcr.io/spatiumnorth/spatiumddi-api` — FastAPI control plane, Celery worker, Celery beat, and the migrate job. One image, four roles |
+| **Frontend image** | `ghcr.io/spatiumnorth/spatiumddi-frontend` — the built React SPA behind nginx |
 | **DNS agent images** | `dns-bind9`, `dns-powerdns`, `dns-technitium`, `dns-dnsdist` — each pairs a DNS engine with the Python sync agent |
 | **DHCP agent image** | `dhcp-kea` — Kea DHCPv4 + DHCPv6 + radvd + the Python sync agent |
 | **Looking Glass image** | `looking-glass` — GoBGP collector + agent |
@@ -48,10 +48,10 @@ The "Where" column throughout this page refers to these:
 Versions below are the pins on `main` at the time of writing, and the
 **Pinned in** column names the file each one lives in.
 
-Since [#975](https://github.com/spatiumddi/spatiumddi/issues/975) this table no
+Since [#975](https://github.com/spatiumnorth/spatiumddi/issues/975) this table no
 longer drifts on its own: the pins that neither Dependabot nor a lockfile owns
 are declared in
-[`versions.json`](https://github.com/spatiumddi/spatiumddi/blob/main/versions.json),
+[`versions.json`](https://github.com/spatiumnorth/spatiumddi/blob/main/versions.json),
 and `scripts/lint_versions.py` — which runs on every CI build — fails when the
 version column here disagrees with it. So the numbers below for k3s, MetalLB,
 CloudNativePG, GoBGP, Technitium, Redis, PostgreSQL, HAProxy, Alpine,
@@ -144,7 +144,7 @@ plane uses only `GET` / `SET` / `DEL` / `INCR` / `EXPIRE` / `SCAN` and pub/sub �
 no modules, no Lua, no streams — and Celery's Redis broker is the other
 consumer. This is an untested configuration rather than a supported one; if you
 run SpatiumDDI on a Redis alternative,
-[tell us how it went](https://github.com/spatiumddi/spatiumddi/issues).
+[tell us how it went](https://github.com/spatiumnorth/spatiumddi/issues).
 
 The Helm chart used to bundle Bitnami's PostgreSQL and Redis subcharts. Bitnami
 pruned its Docker Hub namespace in late 2025 in favour of paid images, so the
@@ -294,7 +294,7 @@ sandboxed argv builder, never a shell string.
 | BIND `dig` (dnsutils) | MPL 2.0 | DNS query + propagation check |
 | [PostgreSQL client 16](https://www.postgresql.org/) | PostgreSQL License | `pg_dump` / `pg_restore` for backup + restore |
 | [xmlsec1](https://www.aleksey.com/xmlsec/) (libxmlsec1-openssl) | MIT | SAML assertion signature verification |
-| [libnfs](https://github.com/sahlberg/libnfs) (libnfs14) | LGPL v2.1 | `nfs` backup destination ([#971](https://github.com/spatiumddi/spatiumddi/issues/971)) |
+| [libnfs](https://github.com/sahlberg/libnfs) (libnfs14) | LGPL v2.1 | `nfs` backup destination ([#971](https://github.com/spatiumnorth/spatiumddi/issues/971)) |
 
 **libnfs is LGPL and dynamically linked, deliberately.** The `nfs` backup
 destination binds `libnfs.so.14` through `ctypes` at runtime — no compilation, no
@@ -350,7 +350,7 @@ because CI gates depend on specific behaviour from several.
 
 ## License obligations
 
-SpatiumDDI itself is [Apache 2.0](https://github.com/spatiumddi/spatiumddi/blob/main/LICENSE).
+SpatiumDDI itself is [Apache 2.0](https://github.com/spatiumnorth/spatiumddi/blob/main/LICENSE).
 Everything above keeps its own license. The combination is distributed as
 **separate, independently-installed programs** — container images built from
 upstream distribution packages, and a disk image built by a distribution's own
@@ -373,7 +373,7 @@ The practical consequences:
   separate process in that image; it does not patch the server.
 
 If you are performing a license review and need something this page does not
-answer, [open an issue](https://github.com/spatiumddi/spatiumddi/issues) — that
+answer, [open an issue](https://github.com/spatiumnorth/spatiumddi/issues) — that
 is a documentation bug, not a support question.
 
 ## Verifying a running system
@@ -415,7 +415,7 @@ kubectl get pods -A -o jsonpath='{range .items[*].spec.containers[*]}{.image}{"\
 
 ## See also
 
-- [`NOTICE`](https://github.com/spatiumddi/spatiumddi/blob/main/NOTICE) — the shipped attribution notice
+- [`NOTICE`](https://github.com/spatiumnorth/spatiumddi/blob/main/NOTICE) — the shipped attribution notice
 - [Architecture](ARCHITECTURE.md) — how these components fit together
 - [DNS Drivers](drivers/DNS_DRIVERS.md) / [DHCP Drivers](drivers/DHCP_DRIVERS.md) — how SpatiumDDI drives the engines
 - [OS Appliance](deployment/APPLIANCE.md) — how the image is built

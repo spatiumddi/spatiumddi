@@ -42,7 +42,7 @@ spec:
                 topologyKey: kubernetes.io/hostname
       containers:
         - name: dhcp
-          image: ghcr.io/spatiumddi/dhcp-kea:latest
+          image: ghcr.io/spatiumnorth/dhcp-kea:latest
           imagePullPolicy: IfNotPresent
           # DHCPv4 broadcast reception requires hostNetwork in most clusters;
           # if your CNI can proxy UDP/67 use a plain ClusterIP + relay instead.

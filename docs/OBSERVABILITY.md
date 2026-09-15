@@ -212,7 +212,7 @@ server reads:
 
 | Tab | Source | Transport | Detail |
 |---|---|---|---|
-| **DNS Queries** | BIND9 / PowerDNS query log (not Technitium — [#742](https://github.com/spatiumddi/spatiumddi/issues/742)) | agent push → DB | § 4½.1 |
+| **DNS Queries** | BIND9 / PowerDNS query log (not Technitium — [#742](https://github.com/spatiumnorth/spatiumddi/issues/742)) | agent push → DB | § 4½.1 |
 | **DHCP Activity** | Kea DHCPv4 activity | agent push → DB | § 4½.2 |
 | **Event Log** | Windows DNS / DHCP Event Log | WinRM read-through | § 4.1 |
 | **DHCP Audit** | Windows DHCP per-lease CSV trail | WinRM read-through | § 4.2 |
@@ -324,7 +324,7 @@ Two additional tabs on the same Logs page, sourced from in-container agents inst
 > (`/api/logs/query*`) rather than a tailable text file, so the
 > file-tailing `QueryLogShipper` cannot reach it — it needs a
 > poll-and-diff shipper instead. Tracked in
-> [#742](https://github.com/spatiumddi/spatiumddi/issues/742); until it
+> [#742](https://github.com/spatiumnorth/spatiumddi/issues/742); until it
 > lands, a Technitium group's queries are visible in Technitium's own
 > console but not on this tab.
 
@@ -876,7 +876,7 @@ All services expose:
 > the dashboards below depend on the planned (un-emitted) metric
 > families in § 6. What *does* exist is a single **perf-testing**
 > "war room" dashboard at
-> [`perf/dashboards/grafana/dashboards/warroom.json`](https://github.com/spatiumddi/spatiumddi/blob/main/perf/dashboards/grafana/dashboards/warroom.json)
+> [`perf/dashboards/grafana/dashboards/warroom.json`](https://github.com/spatiumnorth/spatiumddi/blob/main/perf/dashboards/grafana/dashboards/warroom.json)
 > (with provisioning under `perf/dashboards/grafana/provisioning/` and
 > a matching scrape config at `perf/dashboards/prometheus/prometheus.yml`).
 > That stack is for the load/soak test harness under `perf/`, not for

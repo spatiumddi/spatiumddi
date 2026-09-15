@@ -210,13 +210,13 @@ Duplicate the StatefulSet/Service pair per server (rename `ns1` → `ns2`, etc.)
 The umbrella chart `charts/spatiumddi` deploys the entire stack (API,
 frontend, worker, beat, migrate Job, Postgres, Redis) and can optionally
 stand up DNS and DHCP agent StatefulSets alongside it. Published to
-`oci://ghcr.io/spatiumddi/charts/spatiumddi` — see
+`oci://ghcr.io/spatiumnorth/charts/spatiumddi` — see
 [charts/spatiumddi/README.md](../charts/spatiumddi/README.md) for the
 full option surface.
 
 ```bash
 # BIND9 (default flavor)
-helm install ddi oci://ghcr.io/spatiumddi/charts/spatiumddi \
+helm install ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
   --version <CHART_VERSION> \
   --namespace spatiumddi --create-namespace \
   --set dnsAgents.enabled=true \
@@ -224,7 +224,7 @@ helm install ddi oci://ghcr.io/spatiumddi/charts/spatiumddi \
   --set-json 'dnsAgents.servers=[{"name":"ns1","role":"primary","group":"internal-resolvers"}]'
 
 # PowerDNS (issue #127 — adds ALIAS, LUA, online DNSSEC, catalog zones)
-helm install ddi oci://ghcr.io/spatiumddi/charts/spatiumddi \
+helm install ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
   --version <CHART_VERSION> \
   --namespace spatiumddi --create-namespace \
   --set dnsAgents.enabled=true \
@@ -233,7 +233,7 @@ helm install ddi oci://ghcr.io/spatiumddi/charts/spatiumddi \
 
 # Technitium (issue #746 — adds native DoT/DoH/DoQ with no sidecar,
 # encrypted upstream forwarding, online DNSSEC, catalog zones both ways)
-helm install ddi oci://ghcr.io/spatiumddi/charts/spatiumddi \
+helm install ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
   --version <CHART_VERSION> \
   --namespace spatiumddi --create-namespace \
   --set dnsAgents.enabled=true \
@@ -244,7 +244,7 @@ helm install ddi oci://ghcr.io/spatiumddi/charts/spatiumddi \
 Declare each DNS server under `.dnsAgents.servers[]` in `values.yaml`.
 The chart renders a StatefulSet + LoadBalancer Service per entry.
 Set `flavor: powerdns` or `flavor: technitium` on a server to pull the
-`ghcr.io/spatiumddi/dns-powerdns` / `ghcr.io/spatiumddi/dns-technitium`
+`ghcr.io/spatiumnorth/dns-powerdns` / `ghcr.io/spatiumnorth/dns-technitium`
 image instead of BIND9 — same `DNS_AGENT_KEY` bootstrap, image-baked
 driver, mount path auto-switches to `/var/lib/powerdns` or `/etc/dns`
 respectively. Mixed-driver groups are rejected by the control plane for
@@ -332,8 +332,8 @@ scoping rationale.
 All manifests default to `:latest`. Pin to a specific version tag (e.g., `2026.04.13-1`) for production:
 
 ```bash
-kubectl set image deployment/api api=ghcr.io/spatiumddi/spatiumddi-api:2026.04.13-1 -n spatiumddi
-kubectl set image deployment/frontend frontend=ghcr.io/spatiumddi/spatiumddi-frontend:2026.04.13-1 -n spatiumddi
+kubectl set image deployment/api api=ghcr.io/spatiumnorth/spatiumddi-api:2026.04.13-1 -n spatiumddi
+kubectl set image deployment/frontend frontend=ghcr.io/spatiumnorth/spatiumddi-frontend:2026.04.13-1 -n spatiumddi
 ```
 
 ## Upgrading
@@ -344,7 +344,7 @@ kubectl set image deployment/frontend frontend=ghcr.io/spatiumddi/spatiumddi-fro
 # Pin the new tag on every deployment
 NEW_TAG=2026.05.11-1
 for d in api worker beat frontend; do
-  kubectl set image deployment/$d $d=ghcr.io/spatiumddi/spatiumddi-$d:$NEW_TAG -n spatiumddi
+  kubectl set image deployment/$d $d=ghcr.io/spatiumnorth/spatiumddi-$d:$NEW_TAG -n spatiumddi
 done
 
 # Run the migration job — Alembic is idempotent, safe to re-run

@@ -30,7 +30,7 @@ and the table below lists exactly what each one sends and to whom.
 
 There is no telemetry endpoint to opt out of, because there is no
 telemetry endpoint. That is a design constraint, not a current state:
-[CLAUDE.md](https://github.com/spatiumddi/spatiumddi/blob/main/CLAUDE.md)
+[CLAUDE.md](https://github.com/spatiumnorth/spatiumddi/blob/main/CLAUDE.md)
 non-negotiable #17 forbids adding one, and a CI test
 (`backend/tests/test_outbound_hosts_documented.py`) fails the build
 when a hostname appears in the backend that is not documented on this
@@ -51,7 +51,7 @@ page.
 
 ## 2. The one connection that is on by default
 
-**Daily GitHub release check** — `GET https://api.github.com/repos/spatiumddi/spatiumddi/releases/latest`
+**Daily GitHub release check** — `GET https://api.github.com/repos/spatiumnorth/spatiumddi/releases/latest`
 
 Fired once a day by Celery Beat
 (`backend/app/tasks/update_check.py`), so the UI can tell you a newer
@@ -127,7 +127,7 @@ network the way Debian hosts do:
 
 | Connection | Default | Change it under |
 |---|---|---|
-| `pool.ntp.org` — time sync | on | The disk installer's **Time source** screen (or the `ntp_servers` preseed key) sets it at install; Appliance → Fleet → Services → NTP changes it afterwards. Point it at an internal server or a unicast peer. Leaving it blank at install means **no time source at all** ([#1002](https://github.com/spatiumddi/spatiumddi/issues/1002)): the installer comments out Debian's own `pool` directive and the `/run/chrony-dhcp` sourcedir, and seeds the platform's server list empty so the control plane's first config push does not put the pool back. `chronyd` then runs with no sources and reports `Not synchronised`, which is what an air-gapped site with a trusted RTC is asking for. Clearing the server list under Appliance → Fleet → Services → NTP does the same thing on an appliance that is already running |
+| `pool.ntp.org` — time sync | on | The disk installer's **Time source** screen (or the `ntp_servers` preseed key) sets it at install; Appliance → Fleet → Services → NTP changes it afterwards. Point it at an internal server or a unicast peer. Leaving it blank at install means **no time source at all** ([#1002](https://github.com/spatiumnorth/spatiumddi/issues/1002)): the installer comments out Debian's own `pool` directive and the `/run/chrony-dhcp` sourcedir, and seeds the platform's server list empty so the control plane's first config push does not put the pool back. `chronyd` then runs with no sources and reports `Not synchronised`, which is what an air-gapped site with a trusted RTC is asking for. Clearing the server list under Appliance → Fleet → Services → NTP does the same thing on an appliance that is already running |
 | `github.com` — SSH public keys, **only if you ask** | off | The disk installer's **SSH public key** screen: typing a bare username there fetches `https://github.com/<user>.keys`. Typing a URL fetches that URL instead, and picking "Paste" or "No key" fetches nothing. One `GET`, no request body, nothing about the install is sent |
 | The control-plane URL you type — an `/api/v1/version` probe | off (Additional-node installs only) | The disk installer probes the URL you entered before it wipes the disk, so a typo is caught while it is still correctable. One `GET` to **your own** control plane |
 | Your default gateway — one ICMP echo | on (pre-flight screen) | The installer's pre-flight check pings the LAN gateway to show whether it answers. LAN-local; there is deliberately no internet-reachability probe |
@@ -188,7 +188,7 @@ send it to someone.
 
 ## 6. The mobile app
 
-The [SpatiumDDI mobile app](https://github.com/spatiumddi/spatiumddi-mobile)
+The [SpatiumDDI mobile app](https://github.com/spatiumnorth/spatiumddi-mobile)
 lives in its own repository and carries the same promise: it speaks
 only to **your** control plane's REST API, at the address you enrol it
 against. It has no backend of its own, no analytics SDK, and no
@@ -237,7 +237,7 @@ endpoints); and the feed catalogues in `backend/app/data/`, whose
 entries are all opt-in downloads covered by the blocklist row above.
 
 If you find a connection this page does not describe, that is a bug —
-please [open an issue](https://github.com/spatiumddi/spatiumddi/issues/new).
+please [open an issue](https://github.com/spatiumnorth/spatiumddi/issues/new).
 
 ## Appendix — hostnames in the source that are not connections
 

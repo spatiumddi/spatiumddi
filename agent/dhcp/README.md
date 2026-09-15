@@ -1,7 +1,7 @@
 # spatium-dhcp-agent
 
 Sidecar agent baked into the SpatiumDDI managed Kea DHCP container image
-(`ghcr.io/spatiumddi/dhcp-kea`).
+(`ghcr.io/spatiumnorth/dhcp-kea`).
 
 See [`docs/features/DHCP.md`](../../docs/features/DHCP.md) §6 for the caching
 and offline-resilience spec.

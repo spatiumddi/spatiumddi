@@ -18,7 +18,7 @@
 
 image:
   registry: ghcr.io
-  repository: spatiumddi         # images are ghcr.io/spatiumddi/<name>
+  repository: spatiumnorth       # images are ghcr.io/spatiumnorth/<name>
   # Image tag applied to every control-plane workload. Empty → use Chart.appVersion.
   tag: ""
   pullPolicy: IfNotPresent
@@ -812,7 +812,7 @@ dnsAgents:
   # Default image — used when a server entry doesn't override.
   # Configures the BIND9 driver (the historical default flavor).
   image:
-    repository: ghcr.io/spatiumddi/dns-bind9
+    repository: ghcr.io/spatiumnorth/dns-bind9
     tag: ""                      # empty → use Chart.appVersion
     pullPolicy: IfNotPresent
   # Per-driver image overrides (issue #127). Each key matches a
@@ -821,10 +821,10 @@ dnsAgents:
   # PowerDNS-driver groups alongside BIND9.
   flavors:
     powerdns:
-      repository: ghcr.io/spatiumddi/dns-powerdns
+      repository: ghcr.io/spatiumnorth/dns-powerdns
       tag: ""                    # empty → use Chart.appVersion
     technitium:
-      repository: ghcr.io/spatiumddi/dns-technitium
+      repository: ghcr.io/spatiumnorth/dns-technitium
       tag: ""                    # empty → use Chart.appVersion
   # PSK carrying DNS_AGENT_KEY. Prefer `existingSecret`; `value` lives here
   # only to make lab walk-throughs runnable in one command.
@@ -867,7 +867,7 @@ dhcpAgents:
   enabled: false
   priorityClassName:  # #983 — unset inherits ``global.servicePriorityClassName``; "" means no class
   image:
-    repository: ghcr.io/spatiumddi/dhcp-kea
+    repository: ghcr.io/spatiumnorth/dhcp-kea
     tag: ""
     pullPolicy: IfNotPresent
   agentKey:

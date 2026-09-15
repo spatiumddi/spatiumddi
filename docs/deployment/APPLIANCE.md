@@ -424,7 +424,7 @@ single-node appliance restarting cluster DNS is a footgun.
 7. (Appliance role, or a Control-plane node enabling DNS/DHCP) Operator approves the appliance from the control plane's `/appliance → Fleet` tab + picks roles. DaemonSet schedules role pods within ~30 s.
 
 For a step-by-step user-facing version, see the README's
-["Quick start with the OS appliance ISO" section](https://github.com/spatiumddi/spatiumddi/blob/main/README.md#quick-start-with-the-os-appliance-iso-recommended).
+["Quick start with the OS appliance ISO" section](https://github.com/spatiumnorth/spatiumddi/blob/main/README.md#quick-start-with-the-os-appliance-iso-recommended).
 
 ---
 
@@ -434,7 +434,7 @@ A fresh install is a one-node control plane. Multi-node HA is built
 **by promoting Appliances**, not by a separate installer role — the
 operator scales the existing cluster from `/appliance → Fleet →
 Manage control plane cluster…`. Full design lives in
-[issue #272](https://github.com/spatiumddi/spatiumddi/issues/272);
+[issue #272](https://github.com/spatiumnorth/spatiumddi/issues/272);
 the reference topologies are in
 [`TOPOLOGIES.md`](TOPOLOGIES.md).
 
@@ -497,7 +497,7 @@ state on its heartbeat:
   edits on every seed reboot — the systemic durability bug fixed in
   `083f8d2`.)
 
-  Since [#1005](https://github.com/spatiumddi/spatiumddi/issues/1005) the
+  Since [#1005](https://github.com/spatiumnorth/spatiumddi/issues/1005) the
   supervisor does **not** write that CR when the HelmChart already carries
   every value it would set. Merging a Config that changes nothing still
   records a helm revision and runs a second helm-install Job, so every fresh
@@ -633,7 +633,7 @@ blunt `crictl rmi --prune` (that would delete the inactive slot's images,
 which an A/B rollback needs — the baked airgap tarballs are versionless
 and overwritten each upgrade, and every pod is `imagePullPolicy: Never`,
 so a pruned image can't be re-pulled). Instead it reads
-`slot-versions.json` and removes only `ghcr.io/spatiumddi/*` images that
+`slot-versions.json` and removes only `ghcr.io/spatiumnorth/*` images that
 are tagged with *neither* slot's version *and* not referenced by a live
 container — i.e. releases older than the two slots + stale dev tags. Both
 slots stay bootable. It runs async (`systemctl start --no-block`) from
@@ -869,7 +869,7 @@ the Cluster screen already fetches — now carries a `psi` block on the node's
 `some` is the share of wall-clock time at least one task was stalled waiting
 for the resource; `full` is the share where *every* runnable task was.
 
-**This is the reading [#980](https://github.com/spatiumddi/spatiumddi/issues/980) needed and nothing could give.** That was the
+**This is the reading [#980](https://github.com/spatiumnorth/spatiumddi/issues/980) needed and nothing could give.** That was the
 appliance dropping relayed DHCP under CPU pressure with every dashboard
 green — and it stayed green because utilisation cannot distinguish a node at
 70% CPU with a run queue behind one core from a node at 70% without one.
@@ -1096,7 +1096,7 @@ Seeded **builtin** role policies reproduce the Phase-2 hardcoded renderer
 byte-for-byte; operators tune their rules (the floor — ssh/22, ICMP, loopback —
 cannot be authored away by a rule, and no rule may `drop` 22). The ssh/22 half
 of that floor *can* be source-scoped, but only by the separate `ssh_lockdown`
-setting ([#1009](https://github.com/spatiumddi/spatiumddi/issues/1009)) — a
+setting ([#1009](https://github.com/spatiumnorth/spatiumddi/issues/1009)) — a
 deliberate act with its own guards, never a consequence of a firewall rule.
 
 **Fleet → Firewall tab.** A **left sub-nav** (#404 — was top sub-tabs) over
@@ -1183,7 +1183,7 @@ operator's current source IP is rejected 422 unless `override_lockout=true`
 open by default — a baked sentinel, `/etc/nftables.d/00-spatium-ssh.nft` — so a
 bad Web-UI scope is recoverable over SSH, and from the console regardless.
 
-Since [#1009](https://github.com/spatiumddi/spatiumddi/issues/1009) that SSH
+Since [#1009](https://github.com/spatiumnorth/spatiumddi/issues/1009) that SSH
 half is a default-on floor rather than a guarantee: **the two lockdowns
 compose.** An operator who scopes the Web UI *and* turns on `ssh_lockdown` with
 a scope that excludes them has closed both doors, and the console is what
@@ -1237,7 +1237,7 @@ rather than describing the console as a recovery path.
 
 ## Post-#170 architecture (2026-05-14, superseded by #183)
 
-The architecture below was reshaped end-to-end by [issue #170](https://github.com/spatiumddi/spatiumddi/issues/170). Three threads converged:
+The architecture below was reshaped end-to-end by [issue #170](https://github.com/spatiumnorth/spatiumddi/issues/170). Three threads converged:
 
 1. **The agent containers do far too much.** `dns-bind9` / `dns-powerdns` / `dhcp-kea` each used to carry their own copy of host-side concerns (slot-state reads, nftables drop-ins, reboot-pending watch, docker-socket-aware logic). Three implementations of the same logic.
 2. **The install-time role decision is too early.** Operators picked `dns-agent-bind9` / `dns-agent-powerdns` / `dhcp-agent` at the installer prompt, baked into role-config. Switching meant a reinstall.
@@ -1662,7 +1662,7 @@ containers stay Alpine-based** — only the appliance host OS shifts.
 
 The build's host dependencies (mkosi, qemu-utils, debian-archive-keyring,
 grub-pc-bin + grub-efi-amd64-bin, python3-cryptography, …) live inside
-`ghcr.io/spatiumddi/appliance-builder:latest`. The only host requirement
+`ghcr.io/spatiumnorth/appliance-builder:latest`. The only host requirement
 for `make appliance` is **Docker with privileged-container support**.
 mkosi needs loop devices + namespaces + bind-mounts to bootstrap the
 rootfs — same constraint as `packer`, `live-build`, `diskimage-builder`.
@@ -1706,7 +1706,7 @@ requirement under Docker Desktop's containerd image store.
 ```
 make appliance
   ↓
-docker pull ghcr.io/spatiumddi/appliance-builder:latest
+docker pull ghcr.io/spatiumnorth/appliance-builder:latest
   ↓
 docker run --privileged appliance-builder
   → mkosi build → spatiumddi-appliance_0.1.0.raw   (2.1 GiB sparse)
@@ -1725,10 +1725,10 @@ Hybrid BIOS + UEFI boot via grub (`Bootable=yes`, `Bootloader=grub`,
 trigger: tag push (CalVer)
   ↓
 1. Reuse the existing image-build workflows
-   - ghcr.io/spatiumddi/spatiumddi-api:<calver>
-   - ghcr.io/spatiumddi/spatiumddi-frontend:<calver>
-   - ghcr.io/spatiumddi/dns-{bind9,powerdns,technitium}:<calver>
-   - ghcr.io/spatiumddi/dhcp-kea:<calver>
+   - ghcr.io/spatiumnorth/spatiumddi-api:<calver>
+   - ghcr.io/spatiumnorth/spatiumddi-frontend:<calver>
+   - ghcr.io/spatiumnorth/dns-{bind9,powerdns,technitium}:<calver>
+   - ghcr.io/spatiumnorth/dhcp-kea:<calver>
   ↓
 2. Build appliance images via the builder container
    - Phase 1: amd64 qcow2 (all-in-one)
@@ -1985,7 +1985,7 @@ trigger: tag push (CalVer)
 >   `mkosi.conf` ships no `mdadm`, `lvm2`, `multipath-tools` or `kpartx`,
 >   and the initramfs work that needs is not here. The refusal is the
 >   shippable half; the capability moved to
->   [#999](https://github.com/spatiumddi/spatiumddi/issues/999), which
+>   [#999](https://github.com/spatiumnorth/spatiumddi/issues/999), which
 >   carries it together with the fleet monitoring and management surface
 >   for both — a mirrored root with no degraded-array alarm is a mirror
 >   that silently becomes a single disk, so the monitoring half is a
@@ -2036,7 +2036,7 @@ Every appliance now reports the state of its **software RAID (md)
 arrays** and **device-mapper multipath maps**, and alarms when either
 loses redundancy. This ships *before* the ability to install onto a
 mirror (Parts B + C of
-[#999](https://github.com/spatiumddi/spatiumddi/issues/999)), and the
+[#999](https://github.com/spatiumnorth/spatiumddi/issues/999)), and the
 ordering is deliberate:
 
 > A mirrored root with no degraded-array alarm is a mirror that silently
@@ -2436,7 +2436,7 @@ runs on a build that carries the Looking Glass, so an A/B slot upgrade
 picks it up rather than only fresh installs.
 
 Recipe, schema table, and Azure / AWS / Proxmox / PXE examples:
-[`appliance/cloud-init/README.md`](https://github.com/spatiumddi/spatiumddi/blob/main/appliance/cloud-init/README.md)
+[`appliance/cloud-init/README.md`](https://github.com/spatiumnorth/spatiumddi/blob/main/appliance/cloud-init/README.md)
 plus `spatium-preseed-control-plane.yaml.example` +
 `spatium-preseed-appliance.yaml.example`.
 
@@ -2545,7 +2545,7 @@ introduced by an upgrade don't clobber operator-created ones.
 
 1. Operator opens the **OS Image** card in `/appliance` →
    Releases. The image-URL field is pre-filled with
-   `https://github.com/spatiumddi/spatiumddi/releases/latest/
+   `https://github.com/spatiumnorth/spatiumddi/releases/latest/
    download/spatiumddi-appliance-slot-<arch>.raw.xz` so a
    first-time operator just clicks Apply.
 2. The api container writes a trigger file the host-side
@@ -2687,7 +2687,7 @@ picker plus a pre-filled copy-paste command:
 
   # Kubernetes:
   helm upgrade spatiumddi-dns-bind9 \
-    oci://ghcr.io/spatiumddi/charts/spatiumddi \
+    oci://ghcr.io/spatiumnorth/charts/spatiumddi \
     --set image.tag=2026.05.12-2 \
     --reuse-values
   ```
@@ -2839,12 +2839,12 @@ whereas pointing the bootloader at it cannot be undone remotely.
    >
    > ```bash
    > sudo spatium-upgrade-slot apply \
-   >   https://github.com/spatiumddi/spatiumddi/releases/download/2026.07.30-1/spatiumddi-appliance-slot-2026.07.30-1-amd64.raw.xz \
-   >   --checksum https://github.com/spatiumddi/spatiumddi/releases/download/2026.07.30-1/spatiumddi-appliance-slot-2026.07.30-1-amd64.sha256
+   >   https://github.com/spatiumnorth/spatiumddi/releases/download/2026.07.30-1/spatiumddi-appliance-slot-2026.07.30-1-amd64.raw.xz \
+   >   --checksum https://github.com/spatiumnorth/spatiumddi/releases/download/2026.07.30-1/spatiumddi-appliance-slot-2026.07.30-1-amd64.sha256
    > ```
    >
    > Upload works normally once the appliance is on `2026.07.30-1` or
-   > later. See [#787](https://github.com/spatiumddi/spatiumddi/issues/787).
+   > later. See [#787](https://github.com/spatiumnorth/spatiumddi/issues/787).
 2. **URL** (connected install). Operator pastes the GitHub release
    asset URL — same `https://github.com/.../spatiumddi-appliance-
    slot-amd64.raw.xz` shape the per-box flow uses. Each node fetches
@@ -2991,9 +2991,9 @@ Same-minor bumps are unaffected — revert the slot and you are done.
    The un-versioned `…-slot-amd64.raw.xz` name exists only to back the
    `releases/latest/download/…` URLs and is pruned from every release
    once a newer one is cut (#392), so pinning a tag to it 404s.
-   wget https://github.com/spatiumddi/spatiumddi/releases/download/
+   wget https://github.com/spatiumnorth/spatiumddi/releases/download/
         2026.06.01-1/spatiumddi-appliance-slot-2026.06.01-1-amd64.raw.xz
-   wget https://github.com/spatiumddi/spatiumddi/releases/download/
+   wget https://github.com/spatiumnorth/spatiumddi/releases/download/
         2026.06.01-1/spatiumddi-appliance-slot-2026.06.01-1-amd64.sha256
 
 2. Copy both files to the airgap LAN (USB stick, SCP through a jump

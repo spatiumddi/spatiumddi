@@ -1,6 +1,6 @@
 [Unit]
 Description=Apply pending SpatiumDDI slot-set-next-boot trigger (Fleet UI)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/138
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/138
 
 [Service]
 Type=oneshot

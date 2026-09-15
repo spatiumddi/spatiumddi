@@ -23,7 +23,7 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: migrate
-          image: ghcr.io/spatiumddi/spatiumddi-api:latest
+          image: ghcr.io/spatiumnorth/spatiumddi-api:latest
           imagePullPolicy: Always
           command: ["alembic", "upgrade", "head"]
           env:

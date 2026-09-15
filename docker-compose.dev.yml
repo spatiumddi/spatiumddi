@@ -58,9 +58,9 @@ services:
   # ── API Backend ─────────────────────────────────────────────────────────────
   # ``image:`` is set to a non-registry tag in every dev override so
   # ``docker compose -f prod -f dev up`` always builds locally and never
-  # silently pulls the registry copy of ``ghcr.io/spatiumddi/...:latest``
+  # silently pulls the registry copy of ``ghcr.io/spatiumnorth/...:latest``
   # the prod compose declares. ``make build`` (prod-only) still tags as
-  # ``ghcr.io/spatiumddi/...:latest`` for the release pipeline.
+  # ``ghcr.io/spatiumnorth/...:latest`` for the release pipeline.
   api:
     image: spatiumddi-api:dev
     build:

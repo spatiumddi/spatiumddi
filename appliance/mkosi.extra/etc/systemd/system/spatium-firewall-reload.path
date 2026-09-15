@@ -1,6 +1,6 @@
 [Unit]
 Description=Watch for SpatiumDDI firewall drop-in trigger (issue #183 Phase 9)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/183
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/183
 # Skip on the live ISO — nothing writes the trigger from the
 # installer environment.
 ConditionKernelCommandLine=!boot=live

@@ -42,7 +42,7 @@ spec:
                 topologyKey: kubernetes.io/hostname
       containers:
         - name: dns
-          image: ghcr.io/spatiumddi/dns-bind9:latest
+          image: ghcr.io/spatiumnorth/dns-bind9:latest
           imagePullPolicy: IfNotPresent
           env:
             - name: CONTROL_PLANE_URL

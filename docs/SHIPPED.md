@@ -10,7 +10,7 @@ Mirrors CLAUDE.md's three mixed sections:
 ## Major roadmap items
 
 - ✅ **Multicast group tracking — IPAM-native registry of streams + producer/consumer relationships**
-  ([#126](https://github.com/spatiumddi/spatiumddi/issues/126))
+  ([#126](https://github.com/spatiumnorth/spatiumddi/issues/126))
   — Full multicast registry shipping the four-phase issue body
   (registry → PIM domain → SNMP discovery → Operator Copilot tools)
   end-to-end. Eleven commits between 2026-05-08 and 2026-05-09:
@@ -39,7 +39,7 @@ Mirrors CLAUDE.md's three mixed sections:
   Both deferrals captured in the issue close-out comment.
 
 - ✅ **DNS configuration importer — BIND9, PowerDNS, Windows DNS**
-  ([#128](https://github.com/spatiumddi/spatiumddi/issues/128))
+  ([#128](https://github.com/spatiumnorth/spatiumddi/issues/128))
   — One-shot migration tool that turns three common upstream DNS
   sources into native SpatiumDDI zones + records. Three phases
   shipped 2026-05-09 across seven commits; all three sources feed
@@ -67,18 +67,18 @@ Mirrors CLAUDE.md's three mixed sections:
 
   **Test coverage**: 34 cases total in `backend/tests/test_dns_import.py` + `test_dns_import_windows.py` + `test_dns_import_powerdns.py` covering all three sources end-to-end through the FastAPI test client.
 
-  **Phase 4 polish split out to [#130](https://github.com/spatiumddi/spatiumddi/issues/130)** — gated on real operator demand:
+  **Phase 4 polish split out to [#130](https://github.com/spatiumnorth/spatiumddi/issues/130)** — gated on real operator demand:
   * **Catalog-zone awareness** — current "imports as a regular zone" is fine for most cases (catalog zones are rare in BIND9/PowerDNS deployments people migrate *from*); operator can delete post-import. Build trigger: a real operator hits this and is surprised.
-  * **Multi-view → per-view import** — hard blocked on [#24 DNS Views](https://github.com/spatiumddi/spatiumddi/issues/24); current behavior collapses to default view with a warning.
+  * **Multi-view → per-view import** — hard blocked on [#24 DNS Views](https://github.com/spatiumnorth/spatiumddi/issues/24); current behavior collapses to default view with a warning.
   * **`propose_dns_import` MCP tool** — low value over the UI; build if specifically asked.
 
   **One item dropped, not deferred**: DNSSEC re-sign automation. Current "strip on import + warn + operator re-enables in zone editor" is the right UX — auto-enabling at import time would bake in algorithm/KSK/ZSK choices the operator should make on the SpatiumDDI side. Don't re-pitch.
 
 - ✅ **PowerDNS authoritative driver — second driver alongside BIND9**
-  ([#127](https://github.com/spatiumddi/spatiumddi/issues/127))
+  ([#127](https://github.com/spatiumnorth/spatiumddi/issues/127))
   — Full second authoritative DNS driver with native REST API +
   LMDB embedded backend, multi-arch (`linux/amd64` + `linux/arm64`)
-  `ghcr.io/spatiumddi/dns-powerdns` image, agent + supervisor +
+  `ghcr.io/spatiumnorth/dns-powerdns` image, agent + supervisor +
   long-poll integration, frontend driver picker, and per-driver
   capability gating (ALIAS / LUA / online DNSSEC / catalog zones
   reject 422 against non-PowerDNS groups). Five phases + two
@@ -1794,7 +1794,7 @@ Mirrors CLAUDE.md's three mixed sections:
     the new one, silently clobbering siblings — for an N-
     member pool, only the most-recently-applied member
     would survive in BIND9's running zone. **Superseded but
-    kept** by [#773](https://github.com/spatiumddi/spatiumddi/issues/773):
+    kept** by [#773](https://github.com/spatiumnorth/spatiumddi/issues/773):
     every agent-bound op now carries the complete desired
     `rrset`, which is what a current agent acts on. Pools
     were the only caller that ever set `rrset_action`

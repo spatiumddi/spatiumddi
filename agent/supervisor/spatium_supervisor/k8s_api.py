@@ -1777,13 +1777,38 @@ def ensure_coredns_ha(max_replicas: int = 2) -> tuple[bool, str | None]:
     return False, f"kubeapi status {status}: {resp[:200]!r}"
 
 
+@dataclass
+class CnpgScale:
+    """What one ``patch_cnpg_instances`` call did. ``changed`` is any PATCH
+    (size or affinity); ``scaled`` is a size change actually written;
+    ``deferred`` says why a requested SCALE-DOWN was not written this tick
+    (#1059) — the caller logs it and retries next tick. ``current`` is
+    ``spec.instances`` as read, ``ready`` / ``reported`` the Cluster's
+    ``status.readyInstances`` / ``status.instances``."""
+
+    changed: bool = False
+    error: str | None = None
+    scaled: bool = False
+    deferred: str = ""
+    current: int | None = None
+    ready: int | None = None
+    reported: int | None = None
+
+    def __iter__(self):
+        # ``changed, err = patch_cnpg_instances(...)`` keeps working.
+        yield self.changed
+        yield self.error
+
+
 def patch_cnpg_instances(
     instances: int,
     *,
     pod_anti_affinity_type: str = "required",
     cluster_name: str = _CNPG_DEFAULT_CLUSTER,
     namespace: str = "spatium",
-) -> tuple[bool, str | None]:
+    scale_down: bool = True,
+    hold_reason: str = "",
+) -> CnpgScale:
     """Directly reconcile the CNPG ``Cluster`` CR's ``spec.instances`` and
     its instance-spreading policy.
 
@@ -1806,21 +1831,42 @@ def patch_cnpg_instances(
     on a 1→3 promote: instances 1 and 2 both landed on the seed, so one node
     loss would have taken the primary and a replica together.
 
-    Note this can strand an instance whose PVC is already bound to a node
-    that now hosts another instance — it goes Pending until the operator
-    deletes that REPLICA's PVC (never the primary's) and lets CNPG re-clone
-    it. Postgres stays available throughout: the primary is untouched and a
-    surviving replica keeps failover possible. See charts/spatiumddi/
-    README.md.
+    #1059 — a SCALE-DOWN is never written blind. The dead-node replace
+    endpoint drops the replaced row from the committed count at once, so
+    the seed's next tick asked for ``instances 2`` on the very tick that
+    deleted the dead Node. CloudNativePG (1.30.0, ``reconcilePods``) acts on
+    a smaller spec only while every instance pod still reads Ready — the
+    dead node's does, for the node-monitor grace — and then removes the
+    highest-serial ready non-primary instance, PVCs included: the dead one
+    by luck, or a healthy replica on a live node. Otherwise it refuses, and
+    the smaller spec only stops it re-creating the dead instance until the
+    promote restores the count (observed live 2026-09-15, nightly-2026.09.13:
+    Postgres two of three for 860 s inside a green replace). So a scale-down
+    is deferred — nothing written, ``deferred`` says why — when the caller
+    holds it (``scale_down=False``: a dead-node replace is in flight, see
+    ``heartbeat._ReplaceHold``) or when the Cluster reports fewer ready
+    instances than it has — CNPG's own gate (``reconcilePods``: no scale-down
+    while ``InstancesReportingStatus() < Status.Instances``, and
+    ``Status.Instances`` counts PVC groups, a pending join included), so it
+    would refuse the write anyway and act on it later, when the cluster is
+    whole and nobody means it any more. The
+    caller retries every tick, so a real demote still lands once the cluster
+    is whole. Scale-UP and the affinity patch are never deferred.
+
+    Note the affinity patch can strand an instance whose PVC is already
+    bound to a node that now hosts another instance — it goes Pending until
+    the operator deletes that REPLICA's PVC (never the primary's) and lets
+    CNPG re-clone it. Postgres stays available throughout. See
+    charts/spatiumddi/README.md.
 
     Idempotent: GETs the current spec first and only PATCHes on a real
-    change, so steady-state heartbeats stay quiet. Returns
-    ``(changed, error)`` mirroring the other override helpers.
+    change, so steady-state heartbeats stay quiet. Returns a
+    :class:`CnpgScale`, which still unpacks as ``(changed, error)``.
     """
     if instances < 1:
-        return False, "instances < 1"
+        return CnpgScale(error="instances < 1")
     if pod_anti_affinity_type not in ("preferred", "required"):
-        return False, f"bad pod_anti_affinity_type {pod_anti_affinity_type!r}"
+        return CnpgScale(error=f"bad pod_anti_affinity_type {pod_anti_affinity_type!r}")
     base = (
         f"/apis/postgresql.cnpg.io/v1/namespaces/{quote(namespace)}"
         f"/clusters/{quote(cluster_name)}"
@@ -1831,39 +1877,52 @@ def patch_cnpg_instances(
     try:
         status, resp = _request("GET", base)
     except RuntimeError as exc:
-        return False, str(exc)
+        return CnpgScale(error=str(exc))
     if status == 404:
-        return False, None
+        return CnpgScale()
     if status != 200:
-        return False, f"kubeapi GET status {status}: {resp[:200]!r}"
+        return CnpgScale(error=f"kubeapi GET status {status}: {resp[:200]!r}")
+    ready = reported = None
     try:
-        spec = json.loads(resp).get("spec", {})
+        doc = json.loads(resp)
+        spec = doc.get("spec", {}) or {}
         current = spec.get("instances")
         current_affinity = spec.get("affinity", {}) or {}
         current_aa = current_affinity.get("podAntiAffinityType")
         current_enabled = current_affinity.get("enablePodAntiAffinity")
-    except (ValueError, AttributeError):
+        cr_status = doc.get("status") or {}
+        ready_raw = cr_status.get("readyInstances")
+        reported_raw = cr_status.get("instances")
+        ready = int(ready_raw) if ready_raw is not None else None
+        reported = int(reported_raw) if reported_raw is not None else None
+    except (ValueError, TypeError, AttributeError):
         current = current_aa = current_enabled = None
-    if (
-        current == instances
-        and current_aa == pod_anti_affinity_type
-        and current_enabled is True
-    ):
-        return False, None
-    payload = json.dumps(
-        {
-            "spec": {
-                "instances": instances,
-                # merge-patch: this merges INTO spec.affinity, leaving the
-                # chart's nodeSelector + tolerations under it untouched.
-                "affinity": {
-                    "enablePodAntiAffinity": True,
-                    "podAntiAffinityType": pod_anti_affinity_type,
-                    "topologyKey": "kubernetes.io/hostname",
-                },
-            }
+    size_change = current != instances
+    affinity_change = not (current_aa == pod_anti_affinity_type and current_enabled is True)
+    deferred = ""
+    if size_change and isinstance(current, int) and instances < current:
+        if not scale_down:
+            deferred = hold_reason or "scale-down held by the caller"
+        elif ready is None or reported is None:
+            deferred = "the Cluster reports no readiness yet"
+        elif ready < reported:
+            deferred = f"readyInstances {ready} < instances {reported}"
+    result = CnpgScale(current=current if isinstance(current, int) else None,
+                       ready=ready, reported=reported, deferred=deferred)
+    if not affinity_change and (not size_change or deferred):
+        return result
+    spec_patch: dict = {
+        # merge-patch: this merges INTO spec.affinity, leaving the
+        # chart's nodeSelector + tolerations under it untouched.
+        "affinity": {
+            "enablePodAntiAffinity": True,
+            "podAntiAffinityType": pod_anti_affinity_type,
+            "topologyKey": "kubernetes.io/hostname",
         }
-    ).encode("utf-8")
+    }
+    if not deferred:
+        spec_patch["instances"] = instances
+    payload = json.dumps({"spec": spec_patch}).encode("utf-8")
     try:
         status, resp = _request(
             "PATCH",
@@ -1872,13 +1931,18 @@ def patch_cnpg_instances(
             content_type="application/merge-patch+json",
         )
     except RuntimeError as exc:
-        return False, str(exc)
+        result.error = str(exc)
+        return result
     if status in (200, 201):
-        return True, None
-    return False, f"kubeapi PATCH status {status}: {resp[:200]!r}"
+        result.changed = True
+        result.scaled = size_change and not deferred
+        return result
+    result.error = f"kubeapi PATCH status {status}: {resp[:200]!r}"
+    return result
 
 
 __all__ = [
+    "CnpgScale",
     "KubeConfig",
     "PodStatus",
     "apply_metallb_overrides",

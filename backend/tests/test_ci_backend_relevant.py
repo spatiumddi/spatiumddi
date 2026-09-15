@@ -58,6 +58,13 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_lint_versions.py": "scripts/lint_versions.py",
     "test_lint_workflow_shell.py": "scripts/lint_workflow_shell.py",
     "test_lint_image_upgrades.py": "scripts/lint_image_upgrades.py",
+    "test_trivy_scheduled_report.py": ".github/workflows/trivy-scheduled.yml",
+    "test_trivy_pr_lanes.py": (
+        ".github/workflows/build-dns-images.yml",
+        ".github/workflows/build-dhcp-images.yml",
+        ".github/workflows/build-looking-glass-images.yml",
+        ".github/workflows/build-supervisor-image.yml",
+    ),
     "test_dhcp_packet_loss.py": "agent/dhcp/spatium_dhcp_agent/metrics.py",
     "test_ntp_initial_seed.py": ("appliance/mkosi.extra/usr/local/bin/spatiumddi-firstboot"),
     # #972 — the HELD endpoint is mounted at the application root, so it needs
@@ -196,7 +203,7 @@ def test_known_irrelevant_paths_skip_the_suite(path: str) -> None:
         ".github/workflows/nightly.yml",
         "agent/looking-glass/images/gobgp/Dockerfile",
         ".github/workflows/release.yml",
-        ".github/workflows/build-dns-images.yml",
+        ".github/workflows/docs-publish.yml",
         ".github/dependabot.yml",
         "agent/dns/spatium_dns_agent/sync.py",
         "agent/dhcp/images/kea/Dockerfile",

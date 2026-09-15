@@ -5,18 +5,18 @@ title: Vertical network awareness
 
 # Vertical network awareness — AV · BACnet/IP · Industrial-OT · DICOM
 
-Umbrella issue [#543](https://github.com/spatiumddi/spatiumddi/issues/543), with
-four children: [#540](https://github.com/spatiumddi/spatiumddi/issues/540) AV /
-Audio-Video-over-IP, [#541](https://github.com/spatiumddi/spatiumddi/issues/541)
+Umbrella issue [#543](https://github.com/spatiumnorth/spatiumddi/issues/543), with
+four children: [#540](https://github.com/spatiumnorth/spatiumddi/issues/540) AV /
+Audio-Video-over-IP, [#541](https://github.com/spatiumnorth/spatiumddi/issues/541)
 BACnet/IP building automation,
-[#542](https://github.com/spatiumddi/spatiumddi/issues/542) Industrial / OT, and
-[#723](https://github.com/spatiumddi/spatiumddi/issues/723) DICOM (healthcare).
+[#542](https://github.com/spatiumnorth/spatiumddi/issues/542) Industrial / OT, and
+[#723](https://github.com/spatiumnorth/spatiumddi/issues/723) DICOM (healthcare).
 
 Four IP-native domains that a generic IPAM does not speak. They look unrelated
 but they are the **same DDI primitives, specialized**: a uniqueness registry, a
 segmentation-documentation layer, and conformity rules over both. Each is a
 togglable feature module in the Network group, and all four ship **disabled**
-([#1069](https://github.com/spatiumddi/spatiumddi/issues/1069)) — a registry
+([#1069](https://github.com/spatiumnorth/spatiumddi/issues/1069)) — a registry
 means nothing until the site populates it, and a hospital wants DICOM where
 nobody else wants the sidebar entries. Turn one on under Settings → Features,
 which lists all four with their descriptions whether or not they are enabled.
@@ -25,7 +25,7 @@ Enabling one arms nothing: these are registries, with no probing anywhere.
 The healthcare research pass concluded there should be **no**
 `network.healthcare` catch-all — the vertical splits into separable pieces, and
 DICOM is the anchor. The probe-safety piece is
-[#722](https://github.com/spatiumddi/spatiumddi/issues/722), which is not a
+[#722](https://github.com/spatiumnorth/spatiumddi/issues/722), which is not a
 vertical at all: it is a constraint on SpatiumDDI's own behaviour and ships
 un-gated for every install. See
 [Fragile-device probe suppression](#fragile-device-probe-suppression-722).
@@ -398,7 +398,7 @@ Every discovery phase across all three modules is unshipped, and the reasons are
 structural rather than scheduling.
 
 **The umbrella's shared dependency was cancelled.** #543 named
-[#40](https://github.com/spatiumddi/spatiumddi/issues/40) (mDNS / Bonjour / WSD
+[#40](https://github.com/spatiumnorth/spatiumddi/issues/40) (mDNS / Bonjour / WSD
 passive discovery) as "the common enabling primitive; worth landing early". #40
 was **closed as not planned** after a feasibility review, which found that
 mDNS/WSD are link-local multicast — only a host-networked, on-segment agent

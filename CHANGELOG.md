@@ -22,6 +22,281 @@ the formatter handles the rest.
 
 ## Unreleased
 
+### Changed
+
+- **helm 3.22.0 → 4.3.0 (#1098).** Build-time tool only; nothing
+  ships it. The pinned copies move together — `versions.json` plus
+  the Makefile's `alpine/helm` image and the `version:` input in
+  `ci.yml`, `release.yml`, `build-appliance.yml` and `agent-e2e.yml`
+  — and the manifest's `track` becomes `^v4\.`. `docs/DEVELOPMENT.md`
+  joins them as a sixth: its CI-gate table said "Helm 3.21", already
+  stale before this change and wrong at the *major* after it, which
+  would send anyone reproducing CI locally to the wrong binary. It is
+  now spelled as the exact version and enforced by `lint_versions.py`,
+  so it cannot drift again. (That row was stale two further ways, both
+  corrected: "both charts" predates metallb landing as a third, and
+  "six value sets" describes a matrix that is now 14.)
+  **This CLOSES a divergence rather than opening one.** `bake-chart.sh`
+  packages the chart with THIS binary; on the node, k3s's
+  helm-controller spawns `klipper-helm` to install it — and the
+  pinned `v0.13.3-build20260727` ships **Helm 4.1.4** (verified
+  directly: `helm version --short` in that image). So the appliance
+  has been installing with 4 while CI validated with 3. The CLI
+  major now matches what production actually runs.
+  **The charts render identically.** Both majors were run against the
+  same tree and the 323 rendered objects compared after parsing, not
+  as text. 18 objects differed — but 17 of those also differ between
+  two runs of the *same* 3.22.0 binary, because the charts generate
+  random credentials, so the control run is what identifies them as
+  noise. Exactly one CONTENT difference is attributable to Helm 4: a
+  single trailing blank line inside the `frr.conf` string of the
+  `metallb-bgp-frr-k8s-frr-startup` ConfigMap (227 → 228 bytes),
+  which is inert. The rest of the textual diff is comment placement
+  and blank lines in the output stream, outside any object.
+  **Helm 4 also reorders objects**, which a set-and-content comparison
+  cannot see, so order was checked separately: 12 of the 14 renders
+  emit identical order, and the two metallb ones do not —
+  `IPAddressPool` and `L2Advertisement` move from *before* the two
+  `ValidatingWebhookConfiguration`s to *after* them. That is not
+  cosmetic in principle: those webhooks are `failurePolicy: Fail`, so
+  under the new order the CRs are admitted through a webhook that can
+  reject them, where previously they were created before it existed.
+  Measured against a real k3s v1.36.4+k3s1 cluster rather than reasoned
+  about, and it is not theoretical: a **fresh install of that chart
+  fails under Helm 4 and succeeds under Helm 3**. Same chart, same
+  cluster, same values, apply-only — 3.22.0 exits 0 with both CRs
+  created; 4.3.0 exits 1, reporting that server-side apply failed
+  calling the metallb `ipaddresspoolvalidationwebhook` because the
+  service had `no endpoints available`. The webhook is now registered
+  before the CRs are applied, and its backing controller pod — created
+  moments earlier in the same pass — is not ready yet. **A retry
+  succeeds**: `helm upgrade --install` against the half-applied
+  release exits 0 and creates both CRs once the controller is up.
+  This is nonetheless not a change this PR makes, for a specific
+  reason rather than a general one: **the metallb chart is never
+  installed by this CLI.** `bake-chart.sh` packages it and
+  helm-controller installs it on the node via klipper-helm — already
+  4.1.4 — so the appliance has been on the new order since before this
+  branch. Nothing in CI installs it either; `charts-render-check.sh`
+  only templates it.
+  **A default appliance never reaches the failure at all**, which an
+  arm64 ISO built from this branch and booted confirms rather than
+  assumes: `metallb.enabled` is `false` by default and firstboot
+  renders the HelmChart that way, so the chart produces no
+  `IPAddressPool` and no `L2Advertisement`, the namespace stays empty,
+  and `helm-install-spatium-metallb` completes first time — the release
+  secret is at `v1`, so there was no retry. The ordering bites only
+  where an operator sets a control-plane VIP (#272 multi-node HA),
+  which is what flips metallb on — **and that case is broken today,
+  which setting a VIP on the booted appliance confirmed.** It does not
+  fail once and converge, as this entry previously guessed: it never
+  converges. klipper-helm resolves `SERVER_SIDE=auto` to
+  `--server-side=true`, and every attempt runs `helm uninstall` before
+  `helm install` — so each retry deletes the controller backing the
+  webhook, then reinstalls and applies the CRs while the replacement
+  pod is still starting. Each attempt destroys its own prerequisite.
+  Observed: `CrashLoopBackOff` at 5 restarts after ~5 minutes, no
+  `IPAddressPool`, and the frontend `LoadBalancer` stuck `<pending>`,
+  so the VIP never materialises.
+  **None of that is this pin's doing** and none of it changes with it:
+  klipper-helm ships with the k3s pin (`v1.36.4+k3s1`) and
+  `k3s-images.txt` is generated by `fetch-k3s.sh` rather than tracked,
+  so the appliance has behaved this way since that k3s landed, whichever
+  helm packages the chart. It needs its own issue against the appliance.
+  Also exercised under 4.3.0: `helm lint` + `dependency update` +
+  `package` for all three charts (the `bake-chart.sh` and
+  `release.yml` path), and an OCI `helm push` + `helm pull`
+  round-trip against a throwaway registry, digests matching.
+  **No breaking-change exposure**, re-audited against the tree rather
+  than the changelog: no post-renderers, no plugins, no `--atomic`,
+  no helm `--force`, `registry login` is already domain-only
+  (`ghcr.io`), and all three charts are `apiVersion: v2`, which Helm 4
+  runs unchanged. The flags we do pass — `--set`, `--timeout`,
+  `--kube-version`, `--create-namespace`, `--wait`, `--reuse-values`
+  — are unrenamed. The `helm upgrade` / `uninstall` strings elsewhere
+  in the tree are prose, or commands we print for operators to run
+  with their own helm; those were checked too and use no renamed flag.
+  The one behavioural change is server-side apply, which Helm 4
+  defaults to on **new** installs. The appliance is unaffected — it
+  is already on 4.1.4 — so the only newly-affected path is the single
+  kind `helm install` in `agent-e2e.yml`, and that workflow is
+  path-filtered on itself, so this change exercises it.
+
+
+- **GitHub organization renamed `spatiumddi` → `spatiumnorth`.** The
+  project is now `spatiumnorth/spatiumddi`: the org changed, the
+  repository name did not, and neither did the product, the PyPI
+  package, the image names or any filesystem path — `/etc/spatiumddi/`,
+  `/usr/lib/spatiumddi/` and `spatiumddi-api` are all untouched. Every
+  `github.com/` and `ghcr.io/` reference in the tree moved to the new
+  org, along with the shields.io badge paths in the README, which carry
+  the org separately from the link they sit behind and so would have
+  gone on reporting a repo that no longer answers.
+  **Container images move with the org**: pulls are now
+  `ghcr.io/spatiumnorth/…`, and the umbrella chart's
+  `image.repository` default moved with them. CI needed no such change
+  — it builds from `ghcr.io/${{ github.repository_owner }}`, which
+  follows a rename on its own.
+  **Two things do not follow a rename, and both fail silently.** Eight
+  workflows gate on `if: github.repository_owner == '…'` so a fork
+  never publishes; left at the old literal, release, nightly, the
+  weekly Trivy scan, asset pruning and the docs publisher would all
+  have skipped with a green check rather than an error. And the docs
+  site's org-root Pages repo has to be renamed to
+  `spatiumnorth.github.io` — GitHub serves an organization site only
+  from a repo named `<org>.github.io`, so the old name is demoted to an
+  ordinary project site and the root site stops existing;
+  `docs-publish.yml` now targets the new name.
+  **Operator action on upgrade:** `GITHUB_REPO` shipped in
+  `.env.example`, so an install that copied it carries
+  `spatiumddi/spatiumddi` in its own `.env`, which overrides the new
+  default and pins the daily release check and the appliance
+  slot-image catalogue to the old path. Update the value, or remove
+  the line to take the default.
+- **The release check reported a permanently up-to-date install when
+  its repo had moved.** GitHub answers `301` for a renamed repo, which
+  an org rename makes routine — and httpx does not follow redirects by
+  default while `raise_for_status()` does not reject a `3xx`. So the
+  redirect body was parsed as a release: no `tag_name`, so the task
+  stored no version, set `update_available=False`, cleared
+  `latest_check_error` and logged `update_check_ok`. The one default-on
+  connection in the product would have gone on reporting a healthy
+  “you are up to date” forever, which on a notifier whose job is
+  surfacing security fixes is worse than a loud failure. Both GitHub
+  clients (`tasks/update_check.py`, `services/appliance/releases.py`)
+  now follow redirects, which removes the false negative and keeps a
+  stale `GITHUB_REPO` working rather than silently wrong.
+- **The appliance image pruner stopped reclaiming pre-rename images.**
+  Its prefix guard exempts non-SpatiumDDI images so kubelet image-GC
+  owns them; narrowed to the new org alone, every accumulated
+  `ghcr.io/spatiumddi/*` release already on a deployed appliance —
+  exactly what the timer exists to reclaim — would have been classified
+  as third-party infra and kept forever, while still reporting nothing
+  stale to prune. It now matches both orgs; the in-use and
+  slot-version guards are unchanged, so nothing live can be removed.
+
+### Fixed
+
+- **A dead-node replace no longer scales the database down (#1059).**
+  The replace endpoint drops the replaced row from the committed
+  control-plane count at once, so from the seed's next heartbeat —
+  the same tick that deletes the dead Node — until the replacement
+  was promoted, CloudNativePG's `spec.instances` read 3→2, and only
+  the promote restored it. CloudNativePG takes a smaller spec while
+  every instance pod still reads Ready (the dead node's does, for
+  the node-monitor grace) and then removes the highest-serial ready
+  non-primary instance, PVCs and all — the dead one by luck, or a
+  healthy replica on a live node; on a later tick it refuses, and
+  the smaller spec then only stops it re-creating the dead instance
+  until the promote (observed live on nightly-2026.09.13: Postgres
+  two of three for 860 s inside a green replace). A two-node
+  control plane is not a legal steady state, so a replace is never
+  a scale-down by intent. The eviction tick — which only a replace
+  produces — now arms a hold on the CNPG size that lasts until the
+  committed count is back (or the operator shrinks the control plane
+  on purpose), and `patch_cnpg_instances` defers any scale-down the
+  Cluster reports it cannot take (fewer ready instances than it
+  has) — logged as `cnpg_instances_scale_down_deferred` and retried
+  every tick, so a real demote lands on the first tick the cluster
+  is whole. Scale-up and the anti-affinity repair are untouched.
+
+- **PR-time Trivy lanes scanned a frozen package layer, and trusted
+  Trivy's exit code (#1093).** Four workflows build an image on a PR
+  and scan it — DNS, DHCP, looking-glass, supervisor. All four cache
+  on `type=gha`, and BuildKit keys a layer on its RUN text, so each
+  image's `apk upgrade` / `apt-get upgrade` was served from whenever
+  that scope was first written. Three of the four passed no snapshot
+  build-arg at all. Scanning that layer is wrong in **both**
+  directions: it misses a CVE the current index would flag, and it
+  keeps reporting one fixed weeks ago — telling the operator to do
+  something already done, which is #1029's class.
+  They also decided with `exit-code: "1"`. Trivy's "fixed" means the
+  distro's security database names a fix, not that the package is on
+  the mirrors yet, so that fails a PR on findings nothing could have
+  installed — the nightly-20260905 failure relocated to a lane that
+  blocks unrelated work. All four now emit JSON and hand the verdict
+  to `trivy-gate.sh`, which asks the image's own index whether each
+  fix is installable today: installable → fail, not yet → defer with
+  a warning, unverifiable → fail.
+  The Trivy action was also pinned off `@master`. An unpinned
+  third-party action is the same "tooling moves under us" class as
+  the unpinned `aquasec/trivy:latest` in #1095, and there it was
+  load-bearing: an unrecognised flag exits 1, which these lanes would
+  have read as findings.
+  Timed deliberately: the nightly (snapshot-busted) and the weekly
+  (uncached) had just scanned all nine images clean, so arming these
+  lanes could not newly break any PR.
+  **None of the four listed its own workflow file in `paths:`**, so
+  the PR rewiring this gate would have run none of them — the change
+  most needing the proof was the one that could not get it. They now
+  self-trigger, which `build-appliance-builder.yml` was already
+  doing, so this restores a convention rather than inventing one.
+
+- **`nightly.yml` filed a doubly-wrong failure report on a dry run
+  (#1094).** The failure step lacked the `dry_run` guard every
+  sibling side-effecting step carries, and hardcoded ``failed on
+  `main` ``. A dry run publishes nothing and prunes nothing, so one
+  that fails means a candidate build failed — the dry run doing its
+  job — not that the nightly is broken; and a dispatch takes `--ref`,
+  which is the whole point of a dry run. The #1090 dry run was on
+  `issue-1088` and would have filed exactly this had it failed. It
+  now skips on dry runs and reports `github.ref_name`.
+
+### Changed
+
+- **helm 3.21.4 → 3.22.0 (#1091).** Build-time tool only; nothing
+  ships it. Five copies, none Dependabot-visible, all moved
+  together — `versions.json` plus the Makefile's `alpine/helm`
+  image and the `version:` input in `ci.yml`, `release.yml`,
+  `build-appliance.yml` and `agent-e2e.yml`. All three charts lint
+  and template clean under it.
+  **This is the terminal Helm 3 feature release** — published
+  2026-09-10, matching the project's stated final 3.x feature
+  release of 2026-09-09. After it, 3.x receives security fixes
+  only, until 2027-02-10. So this is a floor, not a resting place;
+  the move to 4.x is #1098.
+  The manifest's note claiming we stay on 3.x because the appliance
+  is "independent of this binary" is **wrong**, and is corrected
+  here rather than repeated: the appliance renders through k3s's
+  helm-controller, which spawns `klipper-helm` — and the pinned
+  `v0.13.3-build20260727` ships **Helm 4.1.4**. We already package
+  with 3 and install with 4, so a 4.x move closes that gap instead
+  of opening one. See #1098.
+
+### Fixed
+
+- **The weekly Trivy issue reported a CVE count and zero CVEs
+  (#1095).** #1092 is the worked example: it said the api image
+  had 5 HIGH/CRITICAL
+  fix-available vulnerabilities and contained no CVE identifier at
+  all. The scan captured `head -c 12000` of Trivy's *table* output,
+  whose Report Summary carries one row per scanned target — which
+  for that image is every `site-packages/*.dist-info/METADATA`
+  file. Measured: the full table is 107,220 bytes and the first
+  `CVE-` does not appear until byte **76,926**, so the cap could
+  only ever capture summary rows. Not a near miss; the detail
+  starts at 6.4x the cap. The report now renders from
+  `--format json`, which removes the truncation rather than
+  mitigating it — the same 34 findings come to 2,765 bytes against
+  107 KB — and gives severity, package, CVE, installed and fixed
+  version per row.
+  **`rc=1` no longer means "findings" on its own**, which is the
+  sharper half. An unrecognised flag ALSO exits 1 — verified
+  against Trivy 0.74.0 — and writes ~15 KB of usage text to the
+  captured stdout stream. The image is `aquasec/trivy:latest`,
+  unpinned, so a CLI change would have filed a security tracking
+  issue whose body was Trivy's help output, presented as CVEs. A
+  report that does not parse as a Trivy document is now a scan
+  error: never findings, and never a clean bill.
+  Truncation, if it happens at all, is capped by LINE and says
+  what it dropped — a byte cap can cut mid-row, and a partial line
+  still begins with `|`, so it would render as a malformed table
+  row instead of being dropped. Rows sort CRITICAL first, so a
+  truncated report keeps the worst findings. Also corrected the
+  footer, which sent readers to `make trivy` for `backend` and
+  `frontend` — neither is an agent image, and `backend` is the one
+  that actually reports findings.
+
 ### Security
 
 - **Every shipped image now patches its base image's own packages
@@ -3357,7 +3632,7 @@ upward instead of serving one thing while the database says another
   cannot paste cleanly emails the credential to themselves. The
   reveal-token modal now offers a QR in two shapes, the bare token or
   `spatiumddi://enrol?host=…&token=…&fingerprint=…`, both already parsed
-  by the client in `spatiumddi/spatiumddi-mobile` — so the URI is a
+  by the client in `spatiumnorth/spatiumddi-mobile` — so the URI is a
   **contract with another repo**, not a local convention.
   - **The fingerprint is the interesting half.** A self-hosted control
     plane presents a private-CA or self-signed certificate, so the
@@ -4717,7 +4992,7 @@ published `spatiumddi-api` image no longer ships the Dockerfile's
   (`agent/dns/spatium_dns_agent/drivers/technitium.py`) reconciling
   zones and records against Technitium's REST API with
   agent-provisioned bearer-token auth, a new
-  `ghcr.io/spatiumddi/dns-technitium` container image (upstream base
+  `ghcr.io/spatiumnorth/dns-technitium` container image (upstream base
   pinned by multi-arch index digest), and full appliance integration —
   supervisor role tables, firewall policy layer, umbrella + appliance
   Helm charts, Fleet UI, Docker Compose profile, CI build matrix,
@@ -5792,7 +6067,7 @@ Wake-on-LAN).
 ### Added
 
 * **#566 — BGP Looking Glass.** A receive-only GoBGP collector
-  (``ghcr.io/spatiumddi/looking-glass``, multi-arch) peers with your
+  (``ghcr.io/spatiumnorth/looking-glass``, multi-arch) peers with your
   routers, ingests the live Adj-RIB-In, and links every learned prefix /
   origin ASN / community back into IPAM. It **never advertises routes to
   your network**: a global ``default-export-policy: reject-route`` plus a
@@ -6916,7 +7191,7 @@ All ten schema changes are additive.
   existing ConfigBundle → ETag → long-poll path. Every field defaults to
   a no-op, so existing groups render byte-identical config until an
   operator opts in. PowerDNS Authoritative has no RRL, so a new
-  **dnsdist front** (``ghcr.io/spatiumddi/dns-dnsdist`` image,
+  **dnsdist front** (``ghcr.io/spatiumnorth/dns-dnsdist`` image,
   watch-and-reload entrypoint) puts ``MaxQPSIPRule`` + TC/Drop +
   ``dynBlockRulesGroup`` in front of pdns — opt-in via the
   ``dns-powerdns-with-dnsdist`` compose profile + Helm sidecar. Drop-rate
@@ -6964,7 +7239,7 @@ All ten schema changes are additive.
   image store lives on the shared ``/var`` partition and nothing pruned
   superseded releases, so ``/var`` crept toward full over upgrades
   (a field appliance hit 91 %). New ``spatiumddi-image-prune`` removes
-  only ``ghcr.io/spatiumddi/*`` images tagged with **neither** slot's
+  only ``ghcr.io/spatiumnorth/*`` images tagged with **neither** slot's
   installed version **and** not referenced by a live container — keeping
   both A/B slots bootable + the running set + all non-SpatiumDDI images,
   and pruning nothing if it can't name both slot versions. Triggered
@@ -9302,14 +9577,14 @@ environment by default — so `SPATIUMDDI_VERSION=2026.05.17-2` and
 `BAKE_SOURCE=ghcr` (set on the job's `env:` block) never reached
 the script. The script fell back to its `SPATIUMDDI_VERSION=dev` +
 `BAKE_SOURCE=local` defaults, then errored at
-`ERROR: no local image found for ghcr.io/spatiumddi/spatium-supervisor`
+`ERROR: no local image found for ghcr.io/spatiumnorth/spatium-supervisor`
 because there's no `:dev`-tagged image on a GitHub-hosted runner.
 
 Fix is one line: `sudo -E` instead of bare `sudo` so the env passes
 through. Plus a preemptive `DOCKER_CONFIG=$HOME/.docker` to point
 root's docker CLI at the runner-user's `~/.docker/config.json`
 where the workflow's `docker/login-action` step stamped the GHCR
-credentials — our `ghcr.io/spatiumddi/*` container images are
+credentials — our `ghcr.io/spatiumnorth/*` container images are
 private, so without this redirect the `docker pull` calls inside
 the script would 401 anonymously even after the env-var fix.
 
@@ -9334,9 +9609,9 @@ Same-day hotfix for the 2026.05.17-1 release pipeline. The
 `build-appliance-iso` job in the release workflow failed at 14 s
 with exit code 3 because `appliance/scripts/bake-images.sh` tried
 to `docker pull` three images that don't exist:
-`ghcr.io/spatiumddi/spatiumddi-worker`,
-`ghcr.io/spatiumddi/spatiumddi-beat`,
-`ghcr.io/spatiumddi/spatiumddi-migrate`. The umbrella chart's
+`ghcr.io/spatiumnorth/spatiumddi-worker`,
+`ghcr.io/spatiumnorth/spatiumddi-beat`,
+`ghcr.io/spatiumnorth/spatiumddi-migrate`. The umbrella chart's
 worker / beat / migrate Deployments + Jobs all share the
 `spatiumddi-api` image with different `command:` overrides
 (confirmed across `docker-compose.yml` and
@@ -9385,7 +9660,7 @@ needed." Off-appliance Helm operators benefit too — flipping
 appliance-ISO-specific). The full design + phase breakdown is in
 [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md) under
 the new "Current architecture (post-#183)" section. Follow-ups
-deferred to [#193](https://github.com/spatiumddi/spatiumddi/issues/193)
+deferred to [#193](https://github.com/spatiumnorth/spatiumddi/issues/193)
 (Phase 4 control-plane proxy half, Helm release UI, krew, firstboot
 fail-on-missing-tarball, `appliance_mode` split into `k8s_mode` +
 `appliance_mode`, plus three carry-overs from #170 Wave E).
@@ -9466,7 +9741,7 @@ surface in the integration's "unmatched" list for operator review.
 **Appliance polish (#181 + #182, landed pre-#183).** The DHCP server
 detail surface gains a tabbed modal mirroring the DNS side (Overview /
 Sync / Events / Logs / Config — Stats deferred to [#195](https://
-github.com/spatiumddi/spatiumddi/issues/195)). Three new endpoints
+github.com/spatiumnorth/spatiumddi/issues/195)). Three new endpoints
 under `/api/v1/dhcp/servers/{id}` (`pending-ops` / `recent-events` /
 `rendered-config`); the existing Kea log pipeline drives the Logs
 tab. Per-server **maintenance mode** (#182) lets operators pause a
@@ -9679,7 +9954,7 @@ DNS / DHCP service containers' agent JWTs are similarly preserved.
 
 - **`/api/v1/appliance/slot-images/*` endpoints** stay functional
   but a rename to `upgrade-images` is queued in [#199](https://
-  github.com/spatiumddi/spatiumddi/issues/199) along with a
+  github.com/spatiumnorth/spatiumddi/issues/199) along with a
   GitHub-Releases-driven picker. No removal in this release.
 
 ### Security
@@ -9928,7 +10203,7 @@ resolver runs.
   the INSERT carries.
 - **Agent container entrypoints crash-loop with only
   ``BOOTSTRAP_PAIRING_CODE``.** The shell entrypoints baked into
-  ``ghcr.io/spatiumddi/dns-bind9`` / ``dns-powerdns`` / ``dhcp-kea``
+  ``ghcr.io/spatiumnorth/dns-bind9`` / ``dns-powerdns`` / ``dhcp-kea``
   did ``: ${DNS_AGENT_KEY:?DNS_AGENT_KEY is required}`` (and
   equivalents) before the Python supervisor ran — that fired before
   the new Phase 3 resolver got a chance to look at
@@ -10436,7 +10711,7 @@ bottom-of-Releases to its own top-level Appliance tab.
   the same release picker the appliance flow uses, plus a
   pre-filled copy-paste command tailored to deployment_kind:
   `SPATIUMDDI_VERSION=<tag> docker compose pull && up -d` or
-  `helm upgrade spatiumddi-<dns|dhcp> oci://ghcr.io/spatiumddi/
+  `helm upgrade spatiumddi-<dns|dhcp> oci://ghcr.io/spatiumnorth/
   charts/spatiumddi --set image.tag=<tag> --reuse-values`. One-
   click Copy button. The agent reports the new
   `installed_appliance_version` via its next heartbeat after the
@@ -10634,7 +10909,7 @@ that's safe to undo.
   inactive target as a three-column grid + a trial-boot amber
   warning when the running slot doesn't match the durable
   default. Operator pastes (or accepts the pre-filled
-  `https://github.com/spatiumddi/spatiumddi/releases/latest/`
+  `https://github.com/spatiumnorth/spatiumddi/releases/latest/`
   URL for) a slot image + optional sha256 sidecar; pressing
   Apply writes a trigger file the host-side
   `spatiumddi-slot-upgrade.path` unit watches, the runner
@@ -10802,7 +11077,7 @@ demo as a scanner / SSRF relay).
   catalog zones, and views are deliberately out of Phase 1 — those
   are Phase 2/3 work and the driver's ``capabilities()`` dict makes
   the gaps explicit.
-- **``ghcr.io/spatiumddi/dns-powerdns`` container image.** Alpine
+- **``ghcr.io/spatiumnorth/dns-powerdns`` container image.** Alpine
   3.22 base + ``pdns`` 4.9.x + ``pdns-backend-lmdb``, multi-arch
   ``linux/amd64`` and ``linux/arm64``. Same agent supervisor + JWT
   bootstrap + long-poll ETag flow as the BIND9 image — the only
@@ -10974,7 +11249,7 @@ demo as a scanner / SSRF relay).
   builds locally and never silently pulls the registry copy that
   prod's compose declares — a source of half-mixed installs the
   user spotted while testing. ``make up`` (prod) still tags as
-  ``ghcr.io/spatiumddi/...:latest`` for the release pipeline.
+  ``ghcr.io/spatiumnorth/...:latest`` for the release pipeline.
 
   Known follow-up: soft-deleted DNS records on PowerDNS-driver
   groups don't propagate to the daemon (only ``?permanent=true``
@@ -11065,7 +11340,7 @@ demo as a scanner / SSRF relay).
   agents alongside BIND9. The existing ``servers[].flavor`` knob
   (already in the schema, never used) now actually picks the image
   + mount path: ``flavor: powerdns`` pulls
-  ``ghcr.io/spatiumddi/dns-powerdns`` (override comes from the new
+  ``ghcr.io/spatiumnorth/dns-powerdns`` (override comes from the new
   ``dnsAgents.flavors.powerdns`` block in ``values.yaml``) and
   mounts the ``dns-state`` PVC at ``/var/lib/powerdns`` for the LMDB
   store; ``flavor: bind9`` (default) keeps the historical
@@ -11083,7 +11358,7 @@ demo as a scanner / SSRF relay).
 - **PowerDNS deployment plumbing, Phase 4a (\#127).** New
   ``docker-compose.agent-dns-powerdns.yml`` standalone-VM compose
   file mirrors the bind9 shape: one ``dns-powerdns`` service against
-  the ``ghcr.io/spatiumddi/dns-powerdns`` image with ``LMDB``-backed
+  the ``ghcr.io/spatiumnorth/dns-powerdns`` image with ``LMDB``-backed
   zone storage volumes. Main ``docker-compose.yml`` +
   ``docker-compose.dev.yml`` grow a ``dns-powerdns`` profile (host
   port 5453 so a side-by-side bind9 + powerdns dev setup doesn't
@@ -11280,7 +11555,7 @@ demo as a scanner / SSRF relay).
   create/edit modal grows ``PowerDNS (agent-managed)`` as a third
   option in the Driver dropdown alongside BIND9 and Windows DNS.
   Selecting it shows a violet info banner explaining that operators
-  run the new ``ghcr.io/spatiumddi/dns-powerdns`` container alongside
+  run the new ``ghcr.io/spatiumnorth/dns-powerdns`` container alongside
   the server, that records apply via the local PowerDNS REST API on
   port 8081 (loopback only), and that the API key is generated +
   rotated automatically by the agent. The API Key input is hidden
@@ -16706,7 +16981,7 @@ enforcement site.
   + `max-h-48 overflow-auto` on the error box so long failure lists
   from bulk deletes scroll instead of pushing the buttons off-screen.
 
-[#20]: https://github.com/spatiumddi/spatiumddi/issues/20
+[#20]: https://github.com/spatiumnorth/spatiumddi/issues/20
 
 ---
 
@@ -17610,7 +17885,7 @@ Compose file to pull release images from GHCR.
 - Per-column filter row on `/admin/audit` — User/Summary/IP text inputs, Action/Resource/Result dropdowns, always visible, Clear-all X in the actions column. Backend adds `resource_display` / `result` / `source_ip` query params.
 
 **Platform**
-- Base `docker-compose.yml` now pulls release images from GHCR (`ghcr.io/spatiumddi/spatiumddi-{api,frontend}`, `ghcr.io/spatiumddi/dns-bind9`, `ghcr.io/spatiumddi/dhcp-kea`); pin with `SPATIUMDDI_VERSION=<tag>` in `.env`.
+- Base `docker-compose.yml` now pulls release images from GHCR (`ghcr.io/spatiumnorth/spatiumddi-{api,frontend}`, `ghcr.io/spatiumnorth/dns-bind9`, `ghcr.io/spatiumnorth/dhcp-kea`); pin with `SPATIUMDDI_VERSION=<tag>` in `.env`.
 - `docker-compose.dev.yml` is a standalone self-contained file that keeps `build:` stanzas for local dev builds — use `docker compose -f docker-compose.dev.yml …` or `export COMPOSE_FILE=docker-compose.dev.yml`.
 - Jekyll docs site config (`docs/_config.yml`, `docs/index.md`).
 - CHANGELOG; alpha banner; clickable screenshot thumbnails in README.
@@ -17659,7 +17934,7 @@ First public release. **Alpha quality** — expect rough edges and breaking chan
 - Server groups, servers, zones, records — full CRUD
 - BIND9 driver with Jinja templates, TSIG-signed RFC 2136 dynamic updates
 - Agent runtime: bootstrap (PSK → JWT), long-poll config sync with ETag, on-disk cache
-- Container image: `ghcr.io/spatiumddi/dns-bind9` (Alpine 3.22, multi-arch)
+- Container image: `ghcr.io/spatiumnorth/dns-bind9` (Alpine 3.22, multi-arch)
 - Zone tree with nested sub-zone display
 - Zone import/export (RFC 1035 parser, color-coded diff preview)
 - Server health checks (heartbeat staleness → SOA fallback)
@@ -17670,7 +17945,7 @@ First public release. **Alpha quality** — expect rough edges and breaking chan
 
 **DHCP**
 - Kea driver + agent runtime (bootstrap, long-poll, lease tail, local cache)
-- Container image: `ghcr.io/spatiumddi/dhcp-kea` (Alpine 3.22, multi-arch)
+- Container image: `ghcr.io/spatiumnorth/dhcp-kea` (Alpine 3.22, multi-arch)
 - Server groups, servers, scopes, pools, static assignments, client classes
 - DHCP options editor with NTP (option 42) as first-class field
 - Pool overlap validation on create and resize
@@ -17706,4 +17981,4 @@ First public release. **Alpha quality** — expect rough edges and breaking chan
 
 ---
 
-_For the full commit history, see the [GitHub compare view](https://github.com/spatiumddi/spatiumddi/commits/main)._
+_For the full commit history, see the [GitHub compare view](https://github.com/spatiumnorth/spatiumddi/commits/main)._

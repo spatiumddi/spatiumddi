@@ -60,4 +60,4 @@ docker build -t spatium-supervisor:dev -f agent/supervisor/images/supervisor/Doc
 (`context: .` from the repo root — the Dockerfile copies the package
 from `agent/supervisor/`.)
 
-[#170]: https://github.com/spatiumddi/spatiumddi/issues/170
+[#170]: https://github.com/spatiumnorth/spatiumddi/issues/170

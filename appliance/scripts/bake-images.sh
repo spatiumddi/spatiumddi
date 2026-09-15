@@ -7,7 +7,7 @@
 # directory at startup and imports anything new into containerd —
 # native, no firstboot shell-out needed.
 #
-# We tag each image as ``ghcr.io/spatiumddi/<name>:${SPATIUMDDI_VERSION}``
+# We tag each image as ``ghcr.io/spatiumnorth/<name>:${SPATIUMDDI_VERSION}``
 # before save so the imported image matches the reference the chart's
 # values.yaml uses. SPATIUMDDI_VERSION resolves from the Makefile (CI
 # release sets it to the CalVer tag; local dev gets ``dev-<short-sha>-
@@ -52,18 +52,18 @@ for arg in "$@"; do
 done
 
 # SpatiumDDI service images. Tagged with SPATIUMDDI_VERSION so the
-# chart's ``image: ghcr.io/spatiumddi/<name>:${SPATIUMDDI_VERSION}``
+# chart's ``image: ghcr.io/spatiumnorth/<name>:${SPATIUMDDI_VERSION}``
 # reference resolves locally without a pull.
 IMAGES=(
-    "ghcr.io/spatiumddi/spatium-supervisor"
-    "ghcr.io/spatiumddi/dns-bind9"
-    "ghcr.io/spatiumddi/dns-powerdns"
-    "ghcr.io/spatiumddi/dns-technitium"
-    "ghcr.io/spatiumddi/dhcp-kea"
+    "ghcr.io/spatiumnorth/spatium-supervisor"
+    "ghcr.io/spatiumnorth/dns-bind9"
+    "ghcr.io/spatiumnorth/dns-powerdns"
+    "ghcr.io/spatiumnorth/dns-technitium"
+    "ghcr.io/spatiumnorth/dhcp-kea"
     # Issue #566 — BGP Looking Glass collector (GoBGP). Baked into
     # every slot per decision D3 (can_run_looking_glass hardcodes
     # True the same way DNS/DHCP do — not a conditional/optional add).
-    "ghcr.io/spatiumddi/looking-glass"
+    "ghcr.io/spatiumnorth/looking-glass"
     # Phase 11 (#183) — control-plane images for the AIO + Core
     # install variants. Application-role appliances don't run these
     # pods, but baking them keeps the slot consistent across all
@@ -77,8 +77,8 @@ IMAGES=(
     # docker-compose.yml + charts/spatiumddi/templates/{api,worker,
     # beat,migrate}.yaml). Don't add ``spatiumddi-worker`` /
     # ``-beat`` / ``-migrate`` here — they don't exist in ghcr.
-    "ghcr.io/spatiumddi/spatiumddi-api"
-    "ghcr.io/spatiumddi/spatiumddi-frontend"
+    "ghcr.io/spatiumnorth/spatiumddi-api"
+    "ghcr.io/spatiumnorth/spatiumddi-frontend"
 )
 
 # Issue #183 Phase 8 — 3rd-party observability images. Tagged with
@@ -207,7 +207,7 @@ echo "→ SPATIUMDDI_VERSION = $SPATIUMDDI_VERSION (stamped at $VERSION_FILE)"
 resolve_source_tag() {
     # ``BAKE_SOURCE=local``: use the operator's local :dev images.
     # Three naming conventions in the wild:
-    #   * ``ghcr.io/spatiumddi/<short>:dev`` — ``make build-supervisor``
+    #   * ``ghcr.io/spatiumnorth/<short>:dev`` — ``make build-supervisor``
     #     dual-tags this form, and dev-iso flows that tag manually.
     #   * ``spatiumddi-<short>:dev`` — ``docker compose build`` uses
     #     the compose project name (``spatiumddi``) as the image
@@ -517,7 +517,7 @@ for repo in "${IMAGES[@]}"; do
     # expected ghcr name. ``docker save`` writes whatever RepoTags
     # the image has at save time; without this step, the archive
     # would carry ``<short>:dev`` (local) — chart references
-    # ``ghcr.io/spatiumddi/<short>:${SPATIUMDDI_VERSION}`` and the
+    # ``ghcr.io/spatiumnorth/<short>:${SPATIUMDDI_VERSION}`` and the
     # kubelet would say ``ErrImagePull``.
     docker tag "$source_tag" "$target_tag"
 

@@ -1,6 +1,6 @@
 [Unit]
 Description=Watch for SpatiumDDI md / multipath management requests (issue #999 Part B)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/999
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/999
 # Skip on the live ISO — array management is not part of the installer
 # environment (the installer builds arrays directly).
 ConditionKernelCommandLine=!boot=live

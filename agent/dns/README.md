@@ -1,7 +1,7 @@
 # spatium-dns-agent
 
 Sidecar agent baked into the SpatiumDDI managed BIND9 DNS container image
-(`ghcr.io/spatiumddi/dns-bind9`).
+(`ghcr.io/spatiumnorth/dns-bind9`).
 
 See [`docs/deployment/DNS_AGENT.md`](../../docs/deployment/DNS_AGENT.md) for
 the protocol specification.

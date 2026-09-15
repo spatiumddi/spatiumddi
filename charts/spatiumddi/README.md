@@ -6,7 +6,7 @@ and Redis via Bitnami subcharts, with optional DNS and DHCP agent
 StatefulSets.
 
 - **Chart type:** application
-- **Registry:** `oci://ghcr.io/spatiumddi/charts/spatiumddi`
+- **Registry:** `oci://ghcr.io/spatiumnorth/charts/spatiumddi`
 - **Versioning:** Each SpatiumDDI release tag (CalVer `YYYY.MM.DD-N`)
   publishes a chart version with leading zeroes stripped so it's a
   valid SemVer 2 identifier — e.g. tag `2026.04.20-1` →
@@ -15,7 +15,7 @@ StatefulSets.
 ## TL;DR
 
 ```bash
-helm install ddi oci://ghcr.io/spatiumddi/charts/spatiumddi \
+helm install ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
   --version 2026.4.20-1 \
   --namespace spatiumddi --create-namespace
 ```
@@ -34,7 +34,7 @@ Default login: **`admin` / `admin`** (forced password change on first login).
 
 ```bash
 # Default install — all-in-one with bundled Postgres + Redis
-helm install ddi oci://ghcr.io/spatiumddi/charts/spatiumddi \
+helm install ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
   --version <CHART_VERSION> \
   --namespace spatiumddi --create-namespace
 ```
@@ -247,13 +247,13 @@ subcharts verbatim — any option those charts accept works here. See:
 | Key | Default | Description |
 |-----|---------|-------------|
 | `dnsAgents.enabled` | `false` |  |
-| `dnsAgents.image.repository` | `ghcr.io/spatiumddi/dns-bind9` | Default image (BIND9 flavor) |
-| `dnsAgents.flavors.powerdns.repository` | `ghcr.io/spatiumddi/dns-powerdns` | Per-flavor image override (issue #127) |
-| `dnsAgents.flavors.technitium.repository` | `ghcr.io/spatiumddi/dns-technitium` | Per-flavor image override |
+| `dnsAgents.image.repository` | `ghcr.io/spatiumnorth/dns-bind9` | Default image (BIND9 flavor) |
+| `dnsAgents.flavors.powerdns.repository` | `ghcr.io/spatiumnorth/dns-powerdns` | Per-flavor image override (issue #127) |
+| `dnsAgents.flavors.technitium.repository` | `ghcr.io/spatiumnorth/dns-technitium` | Per-flavor image override |
 | `dnsAgents.agentKey.existingSecret` | `""` | Carries `DNS_AGENT_KEY` (shared between flavors) |
 | `dnsAgents.servers` | `[]` | One entry → one StatefulSet + Services. `flavor: bind9` (default), `powerdns`, or `technitium` |
 | `dhcpAgents.enabled` | `false` |  |
-| `dhcpAgents.image.repository` | `ghcr.io/spatiumddi/dhcp-kea` |  |
+| `dhcpAgents.image.repository` | `ghcr.io/spatiumnorth/dhcp-kea` |  |
 | `dhcpAgents.agentKey.existingSecret` | `""` | Carries `SPATIUM_AGENT_KEY` |
 | `dhcpAgents.servers` | `[]` |  |
 
@@ -264,7 +264,7 @@ Each server entry accepts `name`, `role`, `group`, `storage.agentState`,
 ## Upgrade
 
 ```bash
-helm upgrade ddi oci://ghcr.io/spatiumddi/charts/spatiumddi \
+helm upgrade ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
   --version <NEW_CHART_VERSION> \
   --namespace spatiumddi --reuse-values
 ```

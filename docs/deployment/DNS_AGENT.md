@@ -14,7 +14,7 @@
 ## Post-#170 architecture (2026-05-14)
 
 The Appliance role (was "Application" pre-#272) + `spatium-supervisor` from
-[#170](https://github.com/spatiumddi/spatiumddi/issues/170)
+[#170](https://github.com/spatiumnorth/spatiumddi/issues/170)
 reshape this document's scope. Read this first; the historical
 sections below describe the pre-#170 agent surface (still
 functional for in-field installs — they keep registering against
@@ -77,9 +77,9 @@ The agent images that ship:
 
 | Image | Processes | Purpose |
 |---|---|---|
-| `ghcr.io/spatiumddi/dns-bind9` | `named` + `spatium-dns-agent` | Authoritative and/or recursive BIND9 |
-| `ghcr.io/spatiumddi/dns-powerdns` | `pdns_server` + `spatium-dns-agent` | Authoritative PowerDNS (LMDB backend) |
-| `ghcr.io/spatiumddi/dns-technitium` | `dotnet DnsServerApp.dll` + `spatium-dns-agent` | Authoritative Technitium DNS Server (v1: primary zones + standard records) |
+| `ghcr.io/spatiumnorth/dns-bind9` | `named` + `spatium-dns-agent` | Authoritative and/or recursive BIND9 |
+| `ghcr.io/spatiumnorth/dns-powerdns` | `pdns_server` + `spatium-dns-agent` | Authoritative PowerDNS (LMDB backend) |
+| `ghcr.io/spatiumnorth/dns-technitium` | `dotnet DnsServerApp.dll` + `spatium-dns-agent` | Authoritative Technitium DNS Server (v1: primary zones + standard records) |
 
 The **agent is the same Python codebase** (`spatium_dns_agent`) in every image; the DNS daemon differs. The agent abstracts daemon specifics internally (symmetric to the control-plane driver, but on the container side).
 
@@ -367,7 +367,7 @@ data out to every server directly.
 
 - A record change enqueues **one `DNSRecordOp` row per enabled
   agent-based server in the group** (`enqueue_record_op` in
-  [`backend/app/services/dns/record_ops.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/services/dns/record_ops.py)).
+  [`backend/app/services/dns/record_ops.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/services/dns/record_ops.py)).
   Each agent pulls its own queued ops via the config long-poll and
   applies them through loopback `nsupdate` against its local daemon.
 - `DNSServer.is_primary` does **not** mean "the only writer" for
@@ -393,7 +393,7 @@ data out to every server directly.
 
 For **agentless** drivers (`windows_dns` plus the cloud-hosted DNS
 drivers — see `AGENTLESS_DRIVERS` in
-[`backend/app/drivers/dns/__init__.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dns/__init__.py))
+[`backend/app/drivers/dns/__init__.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/drivers/dns/__init__.py))
 there is no agent and no loopback `nsupdate`. Here the
 `is_primary=True` server is the **single writer**: `enqueue_record_op`
 detects the agentless driver and applies the op **immediately from the
@@ -425,7 +425,7 @@ them nor manages that transfer.
 
 **Alpine 3.23** for every agent image — *except* `dns-technitium`, which is **not Alpine at all** (see below). Multi-arch: `linux/amd64`, `linux/arm64/v8` via `docker buildx`.
 
-> **`dns-powerdns` carries an LMDB schema guard.** Alpine 3.23 ships pdns 5.0.5 (3.22 shipped 4.9.5), and PowerDNS 5.0 performs an automatic, silent, **irreversible** LMDB schema upgrade (v5 → v6) the first time it opens the database — a read is enough, and there is no opt-out. Afterwards pdns 4.9 cannot open the database at all (`Somehow, we are not at schema version 5. Giving up`). Because the LMDB is persisted on `/var` in every deployment shape, and the appliance A/B slot rollback swaps only the *rootfs*, an upgrade-then-rollback would otherwise leave pdns crash-looping with DNS down and no automatic recovery. [#638](https://github.com/spatiumddi/spatiumddi/issues/638) closed that: the entrypoint runs `spatium-pdns-lmdb-guard snapshot` before the agent spawns `pdns_server`, copying the database aside whenever the pdns major version changed and failing closed if it cannot. **Rolling a PowerDNS node back is therefore a two-step operation — redeploy the old image AND run `spatium-pdns-lmdb-guard restore latest`.** Full mechanics in [DNS_DRIVERS.md §4.9](../drivers/DNS_DRIVERS.md).
+> **`dns-powerdns` carries an LMDB schema guard.** Alpine 3.23 ships pdns 5.0.5 (3.22 shipped 4.9.5), and PowerDNS 5.0 performs an automatic, silent, **irreversible** LMDB schema upgrade (v5 → v6) the first time it opens the database — a read is enough, and there is no opt-out. Afterwards pdns 4.9 cannot open the database at all (`Somehow, we are not at schema version 5. Giving up`). Because the LMDB is persisted on `/var` in every deployment shape, and the appliance A/B slot rollback swaps only the *rootfs*, an upgrade-then-rollback would otherwise leave pdns crash-looping with DNS down and no automatic recovery. [#638](https://github.com/spatiumnorth/spatiumddi/issues/638) closed that: the entrypoint runs `spatium-pdns-lmdb-guard snapshot` before the agent spawns `pdns_server`, copying the database aside whenever the pdns major version changed and failing closed if it cannot. **Rolling a PowerDNS node back is therefore a two-step operation — redeploy the old image AND run `spatium-pdns-lmdb-guard restore latest`.** Full mechanics in [DNS_DRIVERS.md §4.9](../drivers/DNS_DRIVERS.md).
 
 > **Why `dns-technitium` is glibc/Ubuntu-based, not Alpine.** Technitium ships no Alpine package and no binary release assets on GitHub at all (its releases carry notes only, zero attached artifacts — confirmed empirically). The only reproducible, versioned, multi-arch artifact it publishes is its own official Docker image (`technitium/dns-server`, Ubuntu 24.04 + .NET 10 aspnet runtime), so `agent/dns/images/technitium/Dockerfile` builds `FROM` that image and layers the `spatium_dns_agent` wheel on top rather than fetching a build artifact that doesn't exist. The builder stage matches (Debian `python:3.12-slim-bookworm`, not Alpine) since `spatium_dns_agent` depends on `cryptography`, which ships compiled wheels — a musllinux wheel built on Alpine wouldn't load on the Ubuntu-based runtime. The image also explicitly upgrades to the distro's patched `aspnetcore-runtime-10.0` package and deletes the vendored `/usr/share/dotnet` copy the upstream image ships, since Trivy's .NET scanner reads shared-framework directories directly (not `dotnet --list-runtimes`) and would otherwise keep flagging CVEs in files nothing loads.
 
@@ -553,7 +553,7 @@ level. Example added to `docker-compose.yml`:
 
 ```yaml
 dns-bind9-ns1:
-  image: ghcr.io/spatiumddi/dns-bind9:${SPATIUM_VERSION}
+  image: ghcr.io/spatiumnorth/dns-bind9:${SPATIUM_VERSION}
   environment:
     CONTROL_PLANE_URL: http://api:8000
     DNS_AGENT_KEY: ${DNS_AGENT_KEY}
@@ -621,7 +621,7 @@ dns-bind9-ns1:
 |---|---|
 | `agent/dns/images/bind9/Dockerfile` | Alpine + BIND9 + agent, multi-arch. |
 | `agent/dns/images/bind9/entrypoint.sh` | Process-1 entrypoint. |
-| `.github/workflows/build-dns-images.yml` | buildx, amd64+arm64, push to `ghcr.io/spatiumddi/*`. |
+| `.github/workflows/build-dns-images.yml` | buildx, amd64+arm64, push to `ghcr.io/spatiumnorth/*`. |
 
 ### Kubernetes
 

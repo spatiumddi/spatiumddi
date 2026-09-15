@@ -15,12 +15,12 @@ showing off your topology, and general discussion.
 ## 🗣️ GitHub Discussions
 
 For longer-form questions, design ideas, and Q&A you'd like to keep
-searchable: **[Discussions](https://github.com/spatiumddi/spatiumddi/discussions)**.
+searchable: **[Discussions](https://github.com/spatiumnorth/spatiumddi/discussions)**.
 
 ## 🐛 Bugs & feature requests — GitHub Issues
 
 Found a bug or want to request a feature? Open an
-**[issue](https://github.com/spatiumddi/spatiumddi/issues)**. Please include:
+**[issue](https://github.com/spatiumnorth/spatiumddi/issues)**. Please include:
 
 - what you expected vs. what happened,
 - your deployment shape (Docker Compose / Kubernetes / OS appliance),
