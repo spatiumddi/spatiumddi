@@ -61,12 +61,27 @@ the formatter handles the rest.
   cosmetic in principle: those webhooks are `failurePolicy: Fail`, so
   under the new order the CRs are admitted through a webhook that can
   reject them, where previously they were created before it existed.
-  It is nonetheless not a change this makes, for a specific reason
-  rather than a general one — the metallb chart is never installed by
-  this CLI. It is baked by `bake-chart.sh` and installed on the node
-  by helm-controller via klipper-helm, already Helm 4.1.4, so the
-  appliance has been applying the new order all along. Nothing in CI
-  installs it; `charts-render-check.sh` only templates it.
+  Measured against a real k3s v1.36.4+k3s1 cluster rather than reasoned
+  about, and it is not theoretical: a **fresh install of that chart
+  fails under Helm 4 and succeeds under Helm 3**. Same chart, same
+  cluster, same values, apply-only — 3.22.0 exits 0 with both CRs
+  created; 4.3.0 exits 1, reporting that server-side apply failed
+  calling the metallb `ipaddresspoolvalidationwebhook` because the
+  service had `no endpoints available`. The webhook is now registered
+  before the CRs are applied, and its backing controller pod — created
+  moments earlier in the same pass — is not ready yet. **A retry
+  succeeds**: `helm upgrade --install` against the half-applied
+  release exits 0 and creates both CRs once the controller is up.
+  This is nonetheless not a change this PR makes, for a specific
+  reason rather than a general one: **the metallb chart is never
+  installed by this CLI.** `bake-chart.sh` packages it and
+  helm-controller installs it on the node via klipper-helm — already
+  4.1.4 — so the appliance has been on the new order, and on that
+  first-attempt-fails / retry-converges behaviour, since before this
+  branch. helm-controller retries, which is why it converges. Nothing
+  in CI installs it either; `charts-render-check.sh` only templates
+  it. Worth its own issue for the appliance; it is not this pin's to
+  fix, and this pin does not make it worse.
   Also exercised under 4.3.0: `helm lint` + `dependency update` +
   `package` for all three charts (the `bake-chart.sh` and
   `release.yml` path), and an OCI `helm push` + `helm pull`
