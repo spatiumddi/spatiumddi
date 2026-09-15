@@ -25,10 +25,17 @@ the formatter handles the rest.
 ### Changed
 
 - **helm 3.22.0 → 4.3.0 (#1098).** Build-time tool only; nothing
-  ships it. The same five copies move together — `versions.json`
-  plus the Makefile's `alpine/helm` image and the `version:` input
-  in `ci.yml`, `release.yml`, `build-appliance.yml` and
-  `agent-e2e.yml` — and the manifest's `track` becomes `^v4\.`.
+  ships it. The pinned copies move together — `versions.json` plus
+  the Makefile's `alpine/helm` image and the `version:` input in
+  `ci.yml`, `release.yml`, `build-appliance.yml` and `agent-e2e.yml`
+  — and the manifest's `track` becomes `^v4\.`. `docs/DEVELOPMENT.md`
+  joins them as a sixth: its CI-gate table said "Helm 3.21", already
+  stale before this change and wrong at the *major* after it, which
+  would send anyone reproducing CI locally to the wrong binary. It is
+  now spelled as the exact version and enforced by `lint_versions.py`,
+  so it cannot drift again. (That row was stale two further ways, both
+  corrected: "both charts" predates metallb landing as a third, and
+  "six value sets" describes a matrix that is now 14.)
   **This CLOSES a divergence rather than opening one.** `bake-chart.sh`
   packages the chart with THIS binary; on the node, k3s's
   helm-controller spawns `klipper-helm` to install it — and the
@@ -41,11 +48,25 @@ the formatter handles the rest.
   as text. 18 objects differed — but 17 of those also differ between
   two runs of the *same* 3.22.0 binary, because the charts generate
   random credentials, so the control run is what identifies them as
-  noise. Exactly one difference is attributable to Helm 4: a single
-  trailing blank line inside the `frr.conf` string of the
+  noise. Exactly one CONTENT difference is attributable to Helm 4: a
+  single trailing blank line inside the `frr.conf` string of the
   `metallb-bgp-frr-k8s-frr-startup` ConfigMap (227 → 228 bytes),
-  which is inert. Everything else in the textual diff is comment
-  placement and blank lines in the output stream, outside any object.
+  which is inert. The rest of the textual diff is comment placement
+  and blank lines in the output stream, outside any object.
+  **Helm 4 also reorders objects**, which a set-and-content comparison
+  cannot see, so order was checked separately: 12 of the 14 renders
+  emit identical order, and the two metallb ones do not —
+  `IPAddressPool` and `L2Advertisement` move from *before* the two
+  `ValidatingWebhookConfiguration`s to *after* them. That is not
+  cosmetic in principle: those webhooks are `failurePolicy: Fail`, so
+  under the new order the CRs are admitted through a webhook that can
+  reject them, where previously they were created before it existed.
+  It is nonetheless not a change this makes, for a specific reason
+  rather than a general one — the metallb chart is never installed by
+  this CLI. It is baked by `bake-chart.sh` and installed on the node
+  by helm-controller via klipper-helm, already Helm 4.1.4, so the
+  appliance has been applying the new order all along. Nothing in CI
+  installs it; `charts-render-check.sh` only templates it.
   Also exercised under 4.3.0: `helm lint` + `dependency update` +
   `package` for all three charts (the `bake-chart.sh` and
   `release.yml` path), and an OCI `helm push` + `helm pull`
