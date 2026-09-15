@@ -24,6 +24,105 @@ the formatter handles the rest.
 
 ### Changed
 
+- **helm 3.22.0 → 4.3.0 (#1098).** Build-time tool only; nothing
+  ships it. The pinned copies move together — `versions.json` plus
+  the Makefile's `alpine/helm` image and the `version:` input in
+  `ci.yml`, `release.yml`, `build-appliance.yml` and `agent-e2e.yml`
+  — and the manifest's `track` becomes `^v4\.`. `docs/DEVELOPMENT.md`
+  joins them as a sixth: its CI-gate table said "Helm 3.21", already
+  stale before this change and wrong at the *major* after it, which
+  would send anyone reproducing CI locally to the wrong binary. It is
+  now spelled as the exact version and enforced by `lint_versions.py`,
+  so it cannot drift again. (That row was stale two further ways, both
+  corrected: "both charts" predates metallb landing as a third, and
+  "six value sets" describes a matrix that is now 14.)
+  **This CLOSES a divergence rather than opening one.** `bake-chart.sh`
+  packages the chart with THIS binary; on the node, k3s's
+  helm-controller spawns `klipper-helm` to install it — and the
+  pinned `v0.13.3-build20260727` ships **Helm 4.1.4** (verified
+  directly: `helm version --short` in that image). So the appliance
+  has been installing with 4 while CI validated with 3. The CLI
+  major now matches what production actually runs.
+  **The charts render identically.** Both majors were run against the
+  same tree and the 323 rendered objects compared after parsing, not
+  as text. 18 objects differed — but 17 of those also differ between
+  two runs of the *same* 3.22.0 binary, because the charts generate
+  random credentials, so the control run is what identifies them as
+  noise. Exactly one CONTENT difference is attributable to Helm 4: a
+  single trailing blank line inside the `frr.conf` string of the
+  `metallb-bgp-frr-k8s-frr-startup` ConfigMap (227 → 228 bytes),
+  which is inert. The rest of the textual diff is comment placement
+  and blank lines in the output stream, outside any object.
+  **Helm 4 also reorders objects**, which a set-and-content comparison
+  cannot see, so order was checked separately: 12 of the 14 renders
+  emit identical order, and the two metallb ones do not —
+  `IPAddressPool` and `L2Advertisement` move from *before* the two
+  `ValidatingWebhookConfiguration`s to *after* them. That is not
+  cosmetic in principle: those webhooks are `failurePolicy: Fail`, so
+  under the new order the CRs are admitted through a webhook that can
+  reject them, where previously they were created before it existed.
+  Measured against a real k3s v1.36.4+k3s1 cluster rather than reasoned
+  about, and it is not theoretical: a **fresh install of that chart
+  fails under Helm 4 and succeeds under Helm 3**. Same chart, same
+  cluster, same values, apply-only — 3.22.0 exits 0 with both CRs
+  created; 4.3.0 exits 1, reporting that server-side apply failed
+  calling the metallb `ipaddresspoolvalidationwebhook` because the
+  service had `no endpoints available`. The webhook is now registered
+  before the CRs are applied, and its backing controller pod — created
+  moments earlier in the same pass — is not ready yet. **A retry
+  succeeds**: `helm upgrade --install` against the half-applied
+  release exits 0 and creates both CRs once the controller is up.
+  This is nonetheless not a change this PR makes, for a specific
+  reason rather than a general one: **the metallb chart is never
+  installed by this CLI.** `bake-chart.sh` packages it and
+  helm-controller installs it on the node via klipper-helm — already
+  4.1.4 — so the appliance has been on the new order since before this
+  branch. Nothing in CI installs it either; `charts-render-check.sh`
+  only templates it.
+  **A default appliance never reaches the failure at all**, which an
+  arm64 ISO built from this branch and booted confirms rather than
+  assumes: `metallb.enabled` is `false` by default and firstboot
+  renders the HelmChart that way, so the chart produces no
+  `IPAddressPool` and no `L2Advertisement`, the namespace stays empty,
+  and `helm-install-spatium-metallb` completes first time — the release
+  secret is at `v1`, so there was no retry. The ordering bites only
+  where an operator sets a control-plane VIP (#272 multi-node HA),
+  which is what flips metallb on — **and that case is broken today,
+  which setting a VIP on the booted appliance confirmed.** It does not
+  fail once and converge, as this entry previously guessed: it never
+  converges. klipper-helm resolves `SERVER_SIDE=auto` to
+  `--server-side=true`, and every attempt runs `helm uninstall` before
+  `helm install` — so each retry deletes the controller backing the
+  webhook, then reinstalls and applies the CRs while the replacement
+  pod is still starting. Each attempt destroys its own prerequisite.
+  Observed: `CrashLoopBackOff` at 5 restarts after ~5 minutes, no
+  `IPAddressPool`, and the frontend `LoadBalancer` stuck `<pending>`,
+  so the VIP never materialises.
+  **None of that is this pin's doing** and none of it changes with it:
+  klipper-helm ships with the k3s pin (`v1.36.4+k3s1`) and
+  `k3s-images.txt` is generated by `fetch-k3s.sh` rather than tracked,
+  so the appliance has behaved this way since that k3s landed, whichever
+  helm packages the chart. It needs its own issue against the appliance.
+  Also exercised under 4.3.0: `helm lint` + `dependency update` +
+  `package` for all three charts (the `bake-chart.sh` and
+  `release.yml` path), and an OCI `helm push` + `helm pull`
+  round-trip against a throwaway registry, digests matching.
+  **No breaking-change exposure**, re-audited against the tree rather
+  than the changelog: no post-renderers, no plugins, no `--atomic`,
+  no helm `--force`, `registry login` is already domain-only
+  (`ghcr.io`), and all three charts are `apiVersion: v2`, which Helm 4
+  runs unchanged. The flags we do pass — `--set`, `--timeout`,
+  `--kube-version`, `--create-namespace`, `--wait`, `--reuse-values`
+  — are unrenamed. The `helm upgrade` / `uninstall` strings elsewhere
+  in the tree are prose, or commands we print for operators to run
+  with their own helm; those were checked too and use no renamed flag.
+  The one behavioural change is server-side apply, which Helm 4
+  defaults to on **new** installs. The appliance is unaffected — it
+  is already on 4.1.4 — so the only newly-affected path is the single
+  kind `helm install` in `agent-e2e.yml`, and that workflow is
+  path-filtered on itself, so this change exercises it.
+
+
 - **GitHub organization renamed `spatiumddi` → `spatiumnorth`.** The
   project is now `spatiumnorth/spatiumddi`: the org changed, the
   repository name did not, and neither did the product, the PyPI
