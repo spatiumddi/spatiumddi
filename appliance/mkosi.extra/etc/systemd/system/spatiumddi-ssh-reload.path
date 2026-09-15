@@ -1,6 +1,6 @@
 [Unit]
 Description=Watch for SpatiumDDI SSH authorized_keys / sshd config-reload trigger (issue #157)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/157
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/157
 # Skip on the live ISO — managed SSH config isn't part of the installer
 # environment.
 ConditionKernelCommandLine=!boot=live

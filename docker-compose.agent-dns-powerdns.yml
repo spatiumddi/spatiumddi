@@ -37,7 +37,7 @@ name: spatiumddi-agent-dns-powerdns
 
 services:
   dns-powerdns:
-    image: ghcr.io/spatiumddi/dns-powerdns:${SPATIUMDDI_VERSION:-latest}
+    image: ghcr.io/spatiumnorth/dns-powerdns:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
     hostname: ${DNS_HOSTNAME:-dns-powerdns}
     networks:

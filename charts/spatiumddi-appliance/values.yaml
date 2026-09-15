@@ -101,7 +101,7 @@ dnsBind9:
   enabled: false
   priorityClassName: spatium-service  # #983 — see ``priorityClasses`` above
   image:
-    repository: ghcr.io/spatiumddi/dns-bind9
+    repository: ghcr.io/spatiumnorth/dns-bind9
   # Scheduling weight for the serving pod. Requests only, no limits: a
   # request lifts the pod out of BestEffort QoS (cgroup cpu.weight 1, the
   # lowest on the node) so the control plane's bursts cannot starve the
@@ -161,7 +161,7 @@ dnsPowerdns:
   enabled: false
   priorityClassName: spatium-service  # #983 — see ``priorityClasses`` above
   image:
-    repository: ghcr.io/spatiumddi/dns-powerdns
+    repository: ghcr.io/spatiumnorth/dns-powerdns
   # Scheduling weight for the serving pod — see dnsBind9.resources. The
   # three DNS drivers are interchangeable roles on the same node, so they
   # carry the same floor: whichever one the operator assigns must not be
@@ -198,7 +198,7 @@ dnsTechnitium:
   enabled: false
   priorityClassName: spatium-service  # #983 — see ``priorityClasses`` above
   image:
-    repository: ghcr.io/spatiumddi/dns-technitium
+    repository: ghcr.io/spatiumnorth/dns-technitium
   # Scheduling weight for the serving pod — see dnsBind9.resources. The
   # memory request is the same 64Mi floor the other DNS roles carry; it is
   # a scheduling and eviction-ranking floor, not a sizing estimate, and
@@ -238,7 +238,7 @@ dhcpKea:
   enabled: false
   priorityClassName: spatium-service  # #983 — see ``priorityClasses`` above
   image:
-    repository: ghcr.io/spatiumddi/dhcp-kea
+    repository: ghcr.io/spatiumnorth/dhcp-kea
   # Scheduling weight for the DHCP server pod — see dnsBind9.resources.
   # Measured 2026-09-03 on a 5632 MiB / 3 vCPU appliance under a 35k-device
   # DORA ramp: as a BestEffort pod Kea was given 7.5 % of a CPU while the
@@ -289,7 +289,7 @@ lookingGlass:
   enabled: false
   priorityClassName: spatium-service  # #983 — see ``priorityClasses`` above
   image:
-    repository: ghcr.io/spatiumddi/looking-glass
+    repository: ghcr.io/spatiumnorth/looking-glass
   # #965 — a floor, not a measurement. gobgpd holds real BGP sessions with
   # operator routers (#566); as a BestEffort pod it had the lowest CFS
   # weight on the node, and a starved collector misses keepalives until
@@ -393,7 +393,7 @@ supervisor:
   enabled: false
   priorityClassName: spatium-control-plane  # #983 — see ``priorityClasses`` above
   image:
-    repository: ghcr.io/spatiumddi/spatium-supervisor
+    repository: ghcr.io/spatiumnorth/spatium-supervisor
   # #965 — a floor, not a measurement. The supervisor is not a data-plane
   # server, it is what repairs the node: the Wave-E watchdog re-fires
   # apply_role_assignment for a missing service and re-applies a drifted

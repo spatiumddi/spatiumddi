@@ -1,6 +1,6 @@
 [Unit]
 Description=overlay /etc (Phase 8a A/B atomic upgrade — issue #138)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/138
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/138
 DefaultDependencies=no
 # Must mount before any service that reads /etc as configured by the
 # operator. local-fs.target is the standard hand-off point — it waits

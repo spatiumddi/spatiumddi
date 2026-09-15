@@ -1,6 +1,6 @@
 [Unit]
 Description=Prepare SpatiumDDI removable backup disks for the control plane (issue #989)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/989
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/989
 # Pulled in by each removable .mount unit (Wants= + Before=), so it runs
 # AFTER the mount however that mount happened — including a disk plugged
 # in long after the unit was installed, which the apply path never sees.

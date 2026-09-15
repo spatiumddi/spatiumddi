@@ -1138,7 +1138,7 @@ SpatiumDDI supports Windows Server DHCP as an **agentless** backend. Today's imp
 | Bundle push (`/sync`) | ❌ | `READ_ONLY_DRIVERS` — rejected by the API. Windows DHCP is cmdlet-driven, not config-file-driven. |
 | `reload` / `restart` / `validate_config` | ❌ | Not applicable to Windows; raise `NotImplementedError`. |
 
-The driver lives at [`app/drivers/dhcp/windows.py`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/drivers/dhcp/windows.py) (class `WindowsDHCPReadOnlyDriver`). See [DHCP_DRIVERS.md](../drivers/DHCP_DRIVERS.md#4-windows-dhcp-driver-agentless--read-only-path-a) for internals.
+The driver lives at [`app/drivers/dhcp/windows.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/drivers/dhcp/windows.py) (class `WindowsDHCPReadOnlyDriver`). See [DHCP_DRIVERS.md](../drivers/DHCP_DRIVERS.md#4-windows-dhcp-driver-agentless--read-only-path-a) for internals.
 
 ### 15.2 Credentials
 
@@ -1163,7 +1163,7 @@ See [WINDOWS.md](../deployment/WINDOWS.md) for the WinRM + account setup.
 
 ### 15.3 Scheduled lease pull
 
-Scheduled Celery beat task: [`app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases`](https://github.com/spatiumddi/spatiumddi/blob/main/backend/app/tasks/dhcp_pull_leases.py). Beat fires every **10 seconds**; the task gates on platform settings so the UI can change cadence without restarting beat. A 10-second beat tick means operators can configure near-real-time IPAM population from Windows DHCP — the interval is the only knob that limits poll frequency now.
+Scheduled Celery beat task: [`app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/tasks/dhcp_pull_leases.py). Beat fires every **10 seconds**; the task gates on platform settings so the UI can change cadence without restarting beat. A 10-second beat tick means operators can configure near-real-time IPAM population from Windows DHCP — the interval is the only knob that limits poll frequency now.
 
 | Setting | Default | Description |
 |---|---|---|
@@ -1252,7 +1252,7 @@ rule here has been surfaced to an operator, not just silently logged.
   representation back — used to resolve in favour of the `enabled` the
   `GET` supplied and answer `200` while the scope kept handing out
   addresses. A `null` or empty string on either name counts as "not
-  supplied", not as a disagreement.  `422`, [#774](https://github.com/spatiumddi/spatiumddi/issues/774).
+  supplied", not as a disagreement.  `422`, [#774](https://github.com/spatiumnorth/spatiumddi/issues/774).
 
 ### Pools
 
@@ -1661,7 +1661,7 @@ config rendered by the control plane, and passively watches the segment
 for **rogue RAs**. Both live behind the `ipv6.router_advertisements` feature module, which
 ships **disabled** (Settings → Features): it is the one DHCP-adjacent surface
 that ends in something transmitted onto the wire, and a v4-only install has no
-use for it ([#1069](https://github.com/spatiumddi/spatiumddi/issues/1069)).
+use for it ([#1069](https://github.com/spatiumnorth/spatiumddi/issues/1069)).
 
 ### 19.1 RA management (radvd)
 

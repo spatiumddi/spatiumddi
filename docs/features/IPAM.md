@@ -224,7 +224,7 @@ liveness verify + bounded retry**, **stagger auto-tuning** for large fleets, and
 
 Lives behind the `tools.wake_scheduler` feature module, which ships
 **disabled** — it ends in magic packets going out on a schedule, so it is
-opted into ([#1069](https://github.com/spatiumddi/spatiumddi/issues/1069)).
+opted into ([#1069](https://github.com/spatiumnorth/spatiumddi/issues/1069)).
 Enable it under Settings → Features; while it is off the router prefix,
 sidebar entry, and MCP tools all drop out (non-negotiable #14). REST surface is mounted at `/api/v1/wake-scheduler`
 (the Python package is `wol_schedules`; the wire prefix is `wake-scheduler`,
@@ -1179,7 +1179,7 @@ Implementation: `SubnetDomain` junction table; `IPAddress.domain_id` (FK → DNS
 - **Storage**: `oui_vendor(prefix CHAR(6) PRIMARY KEY, vendor_name VARCHAR(255), updated_at TIMESTAMPTZ)`. `prefix` is the first three MAC octets as six *lowercase* hex chars (matches the canonical form `_normalize_mac` already produces).
 - **Incremental diff**: each run SELECTs the current snapshot, classifies incoming rows into `added` / `updated` / `removed` / `unchanged`, and applies only the deltas inside one transaction. A prefix's `updated_at` only bumps when the vendor string actually changes — so the timestamp tracks real IEEE re-assignments, not cron ticks. A failed fetch or parse rolls back to the previous snapshot so lookups never see partial data.
 - **Refresh modal**: the Settings page "Refresh Now" button opens a modal that polls `GET /api/v1/settings/oui/refresh/{task_id}` and renders `Total / Added / Updated / Removed / Unchanged` counters when the task finishes.
-- **User-Agent**: the IEEE edge returns HTTP 418 to clients with the default Python-httpx UA. The fetcher presents as `SpatiumDDI-OUI-Fetcher/1.0 (+https://github.com/spatiumddi/spatiumddi)`.
+- **User-Agent**: the IEEE edge returns HTTP 418 to clients with the default Python-httpx UA. The fetcher presents as `SpatiumDDI-OUI-Fetcher/1.0 (+https://github.com/spatiumnorth/spatiumddi)`.
 - **Display**: MACs render as `aa:bb:cc:dd:ee:ff (Cisco Systems)` in the IP address table and DHCP leases. The IP table's MAC column filter also matches the vendor name so `apple` / `cisco` work when operators know the maker but not the prefix. When OUI is disabled the `vendor` field is simply null on the wire and the UI falls back to the bare MAC.
 
 ---
@@ -1327,7 +1327,7 @@ only in v1 (the DNSBLs are IPv4-centric; IPv6 DNSBL is a future
 enhancement).
 
 Behind the **`security.dnsbl`** feature module, which ships **disabled**
-([#1069](https://github.com/spatiumddi/spatiumddi/issues/1069)): armed, it
+([#1069](https://github.com/spatiumnorth/spatiumddi/issues/1069)): armed, it
 asks public blocklist operators about the operator's own address space, and
 an off-prem call is a choice. It is the outer of two gates — even enabled,
 the subsystem makes **zero external DNS queries** until the operator flips

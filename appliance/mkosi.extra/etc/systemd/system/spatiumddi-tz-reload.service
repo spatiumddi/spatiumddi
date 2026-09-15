@@ -1,6 +1,6 @@
 [Unit]
 Description=Apply pending SpatiumDDI timezone change (issue #165)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/165
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/165
 # Defensive ordering — the runner calls ``timedatectl`` which needs
 # systemd-timedated. /var/lib/spatiumddi/release-state (the trigger
 # location) isn't available until local-fs.target. The /etc overlay

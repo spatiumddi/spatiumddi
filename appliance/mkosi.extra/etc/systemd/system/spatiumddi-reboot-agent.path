@@ -1,6 +1,6 @@
 [Unit]
 Description=Watch for SpatiumDDI fleet-reboot trigger (Phase 8f-8)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/138
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/138
 # Skip on the live ISO — the trigger is meaningful only on installed
 # appliances. The live image's container compose doesn't write here.
 ConditionKernelCommandLine=!boot=live

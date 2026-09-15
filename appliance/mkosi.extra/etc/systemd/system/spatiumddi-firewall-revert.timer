@@ -1,6 +1,6 @@
 [Unit]
 Description=Auto-revert un-confirmed SpatiumDDI firewall test-apply (issue #285 Phase 2c)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/285
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/285
 # Don't run in the live installer environment.
 ConditionKernelCommandLine=!boot=live
 

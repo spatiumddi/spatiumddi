@@ -303,7 +303,7 @@ def test_syslog_ca_blob_cannot_escape_the_managed_dir(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------
 PRUNE_MARKER = 'python3 - "$SLOT_VERSIONS" "$IMAGES_JSON"'
 
-_SP = "ghcr.io/spatiumddi/"
+_SP = "ghcr.io/spatiumnorth/"
 
 
 def _run_prune(tmp_path: Path, images: dict, slots: dict) -> subprocess.CompletedProcess[str]:

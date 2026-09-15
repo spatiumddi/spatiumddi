@@ -114,7 +114,7 @@ jobs:
     # Forks inherit this workflow (#830); never run the publisher outside
     # the canonical repo. Every other job needs this one, so the guard
     # cascades.
-    if: github.repository_owner == 'spatiumddi'
+    if: github.repository_owner == 'spatiumnorth'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -749,20 +749,29 @@ jobs:
         # A nightly that fails silently is worth nothing — that is the whole
         # reason for a scheduled build. One issue, reused, so a broken week
         # doesn't open seven.
+        # #1094 — the dry-run guard every sibling side-effecting step
+        # carries, and which this one did not. A dry run publishes
+        # nothing and prunes nothing, so a dry run that FAILS means a
+        # candidate build failed — the dry run doing its job — not that
+        # the nightly is broken. Filing that on the reused tracker
+        # re-opens it for a build that is fine and points whoever picks
+        # it up at the wrong branch.
         if: >-
-          needs.gate.result == 'failure' ||
-          needs.images.result == 'failure' ||
-          needs.appliance.result == 'failure' ||
-          needs['appliance-publish'].result == 'failure' ||
-          needs.prune.result == 'failure' ||
-          needs['prune-releases'].result == 'failure'
+          github.event.inputs.dry_run != 'true' && (
+            needs.gate.result == 'failure' ||
+            needs.images.result == 'failure' ||
+            needs.appliance.result == 'failure' ||
+            needs['appliance-publish'].result == 'failure' ||
+            needs.prune.result == 'failure' ||
+            needs['prune-releases'].result == 'failure'
+          )
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}  # no checkout in this job — see above
         run: |
           set -euo pipefail
           TITLE="Nightly build failing"
-          BODY="Nightly build failed on \`main\` @ \`${GITHUB_SHA::12}\`.
+          BODY="Nightly build failed on \`${GITHUB_REF_NAME}\` @ \`${GITHUB_SHA::12}\`.
 
           - gate: ${{ needs.gate.result }}
           - images: ${{ needs.images.result }}

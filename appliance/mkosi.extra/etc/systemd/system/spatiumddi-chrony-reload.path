@@ -1,6 +1,6 @@
 [Unit]
 Description=Watch for SpatiumDDI chrony config-reload trigger (issue #154)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/154
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/154
 # Skip on the live ISO — installer environment doesn't drive chrony
 # configs through SpatiumDDI.
 ConditionKernelCommandLine=!boot=live

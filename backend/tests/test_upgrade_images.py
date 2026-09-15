@@ -63,7 +63,7 @@ def _release(tag: str, *, assets: list[dict]) -> dict:
         "name": tag,
         "prerelease": False,
         "published_at": "2026-05-14T00:00:00Z",
-        "html_url": f"https://github.com/spatiumddi/spatiumddi/releases/tag/{tag}",
+        "html_url": f"https://github.com/spatiumnorth/spatiumddi/releases/tag/{tag}",
         "assets": assets,
     }
 

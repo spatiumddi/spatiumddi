@@ -37,7 +37,7 @@ import { SupportBundleSection } from "./SupportBundleSection";
  */
 
 const GITHUB_NEW_ISSUE_URL =
-  "https://github.com/spatiumddi/spatiumddi/issues/new";
+  "https://github.com/spatiumnorth/spatiumddi/issues/new";
 
 // GitHub's ``/issues/new?body=`` query param works up to roughly 7 KB
 // before the URL is rejected. Anything bigger we drop on the

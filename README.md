@@ -6,20 +6,21 @@
 
 <p align="center">
   <strong>Self-hosted DNS, DHCP, and IPAM — one control plane, real servers underneath.</strong><br/>
-  A modern, open-source alternative to commercial DDI platforms.
+  A modern, open-source alternative to commercial DDI platforms.<br/>
+  Built in the open by <a href="https://www.spatiumnorth.com">SpatiumNorth</a>, Montréal.
 </p>
 
 <p align="center">
-  <a href="https://github.com/spatiumddi/spatiumddi/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/spatiumddi/spatiumddi/ci.yml?branch=main&label=CI" alt="CI"/></a>
-  <a href="https://github.com/spatiumddi/spatiumddi/security/code-scanning"><img src="https://img.shields.io/badge/security-CodeQL-1f6feb" alt="CodeQL"/></a>
-  <a href="https://github.com/spatiumddi/spatiumddi/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"/></a>
+  <a href="https://github.com/spatiumnorth/spatiumddi/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/spatiumnorth/spatiumddi/ci.yml?branch=main&label=CI" alt="CI"/></a>
+  <a href="https://github.com/spatiumnorth/spatiumddi/security/code-scanning"><img src="https://img.shields.io/badge/security-CodeQL-1f6feb" alt="CodeQL"/></a>
+  <a href="https://github.com/spatiumnorth/spatiumddi/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"/></a>
   <a href="https://www.spatiumddi.com"><img src="https://img.shields.io/badge/docs-spatiumddi.com-informational" alt="Docs"/></a>
   <img src="https://img.shields.io/badge/status-beta-blue" alt="Status"/>
 </p>
 
 <p align="center">
-  <a href="https://github.com/spatiumddi/spatiumddi/releases/latest"><img src="https://img.shields.io/github/v/release/spatiumddi/spatiumddi?label=release" alt="Latest release"/></a>
-  <a href="https://github.com/spatiumddi/spatiumddi/commits/main"><img src="https://img.shields.io/github/last-commit/spatiumddi/spatiumddi" alt="Last commit"/></a>
+  <a href="https://github.com/spatiumnorth/spatiumddi/releases/latest"><img src="https://img.shields.io/github/v/release/spatiumnorth/spatiumddi?label=release" alt="Latest release"/></a>
+  <a href="https://github.com/spatiumnorth/spatiumddi/commits/main"><img src="https://img.shields.io/github/last-commit/spatiumnorth/spatiumddi" alt="Last commit"/></a>
   <img src="https://img.shields.io/maintenance/yes/2026" alt="Maintained"/>
 </p>
 
@@ -33,10 +34,10 @@
 
 <p align="center">
   <a href="https://discord.com/invite/ANJAnvg2Dd"><img src="https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&logoColor=white" alt="Discord"/></a>
-  <a href="https://github.com/spatiumddi/spatiumddi/stargazers"><img src="https://img.shields.io/github/stars/spatiumddi/spatiumddi?style=social" alt="Stars"/></a>
-  <a href="https://github.com/spatiumddi/spatiumddi/discussions"><img src="https://img.shields.io/github/discussions/spatiumddi/spatiumddi" alt="Discussions"/></a>
-  <a href="https://github.com/spatiumddi/spatiumddi/graphs/contributors"><img src="https://img.shields.io/github/contributors/spatiumddi/spatiumddi" alt="Contributors"/></a>
-  <a href="https://github.com/spatiumddi/spatiumddi/issues"><img src="https://img.shields.io/github/issues/spatiumddi/spatiumddi" alt="Issues"/></a>
+  <a href="https://github.com/spatiumnorth/spatiumddi/stargazers"><img src="https://img.shields.io/github/stars/spatiumnorth/spatiumddi?style=social" alt="Stars"/></a>
+  <a href="https://github.com/spatiumnorth/spatiumddi/discussions"><img src="https://img.shields.io/github/discussions/spatiumnorth/spatiumddi" alt="Discussions"/></a>
+  <a href="https://github.com/spatiumnorth/spatiumddi/graphs/contributors"><img src="https://img.shields.io/github/contributors/spatiumnorth/spatiumddi" alt="Contributors"/></a>
+  <a href="https://github.com/spatiumnorth/spatiumddi/issues"><img src="https://img.shields.io/github/issues/spatiumnorth/spatiumddi" alt="Issues"/></a>
 </p>
 
 ---
@@ -48,6 +49,7 @@
 ## Contents
 
 - [Why I built this](#why-i-built-this) — the story
+- [About SpatiumNorth](#about-spatiumnorth) — the company behind it
 - [Why SpatiumDDI](#why-spatiumddi) — the elevator pitch
 - [Privacy: your data stays yours](#privacy-your-data-stays-yours) — no telemetry, no analytics, no phone-home
 - [Support the project](#support-the-project) — sponsors, tip jar, getting involved
@@ -76,9 +78,13 @@ The open source world has excellent standalone tools — NetBox for IPAM, BIND9 
 
 If SpatiumDDI ends up being useful to you, that's the whole point. If you want to file an issue, send a PR, or just tell me what's broken, I'd genuinely appreciate it.
 
+## About SpatiumNorth
+
+SpatiumDDI is built by [SpatiumNorth](https://www.spatiumnorth.com), a Montréal-based software company that builds infrastructure software in the open. The whole product ships under Apache 2.0 — every feature, free wherever you run it — and the company charges for the part that actually costs something: support, deployment and migration, from the people who wrote the code. If your organization wants that, see [pricing](https://www.spatiumnorth.com/spatiumddi/pricing) or [get in touch](https://www.spatiumnorth.com/contact); managed service providers can [partner](https://www.spatiumnorth.com/spatiumddi/partners) to run it for their clients. The code lives here, in the open, as it always has.
+
 ## Support the project
 
-SpatiumDDI is built on nights and weekends with no commercial backing — every release ships off my own time, my own homelab hardware, and a steady supply of chocolate. If the project is saving your team work, or you just want to keep me building, there are a few ways to chip in. Anything is genuinely appreciated and goes straight back into the hardware-to-test-against fund.
+SpatiumDDI started on nights and weekends and homelab hardware, and the software is free and stays free. If it's saving your team work and you want to chip in, there are two ways, depending on who you are.
 
 **Individuals** — small tips help cover the boring stuff (a domain, a homelab SSD, the occasional cloud VM I spin up to test a deploy topology I don't have locally). No tier system, no perks list, no obligation — just a "thanks, here's a coffee" button if the project saved you an afternoon. Every contribution is genuinely appreciated.
 
@@ -86,7 +92,7 @@ SpatiumDDI is built on nights and weekends with no commercial backing — every 
   <a href="https://buymeacoffee.com/mzac"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?logo=buy-me-a-coffee&logoColor=000000" alt="Buy me a coffee" /></a>
 </p>
 
-**Organizations** — if your team is running SpatiumDDI in production and you'd like to sponsor specific features, get priority on bug reports, or just say hi, [open an issue](https://github.com/spatiumddi/spatiumddi/issues/new) or reach out directly. Happy to talk.
+**Organizations** — if your team runs SpatiumDDI in production, the way to back the project is the support your operators will want anyway: that's what [SpatiumNorth](https://www.spatiumnorth.com) sells — support, deployment and migration from the people who wrote the code. See [pricing](https://www.spatiumnorth.com/spatiumddi/pricing) or [contact us](https://www.spatiumnorth.com/contact). Want to sponsor a specific feature or just say hi? Still happy to talk — [open an issue](https://github.com/spatiumnorth/spatiumddi/issues/new).
 
 ## Why SpatiumDDI
 
@@ -326,7 +332,7 @@ The tables above are the elevator pitch. The bullets here are the same surface w
     - **Technitium ships in two shapes** — `technitium` is the container SpatiumDDI deploys and an agent drives over loopback; `technitium_api` is *agentless*, for an install the operator already runs, driven straight from the control plane over its HTTP API with nothing deployed. Zone and record CRUD plus topology pull on the agentless one; DNSSEC, encrypted transports, forwarders and blocklists stay agent-managed. A group is single-driver, so the two live in separate groups
     - Windows DNS, agentless Technitium and the eight cloud providers are agentless drivers behind the same abstraction — all nine credentialed ones now answer a **Test Connection** probe on a saved server, so "did that token work?" no longer means waiting for a sync to fail
   - Per-server zone-serial drift reporting
-  - **Record-level drift report** — per zone, AXFR the live zone from every server in the group and diff it against the database: *extra on server* (someone edited the host by hand), *missing on server* (a change never landed), *in sync*. Strictly read-only — it never applies anything, and the Sync path stays the way you push. A changed value shows as a missing+extra pair, because the diff key includes the value. Split-horizon zones carry a caveat banner: a transfer is addressed by zone *name*, so the server answers from whichever view matches the control plane's source address. **Driver coverage: every driver except PowerDNS**, which implements no record pull at all. Windows Path B, the cloud drivers and agentless Technitium (`technitium_api`) pull over an API; agent-managed BIND9 and Technitium use a TSIG-signed AXFR, because their agents grant transfer to the group's key rather than to an address ([#734](https://github.com/spatiumddi/spatiumddi/issues/734)) — a group with no TSIG key reports that rather than a bare refusal
+  - **Record-level drift report** — per zone, AXFR the live zone from every server in the group and diff it against the database: *extra on server* (someone edited the host by hand), *missing on server* (a change never landed), *in sync*. Strictly read-only — it never applies anything, and the Sync path stays the way you push. A changed value shows as a missing+extra pair, because the diff key includes the value. Split-horizon zones carry a caveat banner: a transfer is addressed by zone *name*, so the server answers from whichever view matches the control plane's source address. **Driver coverage: every driver except PowerDNS**, which implements no record pull at all. Windows Path B, the cloud drivers and agentless Technitium (`technitium_api`) pull over an API; agent-managed BIND9 and Technitium use a TSIG-signed AXFR, because their agents grant transfer to the group's key rather than to an address ([#734](https://github.com/spatiumnorth/spatiumddi/issues/734)) — a group with no TSIG key reports that rather than a bare refusal
   - **PowerDNS-only record types** — synthesised at query time by `pdns_server`, so they have no BIND9 equivalent:
     - **ALIAS** — an apex CNAME-equivalent. Lets `example.com` itself point at a cloud load balancer's hostname, which a real CNAME can't do at the apex without breaking the SOA / NS rrset
     - **LUA** — scripted answers (health-aware, client-aware, arithmetic). **Security boundary worth stating plainly:** LUA record scripts execute inside the `pdns_server` process, so anyone who can author one has code execution in your DNS daemon. Authoring is gated on the usual DNS write permission — scope that permission accordingly, and treat it as more privileged than authoring an A record
@@ -834,7 +840,7 @@ The driver abstraction is backend-neutral — services speak to `DNSDriver` / `D
 
 ### Try the demo in GitHub Codespaces
 
-[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/spatiumddi/spatiumddi)
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/spatiumnorth/spatiumddi)
 
 One click brings up a full SpatiumDDI stack in a fresh Codespace, builds the images from `main`, runs migrations, and seeds realistic IPAM / DNS / DHCP / network-modeling demo data so every screen has something to look at. Sign in with **`admin / admin`**.
 
@@ -899,7 +905,7 @@ Operators get a real Kubernetes node without managing one.
 #### Get the ISO
 
 - **Pre-built:** grab the ISO for your architecture from the
-  [latest release](https://github.com/spatiumddi/spatiumddi/releases):
+  [latest release](https://github.com/spatiumnorth/spatiumddi/releases):
 
   | Architecture | ISO | Firmware |
   |---|---|---|
@@ -1074,7 +1080,7 @@ label, so promoting a DNS-only appliance never accidentally
 schedules Postgres onto it.
 
 > Multi-node HA shipped in
-> [#272](https://github.com/spatiumddi/spatiumddi/issues/272);
+> [#272](https://github.com/spatiumnorth/spatiumddi/issues/272);
 > the live shake-out validated a 1 → 3 promote end-to-end. See
 > [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md)
 > for the architecture + the
@@ -1166,8 +1172,8 @@ spatiumddi-firstboot` shows the first-boot setup log; `kubectl
 -n spatium logs <pod>` for any pod's stdout/stderr.
 
 > The appliance is beta — see issue
-> [#134](https://github.com/spatiumddi/spatiumddi/issues/134)
-> + [#183](https://github.com/spatiumddi/spatiumddi/issues/183)
+> [#134](https://github.com/spatiumnorth/spatiumddi/issues/134)
+> + [#183](https://github.com/spatiumnorth/spatiumddi/issues/183)
 > for the roadmap and
 > [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md)
 > for the full design, build pipeline, k3s architecture, and
@@ -1182,7 +1188,7 @@ want full control of the OS, or environments where Kubernetes
 overhead is unwanted.
 
 ```bash
-git clone https://github.com/spatiumddi/spatiumddi.git
+git clone https://github.com/spatiumnorth/spatiumddi.git
 cd spatiumddi
 cp .env.example .env
 # Required env vars in .env:
@@ -1337,7 +1343,7 @@ The FastAPI backend auto-generates OpenAPI / Swagger:
 **The same document is attached to every release** as `openapi.json`, so an out-of-repo client can generate against an exact server version instead of whatever `main` happens to be:
 
 ```bash
-curl -LO https://github.com/spatiumddi/spatiumddi/releases/download/<tag>/openapi.json
+curl -LO https://github.com/spatiumnorth/spatiumddi/releases/download/<tag>/openapi.json
 make openapi VERSION=<tag>     # reproduces the identical bytes locally
 ```
 
@@ -1378,9 +1384,9 @@ EOF
 | Method | Use case | Status |
 |---|---|---|
 | **Docker Compose** | Dev, small single-host production | ✅ Supported |
-| **Kubernetes + Helm** | Multi-node production, scalable | ✅ Umbrella chart (`charts/spatiumddi`, published OCI to `ghcr.io/spatiumddi/charts/spatiumddi`). See [`docs/deployment/KUBERNETES.md`](docs/deployment/KUBERNETES.md) |
+| **Kubernetes + Helm** | Multi-node production, scalable | ✅ Umbrella chart (`charts/spatiumddi`, published OCI to `ghcr.io/spatiumnorth/charts/spatiumddi`). See [`docs/deployment/KUBERNETES.md`](docs/deployment/KUBERNETES.md) |
 | **Bare metal / VM (Ansible)** | On-prem without containers | 📋 Planned — no Ansible playbooks yet. For bare-metal today use Docker Compose on a host or the OS appliance: see [`docs/deployment/BAREMETAL.md`](docs/deployment/BAREMETAL.md) |
-| **OS Appliance (ISO / qcow2)** | Easiest deploy, air-gapped, dedicated `/appliance` management hub | 🔄 Beta — Debian 13 + embedded [k3s](https://k3s.io/) + full stack as HelmChart CRs, hybrid USB/CD, installer wizard, atomic A/B slot upgrades, in-UI TLS / releases / pods / logs / diagnostics / maintenance. Build with `make appliance-dev-iso`. See [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md) + issues [#134](https://github.com/spatiumddi/spatiumddi/issues/134) / [#183](https://github.com/spatiumddi/spatiumddi/issues/183) |
+| **OS Appliance (ISO / qcow2)** | Easiest deploy, air-gapped, dedicated `/appliance` management hub | 🔄 Beta — Debian 13 + embedded [k3s](https://k3s.io/) + full stack as HelmChart CRs, hybrid USB/CD, installer wizard, atomic A/B slot upgrades, in-UI TLS / releases / pods / logs / diagnostics / maintenance. Build with `make appliance-dev-iso`. See [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md) + issues [#134](https://github.com/spatiumnorth/spatiumddi/issues/134) / [#183](https://github.com/spatiumnorth/spatiumddi/issues/183) |
 
 ---
 
@@ -1440,8 +1446,8 @@ See [CHANGELOG.md](CHANGELOG.md) for the per-release feature list and
 Contributions are welcome.
 
 - Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR
-- Good first tasks are tagged on the [issue tracker](https://github.com/spatiumddi/spatiumddi/issues)
-- Design discussion happens in [GitHub Discussions](https://github.com/spatiumddi/spatiumddi/discussions)
+- Good first tasks are tagged on the [issue tracker](https://github.com/spatiumnorth/spatiumddi/issues)
+- Design discussion happens in [GitHub Discussions](https://github.com/spatiumnorth/spatiumddi/discussions)
 
 ---
 
@@ -1458,7 +1464,7 @@ Thanks to everyone who has opened a pull request against SpatiumDDI.
 | <img src="https://github.com/waza-ari.png" width="48" alt=""> | [@waza-ari](https://github.com/waza-ari) | Agentless FortiGate cloud DHCP driver |
 
 Opened a PR and not listed? That is an oversight, not a judgement — please
-say so on the [issue tracker](https://github.com/spatiumddi/spatiumddi/issues)
+say so on the [issue tracker](https://github.com/spatiumnorth/spatiumddi/issues)
 and it will be fixed. This list is maintained by hand, so it is added to as
 part of merging each contributor's first PR.
 
@@ -1473,5 +1479,5 @@ Bundled components (BIND9, PowerDNS, Technitium, ISC Kea, k3s, and the appliance
 ---
 
 <p align="center">
-  Built with ❤️ by the SpatiumDDI community · <a href="https://www.spatiumddi.com">www.spatiumddi.com</a>
+  Built with ❤️ by <a href="https://www.spatiumnorth.com">SpatiumNorth</a> and the SpatiumDDI community · <a href="https://www.spatiumddi.com">docs</a> · <a href="https://www.spatiumnorth.com">spatiumnorth.com</a>
 </p>

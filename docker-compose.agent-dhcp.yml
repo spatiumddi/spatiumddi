@@ -33,7 +33,7 @@ services:
 
   # ── DHCP agent (primary) ──────────────────────────────────────────
   dhcp-kea:
-    image: ghcr.io/spatiumddi/dhcp-kea:${SPATIUMDDI_VERSION:-latest}
+    image: ghcr.io/spatiumnorth/dhcp-kea:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
     hostname: ${DHCP_HOSTNAME:-dhcp-kea}
     networks:
@@ -94,7 +94,7 @@ services:
   # set to the peer name, not this profile.
   dhcp-kea-2:
     profiles: ["dhcp-ha"]
-    image: ghcr.io/spatiumddi/dhcp-kea:${SPATIUMDDI_VERSION:-latest}
+    image: ghcr.io/spatiumnorth/dhcp-kea:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
     hostname: ${DHCP_HOSTNAME_2:-dhcp-kea-2}
     networks:

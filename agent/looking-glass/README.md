@@ -1,7 +1,7 @@
 # spatium-lg-agent
 
 Sidecar agent baked into the SpatiumDDI managed GoBGP Looking Glass
-collector container image (`ghcr.io/spatiumddi/looking-glass`).
+collector container image (`ghcr.io/spatiumnorth/looking-glass`).
 
 The BGP Looking Glass collector is a **receive-only** BGP speaker: it
 peers passively with the operator's edge/core routers, accepts their

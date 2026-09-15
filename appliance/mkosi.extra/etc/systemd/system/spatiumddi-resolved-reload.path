@@ -1,6 +1,6 @@
 [Unit]
 Description=Watch for SpatiumDDI systemd-resolved config-reload trigger (issue #158)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/158
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/158
 # Skip on the live ISO — resolver override isn't part of the installer
 # environment.
 ConditionKernelCommandLine=!boot=live

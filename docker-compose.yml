@@ -37,7 +37,7 @@ services:
 
   # ── API Backend ─────────────────────────────────────────────────────────────
   api:
-    image: ghcr.io/spatiumddi/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
+    image: ghcr.io/spatiumnorth/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
     networks:
       - spatiumddi
@@ -121,7 +121,7 @@ services:
 
   # ── Celery Worker ───────────────────────────────────────────────────────────
   worker:
-    image: ghcr.io/spatiumddi/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
+    image: ghcr.io/spatiumnorth/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
     networks:
       - spatiumddi
@@ -180,7 +180,7 @@ services:
 
   # ── Celery Beat (Scheduler) ─────────────────────────────────────────────────
   beat:
-    image: ghcr.io/spatiumddi/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
+    image: ghcr.io/spatiumnorth/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
     networks:
       - spatiumddi
@@ -207,7 +207,7 @@ services:
 
   # ── Frontend (nginx + Vite build) ───────────────────────────────────────────
   frontend:
-    image: ghcr.io/spatiumddi/spatiumddi-frontend:${SPATIUMDDI_VERSION:-latest}
+    image: ghcr.io/spatiumnorth/spatiumddi-frontend:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
     networks:
       - spatiumddi
@@ -218,7 +218,7 @@ services:
 
   # ── Migrations (runs once at startup) ──────────────────────────────────────
   migrate:
-    image: ghcr.io/spatiumddi/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
+    image: ghcr.io/spatiumnorth/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
     networks:
       - spatiumddi
     command: alembic upgrade head
@@ -237,7 +237,7 @@ services:
   # opt into the new ``dns-powerdns`` profile below.
   dns-bind9:
     profiles: ["dns", "dns-bind9"]
-    image: ghcr.io/spatiumddi/dns-bind9:${SPATIUMDDI_VERSION:-latest}
+    image: ghcr.io/spatiumnorth/dns-bind9:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
     networks:
       - spatiumddi
@@ -271,7 +271,7 @@ services:
   # AGENT_GROUP) but is unusual outside of dev / migration scenarios.
   dns-powerdns:
     profiles: ["dns-powerdns"]
-    image: ghcr.io/spatiumddi/dns-powerdns:${SPATIUMDDI_VERSION:-latest}
+    image: ghcr.io/spatiumnorth/dns-powerdns:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
     networks:
       - spatiumddi
@@ -303,7 +303,7 @@ services:
   # caller (same trust boundary as PowerDNS's local API key).
   dns-technitium:
     profiles: ["dns-technitium"]
-    image: ghcr.io/spatiumddi/dns-technitium:${SPATIUMDDI_VERSION:-latest}
+    image: ghcr.io/spatiumnorth/dns-technitium:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
     networks:
       - spatiumddi
@@ -339,7 +339,7 @@ services:
   # front is a plain pass-through (safe no-op); pdns keeps answering on :53.
   dns-dnsdist:
     profiles: ["dns-powerdns-with-dnsdist"]
-    image: ghcr.io/spatiumddi/dns-dnsdist:${SPATIUMDDI_VERSION:-latest}
+    image: ghcr.io/spatiumnorth/dns-dnsdist:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
     networks:
       - spatiumddi
@@ -366,7 +366,7 @@ services:
   #   docker compose --profile dhcp --profile dhcp-ha up -d       # HA pair
   dhcp-kea:
     profiles: ["dhcp"]
-    image: ghcr.io/spatiumddi/dhcp-kea:${SPATIUMDDI_VERSION:-latest}
+    image: ghcr.io/spatiumnorth/dhcp-kea:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
     networks:
       - spatiumddi
@@ -438,7 +438,7 @@ services:
   #   secondary_peer_url: http://dhcp-kea-2:8000/
   dhcp-kea-2:
     profiles: ["dhcp-ha"]
-    image: ghcr.io/spatiumddi/dhcp-kea:${SPATIUMDDI_VERSION:-latest}
+    image: ghcr.io/spatiumnorth/dhcp-kea:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
     networks:
       - spatiumddi
@@ -480,7 +480,7 @@ services:
   # docker-compose.agent-looking-glass.yml instead.
   looking-glass:
     profiles: ["looking-glass"]
-    image: ghcr.io/spatiumddi/looking-glass:${SPATIUMDDI_VERSION:-latest}
+    image: ghcr.io/spatiumnorth/looking-glass:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
     hostname: ${LG_HOSTNAME:-looking-glass}
     # BGP needs the host's real routable interface — a router has no route

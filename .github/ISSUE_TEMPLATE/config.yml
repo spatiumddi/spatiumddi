@@ -4,5 +4,5 @@ contact_links:
     url: https://www.spatiumddi.com/
     about: Feature specs, API reference, and deployment guides
   - name: Security vulnerability
-    url: https://github.com/spatiumddi/spatiumddi/security/advisories/new
+    url: https://github.com/spatiumnorth/spatiumddi/security/advisories/new
     about: Report security issues privately via GitHub Security Advisories

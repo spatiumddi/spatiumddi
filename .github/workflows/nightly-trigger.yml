@@ -58,7 +58,7 @@ jobs:
     name: Wait for the Eastern target, then start the nightly
     # Forks inherit this workflow (#830); never dispatch the publisher
     # outside the canonical repo.
-    if: github.repository_owner == 'spatiumddi'
+    if: github.repository_owner == 'spatiumnorth'
     runs-on: ubuntu-latest
     # MAX_HOP plus a generous margin; never the 6 h ceiling.
     timeout-minutes: 340
