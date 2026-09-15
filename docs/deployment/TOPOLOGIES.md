@@ -11,7 +11,7 @@
 For the per-platform install steps, see:
 
 - [`DOCKER.md`](DOCKER.md) — Docker Compose deployment recipes
-- [`../../k8s/README.md`](https://github.com/spatiumddi/spatiumddi/blob/main/k8s/README.md) — Kubernetes manifests + Helm chart
+- [`../../k8s/README.md`](https://github.com/spatiumnorth/spatiumddi/blob/main/k8s/README.md) — Kubernetes manifests + Helm chart
 - [`DNS_AGENT.md`](DNS_AGENT.md) — DNS-agent protocol details
 - [`APPLIANCE.md`](APPLIANCE.md) — OS appliance image
 - [`WINDOWS.md`](WINDOWS.md) — Windows Server-side checklist (WinRM / DnsAdmins / DHCP Users)
@@ -109,7 +109,7 @@ its PSK for a rotating JWT, then long-polls forever. See
 > Pairing` — no hex key to copy. The agent's supervisor registers, the
 > operator approves it on `/appliance → Fleet`, and roles are assigned
 > from the UI. See the README's
-> ["Joining DNS / DHCP agents"](https://github.com/spatiumddi/spatiumddi/blob/main/README.md#joining-dns--dhcp-agents)
+> ["Joining DNS / DHCP agents"](https://github.com/spatiumnorth/spatiumddi/blob/main/README.md#joining-dns--dhcp-agents)
 > section + [`APPLIANCE.md`](APPLIANCE.md).
 
 ---
@@ -261,7 +261,7 @@ dhcpAgents.enabled: true        # spawns the kea StatefulSet (group-centric HA)
 
 Beat is always a single-replica singleton — there's no toggle for it.
 
-See [`../../k8s/README.md`](https://github.com/spatiumddi/spatiumddi/blob/main/k8s/README.md) for the Helm-vs-raw-manifest
+See [`../../k8s/README.md`](https://github.com/spatiumnorth/spatiumddi/blob/main/k8s/README.md) for the Helm-vs-raw-manifest
 walkthrough, the RWX PVC overlay needed for `local_volume` backup
 targets, and the upgrade-flow recipe.
 
@@ -324,7 +324,7 @@ recommended HA path for operators who installed from the ISO.
 CNPG fails over to a replica, the MetalLB VIP re-homes to a surviving
 node, the UI stays up on the same address. Bring the node back, or
 replace it — operator-driven dead-node replacement is the Phase 9
-follow-up tracked on [#272](https://github.com/spatiumddi/spatiumddi/issues/272).
+follow-up tracked on [#272](https://github.com/spatiumnorth/spatiumddi/issues/272).
 
 **Demote / teardown:** demoting members in the Fleet UI reverses the
 scale (the etcd seed can't be demoted; demoting to an even count is
@@ -336,7 +336,7 @@ cluster member — demote it first.
 read-scale / cross-region shapes the appliance doesn't bundle. Topology 7
 is the "I want HA without becoming a Postgres + Kubernetes operator"
 answer. Full design + the live shake-out log live in
-[issue #272](https://github.com/spatiumddi/spatiumddi/issues/272);
+[issue #272](https://github.com/spatiumnorth/spatiumddi/issues/272);
 the appliance internals are in [`APPLIANCE.md`](APPLIANCE.md#control-plane-high-availability-272).
 
 ---
@@ -377,11 +377,11 @@ Replacing a BIND9 group with a PowerDNS group on the same zones is a four-step r
 
 **3. Promote PowerDNS to primary.** In the UI, edit each zone and switch its `group_id` to the PowerDNS group, then flip its `zone_type` from `secondary` back to `primary` (which clears the `masters` pointer). The control plane: (a) write-through-PATCHes the zone to PowerDNS as primary, (b) creates the primary entry, (c) rebuilds the SOA. BIND can stay on the zone as a plain secondary (read-only, with its `masters` now pointing at PowerDNS) for a soft cutover, or be removed entirely. DDNS / IPAM auto-sync continue uninterrupted because they target the zone by ID, not by driver.
 
-**4. Sign zones (optional).** With the zones now on PowerDNS, signed zones are a single click — open the zone-edit modal, hit **Sign zone** in the DNSSEC card. PowerDNS generates KSK + ZSK (online signing), rectifies the zone, and the agent reports DS records back to the control plane. **Re-publish DS records to your registrar** — that's the only out-of-band step. The DNSSEC card has a per-DS copy-to-clipboard button. See [issue #127 Phase 3c](https://github.com/spatiumddi/spatiumddi/issues/127) for the full flow.
+**4. Sign zones (optional).** With the zones now on PowerDNS, signed zones are a single click — open the zone-edit modal, hit **Sign zone** in the DNSSEC card. PowerDNS generates KSK + ZSK (online signing), rectifies the zone, and the agent reports DS records back to the control plane. **Re-publish DS records to your registrar** — that's the only out-of-band step. The DNSSEC card has a per-DS copy-to-clipboard button. See [issue #127 Phase 3c](https://github.com/spatiumnorth/spatiumddi/issues/127) for the full flow.
 
 **Rollback recipe.** If something goes wrong between step 2 and step 3, the BIND group is still authoritative — flip the zones back via the UI. If something goes wrong after step 3, the secondary on BIND is still serving the last-known-good zone state; promote it back to primary by switching the zone's group back to BIND and setting its `zone_type` to `primary`. The IPAM ↔ DNS reconciler will pick up any record drift on the next 60-s sync cycle and re-stamp the zone.
 
-**Post-restore caveat for DNSSEC zones.** PowerDNS DNSSEC keys live on the agent's LMDB volume, not in the control-plane backup. A factory-reset + restore-from-backup that wipes the agent's volume regenerates keys and produces NEW DS records — which means a new round-trip to the registrar. The restore endpoint surfaces this as a `RestoreOutcomeResponse.warnings[]` advisory listing every signed zone; the BackupPage UI renders it as an amber callout. See [issue #127 Phase 4d](https://github.com/spatiumddi/spatiumddi/issues/127).
+**Post-restore caveat for DNSSEC zones.** PowerDNS DNSSEC keys live on the agent's LMDB volume, not in the control-plane backup. A factory-reset + restore-from-backup that wipes the agent's volume regenerates keys and produces NEW DS records — which means a new round-trip to the registrar. The restore endpoint surfaces this as a `RestoreOutcomeResponse.warnings[]` advisory listing every signed zone; the BackupPage UI renders it as an amber callout. See [issue #127 Phase 4d](https://github.com/spatiumnorth/spatiumddi/issues/127).
 
 ---
 
@@ -486,7 +486,7 @@ only if you understand a still-LAN-wide node won't actually apply the policy).
 - **Operator-driven dead-node replacement on the appliance.** Promote /
   demote ship today (Topology 7); evicting a permanently-dead etcd member
   and minting a pairing code for its replacement is the Phase 9 follow-up
-  on [#272](https://github.com/spatiumddi/spatiumddi/issues/272).
+  on [#272](https://github.com/spatiumnorth/spatiumddi/issues/272).
 - **Multi-tenant control plane.** Coming as Phase 5 per the
   CLAUDE.md roadmap. Today, "tenants" = separate installs.
 - **Read replicas as query routes.** All reads currently go to the

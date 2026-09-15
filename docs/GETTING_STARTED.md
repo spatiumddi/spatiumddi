@@ -7,7 +7,7 @@ title: Getting Started
 
 SpatiumDDI has a few internal dependencies between modules (records need zones, scopes need subnets, etc.). This guide walks you through the **recommended order** to get from a fresh install to a useful working system — whether your DNS/DHCP servers are the built-in Kea + BIND9 containers, a Windows Server DC, or a mix.
 
-> If you haven't installed SpatiumDDI yet, start with the [Docker Compose quick start](deployment/DOCKER.md) or [README Quick start](https://github.com/spatiumddi/spatiumddi/blob/main/README.md#quick-start-with-docker-compose), then come back here.
+> If you haven't installed SpatiumDDI yet, start with the [Docker Compose quick start](deployment/DOCKER.md) or [README Quick start](https://github.com/spatiumnorth/spatiumddi/blob/main/README.md#quick-start-with-docker-compose), then come back here.
 
 ---
 

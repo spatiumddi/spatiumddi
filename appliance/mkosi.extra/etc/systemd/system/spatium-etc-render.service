@@ -1,6 +1,6 @@
 [Unit]
 Description=Render /etc from STATE partition (issue #276)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/276
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/276
 DefaultDependencies=no
 # Run after the /etc overlay + the STATE partition are mounted (both
 # part of local-fs.target), and after the account-reconcile step so

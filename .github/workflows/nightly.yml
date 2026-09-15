@@ -114,7 +114,7 @@ jobs:
     # Forks inherit this workflow (#830); never run the publisher outside
     # the canonical repo. Every other job needs this one, so the guard
     # cascades.
-    if: github.repository_owner == 'spatiumddi'
+    if: github.repository_owner == 'spatiumnorth'
     runs-on: ubuntu-latest
     permissions:
       contents: read

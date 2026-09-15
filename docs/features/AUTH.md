@@ -199,7 +199,7 @@ that POST when it is marked `SameSite=None`, and browsers honour
 `SameSite=None` only when the cookie is also `Secure`. A `Lax` cookie is
 withheld from every cross-site POST, which is what made all logins
 against a hosted IdP fail with `error=saml_state_missing`
-([#873](https://github.com/spatiumddi/spatiumddi/issues/873)). Note the
+([#873](https://github.com/spatiumnorth/spatiumddi/issues/873)). Note the
 contrast with OIDC, whose flow cookie is legitimately `SameSite=Lax`:
 the OIDC provider returns the browser with a cross-site **GET**
 redirect, which Lax permits.
@@ -427,7 +427,7 @@ The reveal-token modal therefore offers a QR code in two shapes:
 | **Server + token** | `spatiumddi://enrol?host=…&port=…&scheme=…&token=…&fingerprint=…` |
 
 The enrolment URI is a **contract with the mobile client**
-([spatiumddi-mobile](https://github.com/spatiumddi/spatiumddi-mobile)),
+([spatiumddi-mobile](https://github.com/spatiumnorth/spatiumddi-mobile)),
 which already parses both shapes. `port` is omitted when it is the
 scheme default, and `scheme` only appears when it is `http` — being
 explicit about the insecure case is the right way round, since a code
@@ -567,7 +567,7 @@ rather than swallowing the failure. Permission-related rejections
   `backend/app/services/password_policy.py`.
 
   That baseline used to be **8 characters**
-  ([#1004](https://github.com/spatiumddi/spatiumddi/issues/1004)) — a
+  ([#1004](https://github.com/spatiumnorth/spatiumddi/issues/1004)) — a
   second minimum, unconfigurable, contradicting the default policy's 12
   and making a relaxed 6-character policy unreachable through the API
   while the UI offered it. It also fired as a Pydantic `422`, whose

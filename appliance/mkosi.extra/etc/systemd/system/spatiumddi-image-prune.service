@@ -1,6 +1,6 @@
 [Unit]
 Description=Prune unreferenced k3s container images to reclaim /var (issue #441)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/441
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/441
 # Skip on the live ISO — no k3s there.
 ConditionKernelCommandLine=!boot=live
 # Needs the k3s containerd socket; /var holds the log + image store.

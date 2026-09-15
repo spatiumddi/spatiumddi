@@ -1,6 +1,6 @@
 [Unit]
 Description=Watch for SpatiumDDI etcd-restore trigger (#272 Phase 9b)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/272
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/272
 # Installed appliances only — the trigger is written by the seed
 # supervisor via its release-state bind mount; never present on the
 # live ISO.

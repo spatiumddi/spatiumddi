@@ -36,7 +36,7 @@ saying it is generated for review. The CSV column names are ours; CER's
 bulk-load columns differ between versions, so the operator maps them. Both
 points are in the docs rather than implied away.
 
-[#60]: https://github.com/spatiumddi/spatiumddi/issues/60
+[#60]: https://github.com/spatiumnorth/spatiumddi/issues/60
 """
 
 from __future__ import annotations

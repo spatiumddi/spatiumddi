@@ -19,10 +19,10 @@ name: Agent E2E (kind)
 # Tag selection — control-plane vs agent images publish on different
 # cadences, so they need different tags:
 #
-# * ``ghcr.io/spatiumddi/spatiumddi-{api,frontend}`` — built only by
+# * ``ghcr.io/spatiumnorth/spatiumddi-{api,frontend}`` — built only by
 #   ``release.yml`` on CalVer tag push. ``:latest`` exists; ``:main``
 #   does not. So control-plane workloads pin ``:latest``.
-# * ``ghcr.io/spatiumddi/{dns-bind9,dns-powerdns,dhcp-kea}`` — built
+# * ``ghcr.io/spatiumnorth/{dns-bind9,dns-powerdns,dhcp-kea}`` — built
 #   by ``build-dns-images.yml`` / ``build-dhcp-images.yml`` on every
 #   push to main, so ``:main`` is fresh. We use ``:main`` here so PR
 #   smokes exercise the actually-current agent image, and to dodge
@@ -103,7 +103,7 @@ jobs:
 
       - name: Build agent images from PR source + load into kind
         # Agent code changes (under ``agent/dns/**``) don't reach
-        # ``ghcr.io/spatiumddi/dns-{bind9,powerdns}:main`` until the
+        # ``ghcr.io/spatiumnorth/dns-{bind9,powerdns}:main`` until the
         # PR merges — ``build-dns-images.yml`` only pushes on push to
         # main. Without this step, agent-e2e on a PR perpetually tests
         # the pre-PR image instead of the PR's actual code.
@@ -120,10 +120,10 @@ jobs:
             docker buildx build \
               --platform linux/amd64 \
               --file "agent/dns/images/${flavor}/Dockerfile" \
-              --tag "ghcr.io/spatiumddi/dns-${flavor}:pr-test" \
+              --tag "ghcr.io/spatiumnorth/dns-${flavor}:pr-test" \
               --load \
               .
-            kind load docker-image "ghcr.io/spatiumddi/dns-${flavor}:pr-test" --name spatium-e2e
+            kind load docker-image "ghcr.io/spatiumnorth/dns-${flavor}:pr-test" --name spatium-e2e
           done
 
       - name: Preload official postgres + redis images into kind

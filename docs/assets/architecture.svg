@@ -233,25 +233,25 @@
   <g>
     <rect x="52" y="750" width="412" height="62" rx="9" class="card" fill="url(#g-agented)"/>
     <text x="258" y="768" text-anchor="middle" class="card-title">dns-bind9</text>
-    <text x="258" y="784" text-anchor="middle" class="card-sub-dim">ghcr.io/spatiumddi/dns-bind9</text>
+    <text x="258" y="784" text-anchor="middle" class="card-sub-dim">ghcr.io/spatiumnorth/dns-bind9</text>
     <text x="258" y="802" text-anchor="middle" class="card-sub">spatium-dns-agent · BIND9 9.18 · nsupdate+TSIG · 53/udp+tcp</text>
   </g>
   <g>
     <rect x="52" y="818" width="412" height="62" rx="9" class="card" fill="url(#g-agented)" fill-opacity="0.95"/>
     <text x="258" y="836" text-anchor="middle" class="card-title">dns-powerdns</text>
-    <text x="258" y="852" text-anchor="middle" class="card-sub-dim">ghcr.io/spatiumddi/dns-powerdns</text>
+    <text x="258" y="852" text-anchor="middle" class="card-sub-dim">ghcr.io/spatiumnorth/dns-powerdns</text>
     <text x="258" y="870" text-anchor="middle" class="card-sub">spatium-dns-agent · PowerDNS · REST Control Agent · DNSSEC</text>
   </g>
   <g>
     <rect x="52" y="886" width="412" height="62" rx="9" class="card" fill="url(#g-agented)" fill-opacity="0.9"/>
     <text x="258" y="904" text-anchor="middle" class="card-title">dns-technitium</text>
-    <text x="258" y="920" text-anchor="middle" class="card-sub-dim">ghcr.io/spatiumddi/dns-technitium</text>
+    <text x="258" y="920" text-anchor="middle" class="card-sub-dim">ghcr.io/spatiumnorth/dns-technitium</text>
     <text x="258" y="938" text-anchor="middle" class="card-sub">spatium-dns-agent · REST API · DoT/DoH/DoQ · online DNSSEC</text>
   </g>
   <g>
     <rect x="52" y="954" width="412" height="62" rx="9" class="card" fill="url(#g-agented)" fill-opacity="0.8"/>
     <text x="258" y="972" text-anchor="middle" class="card-title">dhcp-kea</text>
-    <text x="258" y="988" text-anchor="middle" class="card-sub-dim">ghcr.io/spatiumddi/dhcp-kea</text>
+    <text x="258" y="988" text-anchor="middle" class="card-sub-dim">ghcr.io/spatiumnorth/dhcp-kea</text>
     <text x="258" y="1006" text-anchor="middle" class="card-sub">spatium-dhcp-agent · kea-dhcp4/6 · 67/udp · HA hook</text>
   </g>
   <text x="258" y="1024" text-anchor="middle" class="lane-label" font-size="10.5px" fill="#64748b">PSK/pairing→JWT · long-poll ETag</text>

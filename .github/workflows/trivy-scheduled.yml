@@ -47,7 +47,7 @@ jobs:
     # Forks inherit this workflow (#830); never run the publisher outside
     # the canonical repo. Repeated on every job here — a workflow-level guard
     # does not exist, so each job that can file an issue carries its own.
-    if: github.repository_owner == 'spatiumddi'
+    if: github.repository_owner == 'spatiumnorth'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -336,7 +336,7 @@ jobs:
   # being read.
   pin-drift:
     name: Version pins — upstream drift
-    if: github.repository_owner == 'spatiumddi'
+    if: github.repository_owner == 'spatiumnorth'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

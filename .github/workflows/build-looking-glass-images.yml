@@ -76,7 +76,7 @@ jobs:
           platforms: linux/amd64
           push: false
           load: true
-          tags: ghcr.io/spatiumddi/looking-glass:pr-scan
+          tags: ghcr.io/spatiumnorth/looking-glass:pr-scan
           build-args: |
             APK_SNAPSHOT=${{ steps.snap.outputs.snapshot }}
             APT_SNAPSHOT=${{ steps.snap.outputs.snapshot }}
@@ -91,7 +91,7 @@ jobs:
           # a ``ghcr.io/...:${{ github.sha }}`` reference never resolves
           # (metadata-action emits ``sha-<short>``, not raw full SHAs, and
           # on PR nothing gets pushed) so Trivy 404s with MANIFEST_UNKNOWN.
-          image-ref: ghcr.io/spatiumddi/looking-glass:pr-scan
+          image-ref: ghcr.io/spatiumnorth/looking-glass:pr-scan
           format: json
           output: trivy-report.json
           severity: HIGH,CRITICAL
@@ -114,4 +114,4 @@ jobs:
         run: >-
           .github/scripts/trivy-gate.sh
           "trivy-report.json"
-          "ghcr.io/spatiumddi/looking-glass:pr-scan"
+          "ghcr.io/spatiumnorth/looking-glass:pr-scan"

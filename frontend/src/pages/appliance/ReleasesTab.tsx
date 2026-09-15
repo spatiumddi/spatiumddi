@@ -58,7 +58,7 @@ export function ReleasesTab({
           </h2>
           <p className="mt-1 text-xs text-muted-foreground">
             Published releases from{" "}
-            <code className="rounded bg-muted px-1">ghcr.io/spatiumddi</code>{" "}
+            <code className="rounded bg-muted px-1">ghcr.io/spatiumnorth</code>{" "}
             and the version this control plane is running.
           </p>
         </div>
@@ -329,7 +329,7 @@ function ManualApplyModal({
   const k8sCmd = [
     "# On a workstation with kubectl + helm pointed at the cluster:",
     "helm upgrade spatiumddi \\",
-    "  oci://ghcr.io/spatiumddi/charts/spatiumddi \\",
+    "  oci://ghcr.io/spatiumnorth/charts/spatiumddi \\",
     `  --set image.tag=${tag} \\`,
     "  --reuse-values",
   ].join("\n");

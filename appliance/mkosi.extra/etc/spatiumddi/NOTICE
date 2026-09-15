@@ -3,7 +3,7 @@ SpatiumDDI Appliance — Bundled Open-Source Components
 This appliance image bundles software from the projects listed below.
 SpatiumDDI itself is licensed under the Apache License 2.0 (see
 /usr/share/doc/spatiumddi/LICENSE in the SpatiumDDI containers, or
-https://github.com/spatiumddi/spatiumddi/blob/main/LICENSE).
+https://github.com/spatiumnorth/spatiumddi/blob/main/LICENSE).
 
 The full text of each license is available on the system at
 /usr/share/doc/<package>/copyright. Source for each component is

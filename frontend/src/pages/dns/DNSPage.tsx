@@ -1476,7 +1476,7 @@ function ServerModal({
           <div className="rounded-md border border-violet-500/30 bg-violet-500/10 px-3 py-2 text-xs text-violet-800 dark:text-violet-300">
             <strong>PowerDNS:</strong> agent-managed. Run the{" "}
             <code className="rounded bg-violet-500/20 px-1">
-              ghcr.io/spatiumddi/dns-powerdns
+              ghcr.io/spatiumnorth/dns-powerdns
             </code>{" "}
             container alongside this server (Phase 1 ships LMDB embedded
             storage; no external DB needed). Records apply via the local
@@ -1488,7 +1488,7 @@ function ServerModal({
           <div className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-800 dark:text-emerald-300">
             <strong>Technitium:</strong> agent-managed. Run the{" "}
             <code className="rounded bg-emerald-500/20 px-1">
-              ghcr.io/spatiumddi/dns-technitium
+              ghcr.io/spatiumnorth/dns-technitium
             </code>{" "}
             container alongside this server. v1 supports primary zones +
             standard record types; DNSSEC, native DoT/DoH/DoQ listeners, and

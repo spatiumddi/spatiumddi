@@ -7,7 +7,7 @@ mechanism the bytes ultimately land on — see
 ``services/appliance/slot.py``.) It arrives one of two ways:
 
 * **Upload (air-gap).** Operators on disconnected networks can't reach
-  ``https://github.com/spatiumddi/spatiumddi/releases/...`` to feed the
+  ``https://github.com/spatiumnorth/spatiumddi/releases/...`` to feed the
   supervisor a ``desired_slot_image_url``. They download the ``.raw.xz``
   out-of-band, upload it here, and the control plane stores it on a
   local volume + serves it back under an authenticated internal URL.

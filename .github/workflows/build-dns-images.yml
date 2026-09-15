@@ -44,7 +44,7 @@ jobs:
       matrix:
         # dnsdist (#146 Phase 2) and technitium follow the same image path
         # convention (agent/dns/images/<flavor>/Dockerfile →
-        # ghcr.io/spatiumddi/dns-<flavor>).
+        # ghcr.io/spatiumnorth/dns-<flavor>).
         flavor: [bind9, powerdns, technitium, dnsdist]
     steps:
       - uses: actions/checkout@v7
@@ -80,7 +80,7 @@ jobs:
           platforms: linux/amd64
           push: false
           load: true
-          tags: ghcr.io/spatiumddi/dns-${{ matrix.flavor }}:pr-scan
+          tags: ghcr.io/spatiumnorth/dns-${{ matrix.flavor }}:pr-scan
           build-args: |
             APK_SNAPSHOT=${{ steps.snap.outputs.snapshot }}
             APT_SNAPSHOT=${{ steps.snap.outputs.snapshot }}
@@ -110,7 +110,7 @@ jobs:
           docker run --rm \
             -v "$PWD/agent/dns/tests:/checks:ro" \
             --entrypoint python3 \
-            ghcr.io/spatiumddi/dns-bind9:pr-scan /checks/live_axfr_check.py
+            ghcr.io/spatiumnorth/dns-bind9:pr-scan /checks/live_axfr_check.py
 
       - name: Trivy scan
         uses: aquasecurity/trivy-action@v0.36.0
@@ -122,7 +122,7 @@ jobs:
           # not raw full SHAs, and on PR the image isn't pushed at
           # all. Trivy resolved the missing tag against ghcr and
           # blew up with MANIFEST_UNKNOWN.
-          image-ref: ghcr.io/spatiumddi/dns-${{ matrix.flavor }}:pr-scan
+          image-ref: ghcr.io/spatiumnorth/dns-${{ matrix.flavor }}:pr-scan
           format: json
           output: trivy-report.json
           severity: HIGH,CRITICAL
@@ -145,4 +145,4 @@ jobs:
         run: >-
           .github/scripts/trivy-gate.sh
           "trivy-report.json"
-          "ghcr.io/spatiumddi/dns-${{ matrix.flavor }}:pr-scan"
+          "ghcr.io/spatiumnorth/dns-${{ matrix.flavor }}:pr-scan"

@@ -1,6 +1,6 @@
 [Unit]
 Description=Watch for SpatiumDDI slot-upgrade trigger (Phase 8b-3)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/138
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/138
 # Skip on the live ISO — there are no installed slot partitions to
 # upgrade, and the trigger file path doesn't exist.
 ConditionKernelCommandLine=!boot=live

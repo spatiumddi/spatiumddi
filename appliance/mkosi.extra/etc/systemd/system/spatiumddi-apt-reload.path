@@ -1,6 +1,6 @@
 [Unit]
 Description=Watch for SpatiumDDI APT config-reload trigger (issue #155)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/155
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/155
 # Skip on the live ISO — apt management isn't part of the installer env.
 ConditionKernelCommandLine=!boot=live
 

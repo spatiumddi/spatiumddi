@@ -1,6 +1,6 @@
 [Unit]
 Description=Reboot the appliance on operator-triggered fleet request (Phase 8f-8)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/138
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/138
 # The reboot intent is operator-driven via the control plane's Fleet
 # view — once the path unit fires we just need to actually reboot,
 # no other host state is involved.

@@ -22,6 +22,60 @@ the formatter handles the rest.
 
 ## Unreleased
 
+### Changed
+
+- **GitHub organization renamed `spatiumddi` → `spatiumnorth`.** The
+  project is now `spatiumnorth/spatiumddi`: the org changed, the
+  repository name did not, and neither did the product, the PyPI
+  package, the image names or any filesystem path — `/etc/spatiumddi/`,
+  `/usr/lib/spatiumddi/` and `spatiumddi-api` are all untouched. Every
+  `github.com/` and `ghcr.io/` reference in the tree moved to the new
+  org, along with the shields.io badge paths in the README, which carry
+  the org separately from the link they sit behind and so would have
+  gone on reporting a repo that no longer answers.
+  **Container images move with the org**: pulls are now
+  `ghcr.io/spatiumnorth/…`, and the umbrella chart's
+  `image.repository` default moved with them. CI needed no such change
+  — it builds from `ghcr.io/${{ github.repository_owner }}`, which
+  follows a rename on its own.
+  **Two things do not follow a rename, and both fail silently.** Eight
+  workflows gate on `if: github.repository_owner == '…'` so a fork
+  never publishes; left at the old literal, release, nightly, the
+  weekly Trivy scan, asset pruning and the docs publisher would all
+  have skipped with a green check rather than an error. And the docs
+  site's org-root Pages repo has to be renamed to
+  `spatiumnorth.github.io` — GitHub serves an organization site only
+  from a repo named `<org>.github.io`, so the old name is demoted to an
+  ordinary project site and the root site stops existing;
+  `docs-publish.yml` now targets the new name.
+  **Operator action on upgrade:** `GITHUB_REPO` shipped in
+  `.env.example`, so an install that copied it carries
+  `spatiumddi/spatiumddi` in its own `.env`, which overrides the new
+  default and pins the daily release check and the appliance
+  slot-image catalogue to the old path. Update the value, or remove
+  the line to take the default.
+- **The release check reported a permanently up-to-date install when
+  its repo had moved.** GitHub answers `301` for a renamed repo, which
+  an org rename makes routine — and httpx does not follow redirects by
+  default while `raise_for_status()` does not reject a `3xx`. So the
+  redirect body was parsed as a release: no `tag_name`, so the task
+  stored no version, set `update_available=False`, cleared
+  `latest_check_error` and logged `update_check_ok`. The one default-on
+  connection in the product would have gone on reporting a healthy
+  “you are up to date” forever, which on a notifier whose job is
+  surfacing security fixes is worse than a loud failure. Both GitHub
+  clients (`tasks/update_check.py`, `services/appliance/releases.py`)
+  now follow redirects, which removes the false negative and keeps a
+  stale `GITHUB_REPO` working rather than silently wrong.
+- **The appliance image pruner stopped reclaiming pre-rename images.**
+  Its prefix guard exempts non-SpatiumDDI images so kubelet image-GC
+  owns them; narrowed to the new org alone, every accumulated
+  `ghcr.io/spatiumddi/*` release already on a deployed appliance —
+  exactly what the timer exists to reclaim — would have been classified
+  as third-party infra and kept forever, while still reporting nothing
+  stale to prune. It now matches both orgs; the in-use and
+  slot-version guards are unchanged, so nothing live can be removed.
+
 ### Fixed
 
 - **PR-time Trivy lanes scanned a frozen package layer, and trusted
@@ -3456,7 +3510,7 @@ upward instead of serving one thing while the database says another
   cannot paste cleanly emails the credential to themselves. The
   reveal-token modal now offers a QR in two shapes, the bare token or
   `spatiumddi://enrol?host=…&token=…&fingerprint=…`, both already parsed
-  by the client in `spatiumddi/spatiumddi-mobile` — so the URI is a
+  by the client in `spatiumnorth/spatiumddi-mobile` — so the URI is a
   **contract with another repo**, not a local convention.
   - **The fingerprint is the interesting half.** A self-hosted control
     plane presents a private-CA or self-signed certificate, so the
@@ -4816,7 +4870,7 @@ published `spatiumddi-api` image no longer ships the Dockerfile's
   (`agent/dns/spatium_dns_agent/drivers/technitium.py`) reconciling
   zones and records against Technitium's REST API with
   agent-provisioned bearer-token auth, a new
-  `ghcr.io/spatiumddi/dns-technitium` container image (upstream base
+  `ghcr.io/spatiumnorth/dns-technitium` container image (upstream base
   pinned by multi-arch index digest), and full appliance integration —
   supervisor role tables, firewall policy layer, umbrella + appliance
   Helm charts, Fleet UI, Docker Compose profile, CI build matrix,
@@ -5891,7 +5945,7 @@ Wake-on-LAN).
 ### Added
 
 * **#566 — BGP Looking Glass.** A receive-only GoBGP collector
-  (``ghcr.io/spatiumddi/looking-glass``, multi-arch) peers with your
+  (``ghcr.io/spatiumnorth/looking-glass``, multi-arch) peers with your
   routers, ingests the live Adj-RIB-In, and links every learned prefix /
   origin ASN / community back into IPAM. It **never advertises routes to
   your network**: a global ``default-export-policy: reject-route`` plus a
@@ -7015,7 +7069,7 @@ All ten schema changes are additive.
   existing ConfigBundle → ETag → long-poll path. Every field defaults to
   a no-op, so existing groups render byte-identical config until an
   operator opts in. PowerDNS Authoritative has no RRL, so a new
-  **dnsdist front** (``ghcr.io/spatiumddi/dns-dnsdist`` image,
+  **dnsdist front** (``ghcr.io/spatiumnorth/dns-dnsdist`` image,
   watch-and-reload entrypoint) puts ``MaxQPSIPRule`` + TC/Drop +
   ``dynBlockRulesGroup`` in front of pdns — opt-in via the
   ``dns-powerdns-with-dnsdist`` compose profile + Helm sidecar. Drop-rate
@@ -7063,7 +7117,7 @@ All ten schema changes are additive.
   image store lives on the shared ``/var`` partition and nothing pruned
   superseded releases, so ``/var`` crept toward full over upgrades
   (a field appliance hit 91 %). New ``spatiumddi-image-prune`` removes
-  only ``ghcr.io/spatiumddi/*`` images tagged with **neither** slot's
+  only ``ghcr.io/spatiumnorth/*`` images tagged with **neither** slot's
   installed version **and** not referenced by a live container — keeping
   both A/B slots bootable + the running set + all non-SpatiumDDI images,
   and pruning nothing if it can't name both slot versions. Triggered
@@ -9401,14 +9455,14 @@ environment by default — so `SPATIUMDDI_VERSION=2026.05.17-2` and
 `BAKE_SOURCE=ghcr` (set on the job's `env:` block) never reached
 the script. The script fell back to its `SPATIUMDDI_VERSION=dev` +
 `BAKE_SOURCE=local` defaults, then errored at
-`ERROR: no local image found for ghcr.io/spatiumddi/spatium-supervisor`
+`ERROR: no local image found for ghcr.io/spatiumnorth/spatium-supervisor`
 because there's no `:dev`-tagged image on a GitHub-hosted runner.
 
 Fix is one line: `sudo -E` instead of bare `sudo` so the env passes
 through. Plus a preemptive `DOCKER_CONFIG=$HOME/.docker` to point
 root's docker CLI at the runner-user's `~/.docker/config.json`
 where the workflow's `docker/login-action` step stamped the GHCR
-credentials — our `ghcr.io/spatiumddi/*` container images are
+credentials — our `ghcr.io/spatiumnorth/*` container images are
 private, so without this redirect the `docker pull` calls inside
 the script would 401 anonymously even after the env-var fix.
 
@@ -9433,9 +9487,9 @@ Same-day hotfix for the 2026.05.17-1 release pipeline. The
 `build-appliance-iso` job in the release workflow failed at 14 s
 with exit code 3 because `appliance/scripts/bake-images.sh` tried
 to `docker pull` three images that don't exist:
-`ghcr.io/spatiumddi/spatiumddi-worker`,
-`ghcr.io/spatiumddi/spatiumddi-beat`,
-`ghcr.io/spatiumddi/spatiumddi-migrate`. The umbrella chart's
+`ghcr.io/spatiumnorth/spatiumddi-worker`,
+`ghcr.io/spatiumnorth/spatiumddi-beat`,
+`ghcr.io/spatiumnorth/spatiumddi-migrate`. The umbrella chart's
 worker / beat / migrate Deployments + Jobs all share the
 `spatiumddi-api` image with different `command:` overrides
 (confirmed across `docker-compose.yml` and
@@ -9484,7 +9538,7 @@ needed." Off-appliance Helm operators benefit too — flipping
 appliance-ISO-specific). The full design + phase breakdown is in
 [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md) under
 the new "Current architecture (post-#183)" section. Follow-ups
-deferred to [#193](https://github.com/spatiumddi/spatiumddi/issues/193)
+deferred to [#193](https://github.com/spatiumnorth/spatiumddi/issues/193)
 (Phase 4 control-plane proxy half, Helm release UI, krew, firstboot
 fail-on-missing-tarball, `appliance_mode` split into `k8s_mode` +
 `appliance_mode`, plus three carry-overs from #170 Wave E).
@@ -9565,7 +9619,7 @@ surface in the integration's "unmatched" list for operator review.
 **Appliance polish (#181 + #182, landed pre-#183).** The DHCP server
 detail surface gains a tabbed modal mirroring the DNS side (Overview /
 Sync / Events / Logs / Config — Stats deferred to [#195](https://
-github.com/spatiumddi/spatiumddi/issues/195)). Three new endpoints
+github.com/spatiumnorth/spatiumddi/issues/195)). Three new endpoints
 under `/api/v1/dhcp/servers/{id}` (`pending-ops` / `recent-events` /
 `rendered-config`); the existing Kea log pipeline drives the Logs
 tab. Per-server **maintenance mode** (#182) lets operators pause a
@@ -9778,7 +9832,7 @@ DNS / DHCP service containers' agent JWTs are similarly preserved.
 
 - **`/api/v1/appliance/slot-images/*` endpoints** stay functional
   but a rename to `upgrade-images` is queued in [#199](https://
-  github.com/spatiumddi/spatiumddi/issues/199) along with a
+  github.com/spatiumnorth/spatiumddi/issues/199) along with a
   GitHub-Releases-driven picker. No removal in this release.
 
 ### Security
@@ -10027,7 +10081,7 @@ resolver runs.
   the INSERT carries.
 - **Agent container entrypoints crash-loop with only
   ``BOOTSTRAP_PAIRING_CODE``.** The shell entrypoints baked into
-  ``ghcr.io/spatiumddi/dns-bind9`` / ``dns-powerdns`` / ``dhcp-kea``
+  ``ghcr.io/spatiumnorth/dns-bind9`` / ``dns-powerdns`` / ``dhcp-kea``
   did ``: ${DNS_AGENT_KEY:?DNS_AGENT_KEY is required}`` (and
   equivalents) before the Python supervisor ran — that fired before
   the new Phase 3 resolver got a chance to look at
@@ -10535,7 +10589,7 @@ bottom-of-Releases to its own top-level Appliance tab.
   the same release picker the appliance flow uses, plus a
   pre-filled copy-paste command tailored to deployment_kind:
   `SPATIUMDDI_VERSION=<tag> docker compose pull && up -d` or
-  `helm upgrade spatiumddi-<dns|dhcp> oci://ghcr.io/spatiumddi/
+  `helm upgrade spatiumddi-<dns|dhcp> oci://ghcr.io/spatiumnorth/
   charts/spatiumddi --set image.tag=<tag> --reuse-values`. One-
   click Copy button. The agent reports the new
   `installed_appliance_version` via its next heartbeat after the
@@ -10733,7 +10787,7 @@ that's safe to undo.
   inactive target as a three-column grid + a trial-boot amber
   warning when the running slot doesn't match the durable
   default. Operator pastes (or accepts the pre-filled
-  `https://github.com/spatiumddi/spatiumddi/releases/latest/`
+  `https://github.com/spatiumnorth/spatiumddi/releases/latest/`
   URL for) a slot image + optional sha256 sidecar; pressing
   Apply writes a trigger file the host-side
   `spatiumddi-slot-upgrade.path` unit watches, the runner
@@ -10901,7 +10955,7 @@ demo as a scanner / SSRF relay).
   catalog zones, and views are deliberately out of Phase 1 — those
   are Phase 2/3 work and the driver's ``capabilities()`` dict makes
   the gaps explicit.
-- **``ghcr.io/spatiumddi/dns-powerdns`` container image.** Alpine
+- **``ghcr.io/spatiumnorth/dns-powerdns`` container image.** Alpine
   3.22 base + ``pdns`` 4.9.x + ``pdns-backend-lmdb``, multi-arch
   ``linux/amd64`` and ``linux/arm64``. Same agent supervisor + JWT
   bootstrap + long-poll ETag flow as the BIND9 image — the only
@@ -11073,7 +11127,7 @@ demo as a scanner / SSRF relay).
   builds locally and never silently pulls the registry copy that
   prod's compose declares — a source of half-mixed installs the
   user spotted while testing. ``make up`` (prod) still tags as
-  ``ghcr.io/spatiumddi/...:latest`` for the release pipeline.
+  ``ghcr.io/spatiumnorth/...:latest`` for the release pipeline.
 
   Known follow-up: soft-deleted DNS records on PowerDNS-driver
   groups don't propagate to the daemon (only ``?permanent=true``
@@ -11164,7 +11218,7 @@ demo as a scanner / SSRF relay).
   agents alongside BIND9. The existing ``servers[].flavor`` knob
   (already in the schema, never used) now actually picks the image
   + mount path: ``flavor: powerdns`` pulls
-  ``ghcr.io/spatiumddi/dns-powerdns`` (override comes from the new
+  ``ghcr.io/spatiumnorth/dns-powerdns`` (override comes from the new
   ``dnsAgents.flavors.powerdns`` block in ``values.yaml``) and
   mounts the ``dns-state`` PVC at ``/var/lib/powerdns`` for the LMDB
   store; ``flavor: bind9`` (default) keeps the historical
@@ -11182,7 +11236,7 @@ demo as a scanner / SSRF relay).
 - **PowerDNS deployment plumbing, Phase 4a (\#127).** New
   ``docker-compose.agent-dns-powerdns.yml`` standalone-VM compose
   file mirrors the bind9 shape: one ``dns-powerdns`` service against
-  the ``ghcr.io/spatiumddi/dns-powerdns`` image with ``LMDB``-backed
+  the ``ghcr.io/spatiumnorth/dns-powerdns`` image with ``LMDB``-backed
   zone storage volumes. Main ``docker-compose.yml`` +
   ``docker-compose.dev.yml`` grow a ``dns-powerdns`` profile (host
   port 5453 so a side-by-side bind9 + powerdns dev setup doesn't
@@ -11379,7 +11433,7 @@ demo as a scanner / SSRF relay).
   create/edit modal grows ``PowerDNS (agent-managed)`` as a third
   option in the Driver dropdown alongside BIND9 and Windows DNS.
   Selecting it shows a violet info banner explaining that operators
-  run the new ``ghcr.io/spatiumddi/dns-powerdns`` container alongside
+  run the new ``ghcr.io/spatiumnorth/dns-powerdns`` container alongside
   the server, that records apply via the local PowerDNS REST API on
   port 8081 (loopback only), and that the API key is generated +
   rotated automatically by the agent. The API Key input is hidden
@@ -16805,7 +16859,7 @@ enforcement site.
   + `max-h-48 overflow-auto` on the error box so long failure lists
   from bulk deletes scroll instead of pushing the buttons off-screen.
 
-[#20]: https://github.com/spatiumddi/spatiumddi/issues/20
+[#20]: https://github.com/spatiumnorth/spatiumddi/issues/20
 
 ---
 
@@ -17709,7 +17763,7 @@ Compose file to pull release images from GHCR.
 - Per-column filter row on `/admin/audit` — User/Summary/IP text inputs, Action/Resource/Result dropdowns, always visible, Clear-all X in the actions column. Backend adds `resource_display` / `result` / `source_ip` query params.
 
 **Platform**
-- Base `docker-compose.yml` now pulls release images from GHCR (`ghcr.io/spatiumddi/spatiumddi-{api,frontend}`, `ghcr.io/spatiumddi/dns-bind9`, `ghcr.io/spatiumddi/dhcp-kea`); pin with `SPATIUMDDI_VERSION=<tag>` in `.env`.
+- Base `docker-compose.yml` now pulls release images from GHCR (`ghcr.io/spatiumnorth/spatiumddi-{api,frontend}`, `ghcr.io/spatiumnorth/dns-bind9`, `ghcr.io/spatiumnorth/dhcp-kea`); pin with `SPATIUMDDI_VERSION=<tag>` in `.env`.
 - `docker-compose.dev.yml` is a standalone self-contained file that keeps `build:` stanzas for local dev builds — use `docker compose -f docker-compose.dev.yml …` or `export COMPOSE_FILE=docker-compose.dev.yml`.
 - Jekyll docs site config (`docs/_config.yml`, `docs/index.md`).
 - CHANGELOG; alpha banner; clickable screenshot thumbnails in README.
@@ -17758,7 +17812,7 @@ First public release. **Alpha quality** — expect rough edges and breaking chan
 - Server groups, servers, zones, records — full CRUD
 - BIND9 driver with Jinja templates, TSIG-signed RFC 2136 dynamic updates
 - Agent runtime: bootstrap (PSK → JWT), long-poll config sync with ETag, on-disk cache
-- Container image: `ghcr.io/spatiumddi/dns-bind9` (Alpine 3.22, multi-arch)
+- Container image: `ghcr.io/spatiumnorth/dns-bind9` (Alpine 3.22, multi-arch)
 - Zone tree with nested sub-zone display
 - Zone import/export (RFC 1035 parser, color-coded diff preview)
 - Server health checks (heartbeat staleness → SOA fallback)
@@ -17769,7 +17823,7 @@ First public release. **Alpha quality** — expect rough edges and breaking chan
 
 **DHCP**
 - Kea driver + agent runtime (bootstrap, long-poll, lease tail, local cache)
-- Container image: `ghcr.io/spatiumddi/dhcp-kea` (Alpine 3.22, multi-arch)
+- Container image: `ghcr.io/spatiumnorth/dhcp-kea` (Alpine 3.22, multi-arch)
 - Server groups, servers, scopes, pools, static assignments, client classes
 - DHCP options editor with NTP (option 42) as first-class field
 - Pool overlap validation on create and resize
@@ -17805,4 +17859,4 @@ First public release. **Alpha quality** — expect rough edges and breaking chan
 
 ---
 
-_For the full commit history, see the [GitHub compare view](https://github.com/spatiumddi/spatiumddi/commits/main)._
+_For the full commit history, see the [GitHub compare view](https://github.com/spatiumnorth/spatiumddi/commits/main)._

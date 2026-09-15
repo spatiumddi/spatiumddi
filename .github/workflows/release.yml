@@ -20,7 +20,7 @@ jobs:
     # Forks inherit this workflow (#830); never run the publisher outside
     # the canonical repo. Every other job needs this one, so the guard
     # cascades.
-    if: github.repository_owner == 'spatiumddi'
+    if: github.repository_owner == 'spatiumnorth'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.ver.outputs.version }}
@@ -331,7 +331,7 @@ jobs:
   # pushes it as an OCI artifact to ghcr.io/<owner>/charts/spatiumddi:
   # <chart_version>. Consumers then:
   #
-  #   helm install ddi oci://ghcr.io/spatiumddi/charts/spatiumddi \
+  #   helm install ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
   #     --version <chart_version>
   #
   # The in-repo Chart.yaml version is a placeholder; the release tag
