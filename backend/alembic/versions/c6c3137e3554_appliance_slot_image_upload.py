@@ -1,7 +1,7 @@
 """Issue #170 follow-up — slot-image upload for air-gapped upgrades.
 
 Lands the schema half of the air-gap upgrade pipeline. Operators on
-isolated networks can't reach github.com/spatiumddi/spatiumddi/
+isolated networks can't reach github.com/spatiumnorth/spatiumddi/
 releases to give the supervisor a ``desired_slot_image_url`` — but
 they can upload the ``.raw.xz`` (downloaded out-of-band) directly
 to the control plane through the new Fleet UI. The control plane

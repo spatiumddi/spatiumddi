@@ -15,11 +15,11 @@
 #
 # What this does instead — version-aware prune:
 #   * KEEP every image referenced by a live (running/created) container.
-#   * KEEP every `ghcr.io/spatiumddi/*` image tagged with EITHER slot's
+#   * KEEP every `ghcr.io/spatiumnorth/*` image tagged with EITHER slot's
 #     installed version (from slot-versions.json) — both slots stay bootable.
 #   * KEEP all non-SpatiumDDI images (k3s / coredns / pause / postgres /
 #     redis / metallb / cnpg …) — those are managed by kubelet image-GC.
-#   * REMOVE the rest: older `ghcr.io/spatiumddi/*` releases (3rd-oldest+)
+#   * REMOVE the rest: older `ghcr.io/spatiumnorth/*` releases (3rd-oldest+)
 #     and stale dev tags — the actual accumulation.
 #
 # Fail-safe: if slot-versions.json is missing or names no real version, we
@@ -124,7 +124,7 @@ except Exception:
     print("", end="")
     sys.exit(0)
 
-SP = "ghcr.io/spatiumddi/"
+SP = "ghcr.io/spatiumnorth/"
 remove = []
 for img in images:
     iid = img.get("id") or ""

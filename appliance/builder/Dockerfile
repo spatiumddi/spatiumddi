@@ -7,7 +7,7 @@
 # Run pattern:
 #   docker run --rm --privileged \
 #       -v $PWD/appliance:/work \
-#       ghcr.io/spatiumddi/appliance-builder:latest \
+#       ghcr.io/spatiumnorth/appliance-builder:latest \
 #       --output-directory=build --force build
 #
 # Privileged is required: mkosi creates loop devices, uses unshare for

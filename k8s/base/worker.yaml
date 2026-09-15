@@ -41,7 +41,7 @@ spec:
       terminationGracePeriodSeconds: 60
       containers:
         - name: worker
-          image: ghcr.io/spatiumddi/spatiumddi-api:latest
+          image: ghcr.io/spatiumnorth/spatiumddi-api:latest
           imagePullPolicy: Always
           # NET_RAW lets the worker run nmap with raw sockets — required
           # for SYN scans + ``-O`` OS detection in the device-profiling
@@ -146,7 +146,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: beat
-          image: ghcr.io/spatiumddi/spatiumddi-api:latest
+          image: ghcr.io/spatiumnorth/spatiumddi-api:latest
           imagePullPolicy: Always
           command:
             - celery

@@ -1,6 +1,6 @@
 [Unit]
 Description=Apply pending SpatiumDDI snmpd config (issue #153)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/153
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/153
 # Defensive — the runner writes to /etc/snmp/snmpd.conf and
 # /etc/nftables.d/50-spatium-snmp.nft, both of which need the
 # /etc overlay (Phase 8a, lower=/usr/lib/etc.image,

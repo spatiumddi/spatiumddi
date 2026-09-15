@@ -326,7 +326,7 @@ while IFS=$'\t' read -r NAME UUID FSTYPE; do
 # Managed by SpatiumDDI (#989) — edits are overwritten on the next apply.
 [Unit]
 Description=SpatiumDDI removable backup disk ($NAME)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/989
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/989
 # BindsTo, not just Requires: a disk yanked without ejecting takes the
 # device unit with it, and BindsTo is what tears the mount down instead
 # of leaving a stale mountpoint that still looks writable.

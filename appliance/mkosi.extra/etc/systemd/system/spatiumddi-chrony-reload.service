@@ -1,6 +1,6 @@
 [Unit]
 Description=Apply pending SpatiumDDI chrony config (issue #154)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/154
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/154
 # Defensive ordering — the runner writes /etc/chrony/chrony.conf and
 # /etc/nftables.d/50-spatium-ntp.nft, both of which need the /etc
 # overlay (Phase 8a) mounted so the writes land on the /var-backed

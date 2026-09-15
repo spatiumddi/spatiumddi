@@ -1,6 +1,6 @@
 [Unit]
 Description=SpatiumDDI appliance console dashboard (tty1)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/134
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/134
 # Skip on installer/live ISO modes — those have their own tty1 units
 # (spatium-install.service / spatium-live-banner.service). Operators
 # can also force-disable with `spatium-console=off` on the kernel

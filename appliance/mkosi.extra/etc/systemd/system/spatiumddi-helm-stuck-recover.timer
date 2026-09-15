@@ -1,6 +1,6 @@
 [Unit]
 Description=Periodically scan for wedged k3s HelmChart releases (issue #183 Phase 9)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/183
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/183
 # Don't fire on the live ISO — k3s isn't running there.
 ConditionKernelCommandLine=!boot=live
 

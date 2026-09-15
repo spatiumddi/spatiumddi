@@ -1,6 +1,6 @@
 [Unit]
 Description=Watch for SpatiumDDI appliance-host packet-capture requests (issue #59)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/59
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/59
 # Skip on the live ISO — tcpdump capture is a post-install operator action.
 ConditionKernelCommandLine=!boot=live
 

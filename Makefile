@@ -52,7 +52,7 @@ MKOSI_ARCH := $(if $(filter arm64,$(notdir $(APPLIANCE_ARCH))),arm64,x86-64)
 # Per-build identifier used as the image tag (compose substitutes via
 # ``${SPATIUMDDI_VERSION}``). Computed once per ``make`` invocation —
 # git short sha + 4 random hex chars — so each ISO cut produces a
-# distinct tag visible in ``docker ps`` (e.g. ``ghcr.io/spatiumddi/
+# distinct tag visible in ``docker ps`` (e.g. ``ghcr.io/spatiumnorth/
 # spatiumddi-api:dev-148c437-a3f2``). Mirrors how ISOs are tracked
 # by build-NN; gives operators an in-container way to confirm which
 # build a running stack came from.
@@ -137,7 +137,7 @@ build: build-supervisor
 	# stale-source guard when nothing rebuilt it recently).
 	docker build -t spatiumddi-looking-glass:dev -f agent/looking-glass/images/gobgp/Dockerfile .
 	# #272 Phase 1 — retag compose-built images under the canonical
-	# ``ghcr.io/spatiumddi/<name>:dev`` form so
+	# ``ghcr.io/spatiumnorth/<name>:dev`` form so
 	# ``appliance/scripts/bake-images.sh``'s resolve_source_tag picks
 	# the freshly-built image. Pre-#272 the bake's first-candidate
 	# was ``ghcr.io/...:dev``, which on most dev hosts was a
@@ -152,7 +152,7 @@ build: build-supervisor
 	# by ``build-supervisor`` already.
 	@# Compose tags ``<project>-<service>:dev`` (project=spatiumddi).
 	@# bake-images.sh's IMAGES list uses the canonical
-	@# ``ghcr.io/spatiumddi/<short>`` form where <short> matches the
+	@# ``ghcr.io/spatiumnorth/<short>`` form where <short> matches the
 	@# upstream image name — which is NOT always the compose service
 	@# name. Map explicitly:
 	@for pair in \
@@ -165,7 +165,7 @@ build: build-supervisor
 	    "looking-glass:looking-glass"; do \
 	  compose="$${pair%%:*}"; target="$${pair##*:}"; \
 	  if docker image inspect "spatiumddi-$$compose:dev" >/dev/null 2>&1; then \
-	    docker tag "spatiumddi-$$compose:dev" "ghcr.io/spatiumddi/$$target:dev"; \
+	    docker tag "spatiumddi-$$compose:dev" "ghcr.io/spatiumnorth/$$target:dev"; \
 	  fi; \
 	done
 
@@ -180,7 +180,7 @@ build: build-supervisor
 # local-source resolver finds it under either form.
 build-supervisor:
 	docker build -t spatium-supervisor:dev \
-	             -t ghcr.io/spatiumddi/spatium-supervisor:dev \
+	             -t ghcr.io/spatiumnorth/spatium-supervisor:dev \
 	             -f agent/supervisor/images/supervisor/Dockerfile .
 
 # ── Database ───────────────────────────────────────────────────────────────────
@@ -326,7 +326,7 @@ trivy:
 # ── OpenAPI contract export (#903) ──────────────────────────────────────────
 #
 # Produces the same openapi.json the release workflow attaches to every CalVer
-# tag, so a client repo (spatiumddi/spatiumddi-mobile) can regenerate and diff
+# tag, so a client repo (spatiumnorth/spatiumddi-mobile) can regenerate and diff
 # the contract without waiting for a release.
 #
 # Runs inside the API image rather than a host venv on purpose: the artifact is
@@ -542,7 +542,7 @@ APPLIANCE_OUT     = $(APPLIANCE_DIR)/build
 # mkosi names the output `<ImageId>_<ImageVersion>.raw` — derive both
 # at runtime from whatever appears in build/ so a version bump in
 # mkosi.conf doesn't break the Makefile.
-APPLIANCE_BUILDER = ghcr.io/spatiumddi/appliance-builder:latest
+APPLIANCE_BUILDER = ghcr.io/spatiumnorth/appliance-builder:latest
 
 appliance:
 	@command -v docker >/dev/null || \

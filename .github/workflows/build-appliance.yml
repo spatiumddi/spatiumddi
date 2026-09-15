@@ -214,7 +214,7 @@ jobs:
           # ``DOCKER_CONFIG=$HOME/.docker`` re-points root's docker CLI
           # at the runner-user's ``~/.docker/config.json`` where the
           # docker/login-action step above stamped the GHCR creds. Our
-          # ghcr.io/spatiumddi/* images are private; without this redirect
+          # ghcr.io/spatiumnorth/* images are private; without this redirect
           # root would docker-pull anonymously and 401 on every image.
           sudo DOCKER_CONFIG="$HOME/.docker" -E appliance/scripts/bake-images.sh
           echo "→ Baked image tarballs:"

@@ -371,7 +371,7 @@ next attempt.
 
 ## ACME client (issuing certs for the Web UI)
 
-> **Issue [#438](https://github.com/spatiumddi/spatiumddi/issues/438)
+> **Issue [#438](https://github.com/spatiumnorth/spatiumddi/issues/438)
 > — landed on `issue-438`.** Distinct from the ACME *provider*
 > documented above. The provider answers DNS-01 challenges for
 > *external* ACME clients (certbot / lego / acme.sh). The client

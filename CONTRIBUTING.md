@@ -5,13 +5,13 @@ Thank you for your interest in contributing! SpatiumDDI is an open project and w
 ## Before You Start
 
 - Read the [CLAUDE.md](CLAUDE.md) file — it is the canonical spec for the project and defines all architectural decisions
-- Check [open issues](https://github.com/spatiumddi/spatiumddi/issues) to avoid duplicate work
+- Check [open issues](https://github.com/spatiumnorth/spatiumddi/issues) to avoid duplicate work
 - For significant changes, open a discussion or issue first so we can align before you invest time coding
 
 ## Development Setup
 
 ```bash
-git clone https://github.com/spatiumddi/spatiumddi.git
+git clone https://github.com/spatiumnorth/spatiumddi.git
 cd spatiumddi
 cp .env.example .env
 docker compose up -d
@@ -55,14 +55,14 @@ it is still the right way to contribute.
 
 ## Reporting Bugs
 
-Use the [GitHub Issues](https://github.com/spatiumddi/spatiumddi/issues)
+Use the [GitHub Issues](https://github.com/spatiumnorth/spatiumddi/issues)
 tracker — the "Bug report" issue template will prompt you for everything
 that's needed (version, deployment method, area, repro steps, logs,
 environment details). The "Feature request" template has separate fields
 for the problem, the proposed solution, and alternatives considered.
 
 Security vulnerabilities should **not** be filed as issues — please use
-[GitHub Security Advisories](https://github.com/spatiumddi/spatiumddi/security/advisories/new)
+[GitHub Security Advisories](https://github.com/spatiumnorth/spatiumddi/security/advisories/new)
 for private disclosure.
 
 ## License

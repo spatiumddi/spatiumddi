@@ -19,7 +19,7 @@
 #
 # Auth: GITHUB_TOKEN is scoped to the repo running the workflow and cannot
 # push to another repo, so this uses an SSH deploy key registered on the
-# spatiumddi.github.io repo with write access. The private half lives in the
+# spatiumnorth.github.io repo with write access. The private half lives in the
 # DOCS_DEPLOY_KEY secret. To rotate: generate a new ed25519 pair, replace the
 # deploy key on the target repo, then update the secret here.
 name: Publish docs site
@@ -59,7 +59,7 @@ env:
   # The repo must keep the <org>.github.io name — that is what makes GitHub
   # serve it as the organization site. www.spatiumddi.com is the custom
   # domain configured on top of it, not the repo's name.
-  TARGET_REPO: git@github.com:spatiumddi/spatiumddi.github.io.git
+  TARGET_REPO: git@github.com:spatiumnorth/spatiumnorth.github.io.git
   # The branch GitHub Pages is configured to serve on the site repo.
   TARGET_BRANCH: main
 
@@ -68,7 +68,7 @@ jobs:
     name: Mirror docs/ to the site repo
     # Forks inherit this workflow (#830); never run the publisher outside
     # the canonical repo. (Single-job workflow.)
-    if: github.repository_owner == 'spatiumddi'
+    if: github.repository_owner == 'spatiumnorth'
     runs-on: ubuntu-latest
     steps:
       - name: Check out source ref
@@ -129,7 +129,7 @@ jobs:
 
           mkdir -p site/.github
           cat > site/.github/README.md <<'EOF'
-          # spatiumddi.github.io
+          # spatiumnorth.github.io
 
           **Generated — do not edit this repository directly.**
 
@@ -137,7 +137,7 @@ jobs:
           <https://www.spatiumddi.com>.
 
           Its entire contents are mirrored from the `docs/` directory of
-          [spatiumddi/spatiumddi](https://github.com/spatiumddi/spatiumddi) by
+          [spatiumnorth/spatiumddi](https://github.com/spatiumnorth/spatiumddi) by
           the `docs-publish` workflow, which runs on every release tag. Any
           commit made here by hand will be overwritten by the next release.
 
@@ -161,6 +161,6 @@ jobs:
             exit 0
           fi
           git commit -m "docs: publish ${VERSION}" -m \
-            "Mirrored from spatiumddi/spatiumddi@${SOURCE_SHA} by the docs-publish workflow. Do not edit this repository directly."
+            "Mirrored from spatiumnorth/spatiumddi@${SOURCE_SHA} by the docs-publish workflow. Do not edit this repository directly."
           git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
           echo "Published ${VERSION} to https://www.spatiumddi.com/"

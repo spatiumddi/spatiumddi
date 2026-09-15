@@ -31,7 +31,7 @@ name: spatiumddi-agent-looking-glass
 services:
 
   looking-glass:
-    image: ghcr.io/spatiumddi/looking-glass:${SPATIUMDDI_VERSION:-latest}
+    image: ghcr.io/spatiumnorth/looking-glass:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
     hostname: ${LG_HOSTNAME:-looking-glass}
     # BGP needs the real routable interface — a bridged network only

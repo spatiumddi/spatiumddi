@@ -291,11 +291,11 @@ def test_missing_platform_flag_still_catches_a_wrong_arch_image(rig):
 
 
 def test_candidate_tag_forms_are_tried_in_order(rig):
-    """The bake resolves ``ghcr.io/spatiumddi/x`` to one of four local tag
+    """The bake resolves ``ghcr.io/spatiumnorth/x`` to one of four local tag
     spellings; the guard must check whichever one the bake would use."""
     r = rig(
-        ["ghcr.io/spatiumddi/looking-glass"],
-        tags={"ghcr.io/spatiumddi/looking-glass:dev": ("amd64", "amd64")},
+        ["ghcr.io/spatiumnorth/looking-glass"],
+        tags={"ghcr.io/spatiumnorth/looking-glass:dev": ("amd64", "amd64")},
     )
     assert r.returncode == 0, r.stderr
-    assert "ghcr.io/spatiumddi/looking-glass:dev" in r.stdout
+    assert "ghcr.io/spatiumnorth/looking-glass:dev" in r.stdout

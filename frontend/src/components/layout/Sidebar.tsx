@@ -658,7 +658,7 @@ export function Sidebar({
           />
 
           <a
-            href="https://github.com/spatiumddi/spatiumddi"
+            href="https://github.com/spatiumnorth/spatiumddi"
             target="_blank"
             rel="noopener noreferrer"
             title={effectiveCollapsed ? "GitHub" : undefined}

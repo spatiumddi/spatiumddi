@@ -102,7 +102,7 @@ async def _run_update(force: bool = False) -> dict[str, Any]:
                 # Present as a regular HTTP client; no cookies, no JS, just
                 # a static CSV fetch.
                 headers = {
-                    "User-Agent": "SpatiumDDI-OUI-Fetcher/1.0 (+https://github.com/spatiumddi/spatiumddi)",
+                    "User-Agent": "SpatiumDDI-OUI-Fetcher/1.0 (+https://github.com/spatiumnorth/spatiumddi)",
                     "Accept": "text/csv,text/plain,*/*",
                 }
                 async with httpx.AsyncClient(

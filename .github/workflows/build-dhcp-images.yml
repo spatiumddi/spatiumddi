@@ -76,7 +76,7 @@ jobs:
           platforms: linux/amd64
           push: false
           load: true
-          tags: ghcr.io/spatiumddi/dhcp-${{ matrix.flavor }}:pr-scan
+          tags: ghcr.io/spatiumnorth/dhcp-${{ matrix.flavor }}:pr-scan
           build-args: |
             APK_SNAPSHOT=${{ steps.snap.outputs.snapshot }}
             APT_SNAPSHOT=${{ steps.snap.outputs.snapshot }}
@@ -92,7 +92,7 @@ jobs:
           # never resolved (metadata-action emits ``sha-<short>``,
           # not raw full SHAs, and on PR nothing gets pushed) so
           # Trivy 404'd with MANIFEST_UNKNOWN.
-          image-ref: ghcr.io/spatiumddi/dhcp-${{ matrix.flavor }}:pr-scan
+          image-ref: ghcr.io/spatiumnorth/dhcp-${{ matrix.flavor }}:pr-scan
           format: json
           output: trivy-report.json
           severity: HIGH,CRITICAL
@@ -115,4 +115,4 @@ jobs:
         run: >-
           .github/scripts/trivy-gate.sh
           "trivy-report.json"
-          "ghcr.io/spatiumddi/dhcp-${{ matrix.flavor }}:pr-scan"
+          "ghcr.io/spatiumnorth/dhcp-${{ matrix.flavor }}:pr-scan"

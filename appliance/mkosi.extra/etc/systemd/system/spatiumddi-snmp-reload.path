@@ -1,6 +1,6 @@
 [Unit]
 Description=Watch for SpatiumDDI SNMP config-reload trigger (issue #153)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/153
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/153
 # Skip on the live ISO — snmpd isn't part of the installer environment.
 ConditionKernelCommandLine=!boot=live
 

@@ -126,7 +126,7 @@ class Settings(BaseSettings):
 
     # GitHub repo coordinates used by the release-check task. Overridable
     # so forks can point their update check at their own repo.
-    github_repo: str = "spatiumddi/spatiumddi"
+    github_repo: str = "spatiumnorth/spatiumddi"
 
     # When ``True`` (recommended for any non-dev deployment), the boot
     # fails fast if ``SECRET_KEY`` is still set to the .env.example

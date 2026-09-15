@@ -1,6 +1,6 @@
 [Unit]
 Description=Clear wedged k3s HelmChart releases so helm-controller retries (#183 Phase 9)
-Documentation=https://github.com/spatiumddi/spatiumddi/issues/183
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/183
 After=k3s.service
 # Wants, not Requires: with Requires= every k3s restart (a member join, a
 # slot upgrade, an etcd exit on a wedged cluster) took a running recovery
