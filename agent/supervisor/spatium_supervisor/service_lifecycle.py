@@ -217,12 +217,33 @@ def _build_values(profiles: list[str], env_vars: dict[str, str]) -> dict[str, ob
     # exclusively (``spatium.io/role-<role>=true``); the supervisor
     # toggles those on every heartbeat via reconcile_node_labels.
     #
-    # The role release ALWAYS sets every role's enabled=true (so the
-    # chart renders + helm tracks the Deployment + PVCs). The
-    # bootstrap release sets them all false (so spatium-bootstrap
-    # doesn't fight us for ownership). Result: role swap = pure
-    # label flip, no chart upgrade, no chartContent re-upload to
-    # kine — Phase 9 kine-footprint follow-up closes.
+    # The role release renders every agent DaemonSet whose KEY it has
+    # (so the chart renders + helm tracks the DaemonSet); the bootstrap
+    # release sets them all false (so spatium-bootstrap doesn't fight
+    # us for ownership). A role swap between DNS engines is still a
+    # pure label flip — one ``DNS_AGENT_KEY`` renders all three engines.
+    #
+    # #1062 — gated on the key, not rendered unconditionally. Every
+    # agent entrypoint refuses an empty key by design and exits 2
+    # (``bind9/entrypoint.sh:6``, ``kea/entrypoint.sh:38``,
+    # ``gobgp/entrypoint.sh:9``), so a DaemonSet rendered before its key
+    # exists is an object that can only crash. The supervisor's FIRST
+    # apply is the idle one — the heartbeat before any role or key has
+    # arrived — and it used to create every agent DaemonSet keyless
+    # (revision 1). When the roles then arrived the node label landed
+    # in milliseconds while the keyed re-render took helm-controller's
+    # Job ~11 s, so the DaemonSet scheduled a revision-1 pod that died
+    # twice and was replaced by revision 2 — on every fresh install.
+    # Rendering the DaemonSet only once its key is in the role env
+    # means the first revision that exists is keyed, and the pod the
+    # label schedules is the one that serves. A role assigned without a
+    # configured key is held back (logged by apply_role_assignment, and
+    # ``missing`` in the watchdog's role_health) rather than crash-looped;
+    # a role removed takes its DaemonSet with it (its key leaves the env),
+    # which is the same chart upgrade the key's departure caused before.
+    dns_key = env_vars.get("DNS_AGENT_KEY", "")
+    dhcp_key = env_vars.get("DHCP_AGENT_KEY", "")
+    lg_key = env_vars.get("LG_AGENT_KEY", "")
     values: dict[str, object] = {
         "global": {
             "imageTag": image_tag,
@@ -257,27 +278,27 @@ def _build_values(profiles: list[str], env_vars: dict[str, str]) -> dict[str, ob
             "enabled": False,
         },
         "dnsBind9": {
-            "enabled": True,
+            "enabled": bool(dns_key),
             "controlPlaneUrl": control_plane_url,
-            "agentKey": env_vars.get("DNS_AGENT_KEY", ""),
+            "agentKey": dns_key,
             "serverGroupName": env_vars.get("AGENT_GROUP", ""),
         },
         "dnsPowerdns": {
-            "enabled": True,
+            "enabled": bool(dns_key),
             "controlPlaneUrl": control_plane_url,
-            "agentKey": env_vars.get("DNS_AGENT_KEY", ""),
+            "agentKey": dns_key,
             "serverGroupName": env_vars.get("AGENT_GROUP", ""),
         },
         "dnsTechnitium": {
-            "enabled": True,
+            "enabled": bool(dns_key),
             "controlPlaneUrl": control_plane_url,
-            "agentKey": env_vars.get("DNS_AGENT_KEY", ""),
+            "agentKey": dns_key,
             "serverGroupName": env_vars.get("AGENT_GROUP", ""),
         },
         "dhcpKea": {
-            "enabled": True,
+            "enabled": bool(dhcp_key),
             "controlPlaneUrl": control_plane_url,
-            "agentKey": env_vars.get("DHCP_AGENT_KEY", ""),
+            "agentKey": dhcp_key,
             # #555 — NO ``AGENT_GROUP`` fallback here. ``AGENT_GROUP`` is
             # written only for DNS roles (role_orchestrator writes
             # ``DHCP_AGENT_GROUP`` for DHCP), so the fallback could only ever
@@ -288,19 +309,31 @@ def _build_values(profiles: list[str], env_vars: dict[str, str]) -> dict[str, ob
             "serverGroupName": env_vars.get("DHCP_AGENT_GROUP", ""),
             "networkMode": env_vars.get("DHCP_NETWORK_MODE", "host"),
         },
-        # #566 — BGP Looking Glass collector (GoBGP). ``enabled: True``
-        # unconditionally, same release-ownership-not-scheduling-scope
-        # convention as every other role block above — pod scheduling
-        # is gated purely by the ``spatium.io/role-looking-glass`` node
-        # label. No group/serverGroupName concept (LG peers aren't
-        # grouped like DNS/DHCP server groups).
+        # #566 — BGP Looking Glass collector (GoBGP). Same
+        # release-ownership-not-scheduling-scope convention as every
+        # other role block above — pod scheduling is gated purely by
+        # the ``spatium.io/role-looking-glass`` node label — and the
+        # same #1062 key gate. No group/serverGroupName concept (LG
+        # peers aren't grouped like DNS/DHCP server groups).
         "lookingGlass": {
-            "enabled": True,
+            "enabled": bool(lg_key),
             "controlPlaneUrl": control_plane_url,
-            "agentKey": env_vars.get("LG_AGENT_KEY", ""),
+            "agentKey": lg_key,
         },
     }
     return values
+
+
+def roles_awaiting_key(profiles: list[str], values: dict[str, object]) -> set[str]:
+    """The assigned profiles whose DaemonSet the values do NOT render yet
+    (#1062): the role's chart block is ``enabled: False`` because its agent
+    key is not in the role env. Pure; ``apply_role_assignment`` logs it."""
+    out: set[str] = set()
+    for profile in profiles:
+        block = values.get(_PROFILE_TO_HELM_KEY.get(profile, ""))
+        if isinstance(block, dict) and block.get("enabled") is False:
+            out.add(profile)
+    return out
 
 
 def _read_chart_tarball() -> bytes:
@@ -402,6 +435,12 @@ def apply_role_assignment(
 
     env_vars = _parse_env_file(env_file)
     values = _build_values(profiles, env_vars)
+    held_back = roles_awaiting_key(profiles, values)
+    if held_back:
+        # #1062 — an assigned role whose key is not in the role env is
+        # not rendered (its DaemonSet could only crash); the next
+        # heartbeat that brings the key re-applies with it.
+        log.info("supervisor.k3s_lifecycle.roles_awaiting_key", roles=sorted(held_back))
 
     try:
         chart_bytes = _read_chart_tarball()
@@ -539,5 +578,6 @@ __all__ = [
     "apply_role_assignment",
     "k3s_available",
     "reconcile_node_labels",
+    "roles_awaiting_key",
     "tear_down_supervised_services",
 ]
