@@ -1253,7 +1253,7 @@ async def _sync_dns_record(
     zone_id: uuid.UUID | None = None,
     action: str = "create",  # create | update | delete
     ttl: int | None = None,
-) -> None:
+) -> bool:
     """Create, update, or delete the auto-generated A + PTR records for this IP.
 
     Forward A goes in the subnet's DNS zone (or explicitly passed zone_id);
@@ -1264,6 +1264,13 @@ async def _sync_dns_record(
     passes the subnet's effective ``ddns_ttl`` — #428); None inherits the
     zone default. Updates preserve the existing TTL so a rename doesn't
     churn it.
+
+    Returns whether the sync had anything to do: False when the row carries
+    no hostname, when there is no primary zone and no extra zone to publish
+    into, or when a delete found no auto-generated record; True once it ran
+    against a zone (including retractions). Callers that report on the
+    outcome — the DDNS path logs ``ddns_applied`` — must not claim more than
+    this says (spatiumddi#1065).
     """
     if action == "delete":
         result = await db.execute(
@@ -1274,7 +1281,8 @@ async def _sync_dns_record(
             )
             .options(selectinload(DNSRecord.zone))
         )
-        for record in result.scalars().all():
+        records = list(result.scalars().all())
+        for record in records:
             zone = record.zone
             if zone is not None:
                 await _enqueue_dns_op(
@@ -1292,7 +1300,7 @@ async def _sync_dns_record(
         # the orphan row keeps showing what was published before the delete
         # (greyed out in the UI), and so a later restore knows which zones to
         # put the records back into.
-        return
+        return bool(records)
 
     effective_zone_id = zone_id or await _resolve_effective_zone(db, subnet)
     # Fallback: when the subnet hierarchy resolves to no zone (operator
@@ -1304,10 +1312,10 @@ async def _sync_dns_record(
     if effective_zone_id is None:
         effective_zone_id = ip.forward_zone_id
     if not ip.hostname:
-        return
+        return False
     if effective_zone_id is None and not ip.extra_zone_ids:
         # Nothing to publish to — no primary zone, no extras.
-        return
+        return False
 
     zone = await db.get(DNSZone, effective_zone_id) if effective_zone_id else None
     if effective_zone_id and not zone:
@@ -1588,14 +1596,14 @@ async def _sync_dns_record(
             await db.delete(rec)
         if stale_ptrs:
             ip.reverse_zone_id = None
-        return
+        return True
     try:
         ip_obj = ipaddress.ip_address(str(ip.address))
     except ValueError:
-        return
+        return True
     rev_zone = await _resolve_reverse_zone(db, subnet, ip_obj)
     if rev_zone is None:
-        return  # No reverse zone covers this IP — quietly skip
+        return True  # No reverse zone covers this IP — quietly skip the PTR
 
     rev_pointer_full = ip_obj.reverse_pointer + "."
     rev_zone_name = rev_zone.name.rstrip(".") + "."
@@ -1662,6 +1670,7 @@ async def _sync_dns_record(
                     await _enqueue_dns_op(
                         db, rev_zone, "update", ptr_name, "PTR", ptr_value, record.ttl
                     )
+    return True
 
 
 def _compute_free_cidrs(
