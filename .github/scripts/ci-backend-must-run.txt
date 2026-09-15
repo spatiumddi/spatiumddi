@@ -94,6 +94,18 @@ docs/PRIVACY.md
 # edit that would reintroduce them must run the test that says it must not.
 .github/workflows/trivy-scheduled.yml
 
+# test_trivy_pr_lanes.py (#1093) pins that every PR-time image lane busts its
+# cached package layer and routes its verdict through trivy-gate.sh rather
+# than Trivy's own exit code. Listed exactly rather than as a
+# ".github/workflows/build-" prefix because test_manifest_entries_exist_on_disk
+# requires every entry to name something real — a prefix that matches nothing
+# is how a stale carve-out hides. The test itself globs, so a fifth lane is
+# covered the day it lands; add it here too so editing it runs that test.
+.github/workflows/build-dns-images.yml
+.github/workflows/build-dhcp-images.yml
+.github/workflows/build-looking-glass-images.yml
+.github/workflows/build-supervisor-image.yml
+
 # The two shipped nginx templates (#972). `backend/tests/test_e911_held.py`
 # asserts both carry a `location /held` block: the HELD endpoint is mounted at
 # the application root rather than under /api/, so without one it falls through
