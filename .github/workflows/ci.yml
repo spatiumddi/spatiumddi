@@ -721,7 +721,7 @@ jobs:
       - name: Install Helm
         uses: azure/setup-helm@v5
         with:
-          version: v3.22.0
+          version: v4.3.0
 
       - name: Install kubeconform
         run: .github/scripts/install-kubeconform.sh

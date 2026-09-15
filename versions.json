@@ -94,7 +94,7 @@
     },
 
     "helm": {
-      "version": "v3.22.0",
+      "version": "v4.3.0",
       "pinned_in": [
         { "path": "Makefile", "match": "alpine/helm:{version_no_v}", "count": 1 },
         { "path": ".github/workflows/ci.yml", "match": "version: {version}", "count": 1 },
@@ -102,8 +102,8 @@
         { "path": ".github/workflows/build-appliance.yml", "match": "version: {version}", "count": 1 },
         { "path": ".github/workflows/agent-e2e.yml", "match": "version: {version}", "count": 1 }
       ],
-      "upstream": { "kind": "github-release", "repo": "helm/helm", "track": "^v3\\." },
-      "note": "Build-time tool only -- nothing ships it: this CLI lints, templates and PACKAGES the charts. v3.22.0 is the TERMINAL 3.x feature release (2026-09-10); 3.x is security-only until 2027-02-10, so this pin is a floor, not a resting place -- the move to 4.x is #1098. This note previously claimed we stayed on 3.x because the appliance renders through k3s's bundled helm-controller, 'independent of this binary'. That conclusion was wrong: the controller spawns klipper-helm, and the pinned v0.13.3-build20260727 ships Helm 4.1.4 -- so bake-chart.sh already packages with 3 and the appliance already installs with 4. A 4.x move CLOSES that divergence rather than creating it. Five copies, none of them Dependabot-visible; this component is the reason the manifest exists."
+      "upstream": { "kind": "github-release", "repo": "helm/helm", "track": "^v4\\." },
+      "note": "Build-time tool only -- nothing ships it: this CLI lints, templates and PACKAGES the charts. On 4.x since #1098, which CLOSED a real divergence rather than creating one: bake-chart.sh packages the chart with THIS binary, then k3s's helm-controller spawns klipper-helm to install it -- and the pinned v0.13.3-build20260727 ships Helm 4.1.4 (verified: `helm version --short` in that image). So the appliance has been installing with 4 while CI validated with 3; the CLI major now matches what production runs. Keep it that way -- if the klipper-helm pin in appliance/mkosi.extra/usr/share/doc/k3s/k3s-images.txt moves to a different helm major, this pin should follow it. (3.x history: v3.22.0 was the terminal 3.x feature release, 2026-09-10; security-only to 2027-02-10.) Five copies, none of them Dependabot-visible; this component is the reason the manifest exists."
     },
 
     "kubeconform": {

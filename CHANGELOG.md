@@ -24,6 +24,48 @@ the formatter handles the rest.
 
 ### Changed
 
+- **helm 3.22.0 → 4.3.0 (#1098).** Build-time tool only; nothing
+  ships it. The same five copies move together — `versions.json`
+  plus the Makefile's `alpine/helm` image and the `version:` input
+  in `ci.yml`, `release.yml`, `build-appliance.yml` and
+  `agent-e2e.yml` — and the manifest's `track` becomes `^v4\.`.
+  **This CLOSES a divergence rather than opening one.** `bake-chart.sh`
+  packages the chart with THIS binary; on the node, k3s's
+  helm-controller spawns `klipper-helm` to install it — and the
+  pinned `v0.13.3-build20260727` ships **Helm 4.1.4** (verified
+  directly: `helm version --short` in that image). So the appliance
+  has been installing with 4 while CI validated with 3. The CLI
+  major now matches what production actually runs.
+  **The charts render identically.** Both majors were run against the
+  same tree and the 323 rendered objects compared after parsing, not
+  as text. 18 objects differed — but 17 of those also differ between
+  two runs of the *same* 3.22.0 binary, because the charts generate
+  random credentials, so the control run is what identifies them as
+  noise. Exactly one difference is attributable to Helm 4: a single
+  trailing blank line inside the `frr.conf` string of the
+  `metallb-bgp-frr-k8s-frr-startup` ConfigMap (227 → 228 bytes),
+  which is inert. Everything else in the textual diff is comment
+  placement and blank lines in the output stream, outside any object.
+  Also exercised under 4.3.0: `helm lint` + `dependency update` +
+  `package` for all three charts (the `bake-chart.sh` and
+  `release.yml` path), and an OCI `helm push` + `helm pull`
+  round-trip against a throwaway registry, digests matching.
+  **No breaking-change exposure**, re-audited against the tree rather
+  than the changelog: no post-renderers, no plugins, no `--atomic`,
+  no helm `--force`, `registry login` is already domain-only
+  (`ghcr.io`), and all three charts are `apiVersion: v2`, which Helm 4
+  runs unchanged. The flags we do pass — `--set`, `--timeout`,
+  `--kube-version`, `--create-namespace`, `--wait`, `--reuse-values`
+  — are unrenamed. The `helm upgrade` / `uninstall` strings elsewhere
+  in the tree are prose, or commands we print for operators to run
+  with their own helm; those were checked too and use no renamed flag.
+  The one behavioural change is server-side apply, which Helm 4
+  defaults to on **new** installs. The appliance is unaffected — it
+  is already on 4.1.4 — so the only newly-affected path is the single
+  kind `helm install` in `agent-e2e.yml`, and that workflow is
+  path-filtered on itself, so this change exercises it.
+
+
 - **GitHub organization renamed `spatiumddi` → `spatiumnorth`.** The
   project is now `spatiumnorth/spatiumddi`: the org changed, the
   repository name did not, and neither did the product, the PyPI
