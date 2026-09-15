@@ -121,16 +121,37 @@ jobs:
             # tracking issue untouched with a warning. The scan could report
             # "clean" and could never report a CVE. Commands in an ``if``
             # condition are exempt from ``-e``; keep this shape.
+            # #1095 — JSON, not ``--format table``. Trivy's table opens with a
+            # Report Summary carrying one row per scanned target, which for the
+            # api image is every site-packages METADATA file: measured, the
+            # full table is 107 KB and the first CVE does not appear until byte
+            # 76,926. The old ``head -c 12000`` of it therefore captured
+            # summary rows and NEVER a CVE — the tracking issue reported a
+            # count and nothing to act on. Rendering from JSON removes the
+            # truncation problem rather than mitigating it (~34 findings in
+            # ~3 KB), and is independent of Trivy's table layout.
             if docker run --rm \
               -v /var/run/docker.sock:/var/run/docker.sock \
               -v "$cache":/root/.cache/ \
               aquasec/trivy:latest image \
               --severity HIGH,CRITICAL --ignore-unfixed --scanners vuln \
-              --format table --exit-code 1 -q \
-              "trivy-scan-$name:scan" > "$RUNNER_TEMP/trivy-$name.txt" 2>"$RUNNER_TEMP/trivy-$name.log"; then
+              --format json --exit-code 1 -q \
+              "trivy-scan-$name:scan" > "$RUNNER_TEMP/trivy-$name.json" 2>"$RUNNER_TEMP/trivy-$name.log"; then
               rc=0
             else
               rc=$?
+            fi
+
+            # rc=1 DOES NOT MEAN "findings" on its own. An unrecognised flag
+            # also exits 1 — verified against 0.74.0 — and writes ~15 KB of
+            # usage text to stdout, the stream captured above. With
+            # ``aquasec/trivy:latest`` unpinned, a CLI change would otherwise
+            # file a security issue whose body is Trivy's help output,
+            # presented as CVEs. A report that will not parse is a scan ERROR:
+            # never findings, and never a clean bill.
+            if [ "$rc" -eq 1 ] && ! jq -e 'has("Results")' "$RUNNER_TEMP/trivy-$name.json" >/dev/null 2>&1; then
+              echo "⚠️ exit 1 but the report is not a Trivy document — treating as a scan error"
+              rc=90
             fi
 
             if [ "$rc" -eq 0 ]; then
@@ -138,12 +159,36 @@ jobs:
             elif [ "$rc" -eq 1 ]; then
               echo "🚨 findings"
               any=1
+              # One row per finding. ``FixedVersion`` can list several; the
+              # first is the lowest that clears the CVE, matching trivy-gate.sh.
+              rows=$(jq -r '
+                .Results[]? as $r
+                | ($r.Vulnerabilities // [])[]
+                | "| \(.Severity) | `\(.PkgName)` | \(.VulnerabilityID) | `\(.InstalledVersion)` | `\((.FixedVersion // "-") | split(",")[0] | gsub("^\\s+|\\s+$"; ""))` |"
+                ' "$RUNNER_TEMP/trivy-$name.json" | sort -u)
+              total=$(printf '%s\n' "$rows" | grep -c '^|' || true)
+              # The COMPLETE set into the run log, inside this image's group.
+              # The report below may be capped, and its note says the full list
+              # is here — which was not true of the old capture, where the
+              # scan output went only to a file that nothing ever echoed.
+              printf '%s\n' "$rows"
               {
-                echo "### \`$name\` (\`$df\`)"
+                echo "### \`$name\` (\`$df\`) — $total finding(s)"
                 echo ""
-                echo '```'
-                head -c 12000 "$RUNNER_TEMP/trivy-$name.txt"
-                echo '```'
+                echo "| Severity | Package | CVE | Installed | Fixed |"
+                echo "|---|---|---|---|---|"
+                # Cap as a backstop only, and never silently: the reporting
+                # step has its own 60 KB body guard, so an image with a very
+                # large finding set must not crowd out the images after it.
+                # LINE cap, not ``head -c``: a byte cap can cut mid-row, and a
+                # partial line still starts with "|", so it would render as a
+                # malformed table row rather than being dropped. Rows are
+                # sorted, so CRITICAL survives truncation ahead of HIGH.
+                printf '%s\n' "$rows" | head -n 200 | grep '^|' || true
+                if [ "$total" -gt 200 ]; then
+                  echo ""
+                  echo "_Truncated: showing 200 of $total findings. Full report in the run log._"
+                fi
                 echo ""
               } >> "$report"
             else
@@ -237,7 +282,9 @@ jobs:
                 `fix-available** CVEs (or a scan/build error).\n\n` +
                 `- Scan run: ${runUrl}\n- Last updated: ${today}\n\n` +
                 `${report}\n\n---\n` +
-                `Reproduce the agent images locally with \`make trivy\`. ` +
+                `Reproduce an agent image locally with \`make trivy IMAGE=<name>\`; ` +
+                `\`backend\` and \`frontend\` are not agent images — build the Dockerfile ` +
+                `above (\`--target runtime\` for backend) and scan it with the same flags. ` +
                 `This issue auto-closes when a later scheduled scan is clean.`;
               // GitHub caps issue bodies at 65536 chars.
               if (body.length > 60000) body = body.slice(0, 60000) + '\n\n_…truncated._';

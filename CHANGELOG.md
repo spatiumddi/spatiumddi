@@ -22,6 +22,40 @@ the formatter handles the rest.
 
 ## Unreleased
 
+### Fixed
+
+- **The weekly Trivy issue reported a CVE count and zero CVEs
+  (#1095).** #1092 is the worked example: it said the api image
+  had 5 HIGH/CRITICAL
+  fix-available vulnerabilities and contained no CVE identifier at
+  all. The scan captured `head -c 12000` of Trivy's *table* output,
+  whose Report Summary carries one row per scanned target — which
+  for that image is every `site-packages/*.dist-info/METADATA`
+  file. Measured: the full table is 107,220 bytes and the first
+  `CVE-` does not appear until byte **76,926**, so the cap could
+  only ever capture summary rows. Not a near miss; the detail
+  starts at 6.4x the cap. The report now renders from
+  `--format json`, which removes the truncation rather than
+  mitigating it — the same 34 findings come to 2,765 bytes against
+  107 KB — and gives severity, package, CVE, installed and fixed
+  version per row.
+  **`rc=1` no longer means "findings" on its own**, which is the
+  sharper half. An unrecognised flag ALSO exits 1 — verified
+  against Trivy 0.74.0 — and writes ~15 KB of usage text to the
+  captured stdout stream. The image is `aquasec/trivy:latest`,
+  unpinned, so a CLI change would have filed a security tracking
+  issue whose body was Trivy's help output, presented as CVEs. A
+  report that does not parse as a Trivy document is now a scan
+  error: never findings, and never a clean bill.
+  Truncation, if it happens at all, is capped by LINE and says
+  what it dropped — a byte cap can cut mid-row, and a partial line
+  still begins with `|`, so it would render as a malformed table
+  row instead of being dropped. Rows sort CRITICAL first, so a
+  truncated report keeps the worst findings. Also corrected the
+  footer, which sent readers to `make trivy` for `backend` and
+  `frontend` — neither is an agent image, and `backend` is the one
+  that actually reports findings.
+
 ### Security
 
 - **Every shipped image now patches its base image's own packages
