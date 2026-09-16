@@ -273,9 +273,17 @@ async def apply_ddns_for_lease(
     # cycle. Calling at the bottom of the service call is cycle-free.
     from app.api.v1.ipam.router import _sync_dns_record  # noqa: PLC0415
 
-    await _sync_dns_record(
+    published = await _sync_dns_record(
         db, ipam_row, subnet, zone_id=override_zone_id, action="create", ttl=eff.ttl
     )
+    if not published:
+        # spatiumddi#1065 — the sync found no forward zone (no primary, no
+        # extras) and enqueued nothing. This used to log ``ddns_applied``
+        # anyway, so a DDNS-enabled subnet with nowhere to publish looked
+        # exactly like one that worked. Say what happened, where an operator
+        # will see it.
+        _warn_not_published(subnet, ipam_row, hostname, eff)
+        return False
     logger.info(
         "ddns_applied",
         subnet_id=str(subnet.id),
@@ -286,6 +294,42 @@ async def apply_ddns_for_lease(
         ttl=eff.ttl,
     )
     return True
+
+
+# spatiumddi#1065 — every lease that DDNS evaluated and could not publish gets
+# its own ``ddns_not_published`` line, so the condition is visible for each
+# lease it affects (the QA harness reads the log for the lease it just took,
+# and a re-lease of the same address must read the same as a fresh one). The
+# FIRST such lease on a subnet is a warning — the operator's signal, once per
+# subnet per process, the #844 shape; the rest log at info, because the
+# agentless lease pull re-evaluates every lease on every poll and the
+# idempotency guard above never trips while no record exists — a warning per
+# lease per poll would be a storm, silence would be the old lie in a new
+# place. Log level only — never consulted for logic.
+_not_published_warned: set[str] = set()
+
+
+def _warn_not_published(
+    subnet: Subnet, ipam_row: IPAddress, hostname: str, eff: EffectiveDDNS
+) -> None:
+    key = str(subnet.id)
+    log_fn = logger.info if key in _not_published_warned else logger.warning
+    _not_published_warned.add(key)
+    log_fn(
+        "ddns_not_published",
+        subnet_id=str(subnet.id),
+        ip=str(ipam_row.address),
+        hostname=hostname,
+        policy=eff.hostname_policy,
+        zone_override=eff.domain_override,
+        reason="no_forward_zone",
+        note=(
+            "DDNS is enabled for this subnet but it resolves no forward zone to "
+            "publish into: bind one (dns_zone_id with dns_inherit_settings=false), "
+            "inherit one from the block or space, or name one with "
+            "ddns_domain_override"
+        ),
+    )
 
 
 async def _resolve_override_zone_id(db: AsyncSession, domain_override: str | None) -> Any:
@@ -340,13 +384,17 @@ async def revoke_ddns_for_lease(
 
     from app.api.v1.ipam.router import _sync_dns_record  # noqa: PLC0415
 
-    await _sync_dns_record(db, ipam_row, subnet, action="delete")
-    logger.info(
-        "ddns_revoked",
-        subnet_id=str(subnet.id),
-        ip=str(ipam_row.address),
-    )
-    return True
+    # Same honesty as the apply path (spatiumddi#1065): ``ddns_revoked`` only
+    # when a record was actually retracted — a named row that never published
+    # has nothing to revoke.
+    removed = await _sync_dns_record(db, ipam_row, subnet, action="delete")
+    if removed:
+        logger.info(
+            "ddns_revoked",
+            subnet_id=str(subnet.id),
+            ip=str(ipam_row.address),
+        )
+    return removed
 
 
 __all__ = [

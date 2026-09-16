@@ -242,3 +242,109 @@ def test_metallb_bgp_overrides_disabled_shape(monkeypatch) -> None:
     assert "bgp:\n    enabled: false" in vals
     assert "peers: []" in vals
     assert "advertisements: []" in vals
+
+
+# ---- #1059: a scale-down is never written blind -----------------------------------
+
+_HOLD = ("replacing ['ddipg-member-2']: the committed count 2 is short until the "
+         "replacement is promoted")
+
+
+def _cr(spec: int, ready: int | None, reported: int | None, affinity: dict | None = None) -> str:
+    status = {}
+    if ready is not None:
+        status["readyInstances"] = ready
+    if reported is not None:
+        status["instances"] = reported
+    return json.dumps({"spec": {"instances": spec, "affinity": affinity or _SETTLED_AFFINITY},
+                       "status": status})
+
+
+def test_scale_down_is_deferred_while_the_cluster_reports_fewer_ready_than_instances(
+    monkeypatch,
+) -> None:
+    """The refused branch, live on nightly-2026.09.13: the dead node's pod had
+    gone NotReady before the tick, CNPG would not take the smaller spec, and
+    writing it only stopped the operator re-creating the instance until the
+    promote — Postgres two of three for 860 s. Nothing is written now."""
+    rec = _Recorder(200, _cr(3, ready=2, reported=3))
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    res = k8s_api.patch_cnpg_instances(2)
+
+    assert not rec.patched
+    assert (res.changed, res.scaled, res.error) == (False, False, None)
+    assert res.deferred == "readyInstances 2 < instances 3"
+    assert (res.current, res.ready, res.reported) == (3, 2, 3)
+    changed, err = res  # the (changed, error) contract still unpacks
+    assert (changed, err) == (False, None)
+
+
+def test_scale_down_is_held_on_an_eviction_tick_even_when_every_pod_reads_ready(
+    monkeypatch,
+) -> None:
+    """The honoured branch: on the eviction tick the dead node's pod still
+    reads Ready (node-monitor grace), so CNPG WOULD take the smaller spec and
+    delete the highest-serial ready non-primary instance — a healthy replica
+    unless the serial happens to be the dead node's. The caller holds it
+    (heartbeat._ReplaceHold, from that tick until the count is back)."""
+    rec = _Recorder(200, _cr(3, ready=3, reported=3))
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    res = k8s_api.patch_cnpg_instances(2, scale_down=False, hold_reason=_HOLD)
+
+    assert not rec.patched
+    assert res.scaled is False
+    assert res.deferred == _HOLD
+
+
+def test_scale_down_proceeds_on_a_whole_cluster_when_nothing_holds_it(monkeypatch) -> None:
+    """A real demote: every instance ready, no eviction in flight."""
+    rec = _Recorder(200, _cr(3, ready=3, reported=3))
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    res = k8s_api.patch_cnpg_instances(2)
+
+    assert rec.patch_body["spec"]["instances"] == 2
+    assert (res.changed, res.scaled, res.deferred, res.error) == (True, True, "", None)
+
+
+def test_scale_down_with_no_readiness_in_the_status_is_deferred(monkeypatch) -> None:
+    rec = _Recorder(200, _cr(3, ready=None, reported=None))
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    res = k8s_api.patch_cnpg_instances(2)
+
+    assert not rec.patched
+    assert res.deferred == "the Cluster reports no readiness yet"
+
+
+def test_scale_up_is_never_deferred(monkeypatch) -> None:
+    """A 1->3 promote scales up while the single instance is the only ready
+    one; the guards are about shrinking, not growing."""
+    rec = _Recorder(200, _cr(1, ready=1, reported=1))
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    res = k8s_api.patch_cnpg_instances(3, scale_down=False, hold_reason=_HOLD)
+
+    assert rec.patch_body["spec"]["instances"] == 3
+    assert (res.scaled, res.deferred) == (True, "")
+
+
+def test_a_deferred_scale_down_still_repairs_the_affinity(monkeypatch) -> None:
+    """#590's affinity patch rides the same call and must not wait on the
+    size: it lands alone, with no ``instances`` in the merge-patch."""
+    rec = _Recorder(
+        200,
+        _cr(3, ready=2, reported=3,
+            affinity={"enablePodAntiAffinity": True, "podAntiAffinityType": "preferred"}),
+    )
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    res = k8s_api.patch_cnpg_instances(2)
+
+    assert rec.patched
+    assert "instances" not in rec.patch_body["spec"]
+    assert rec.patch_body["spec"]["affinity"]["podAntiAffinityType"] == "required"
+    assert (res.changed, res.scaled) == (True, False)
+    assert res.deferred == "readyInstances 2 < instances 3"

@@ -177,6 +177,29 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A dead-node replace no longer scales the database down (#1059).**
+  The replace endpoint drops the replaced row from the committed
+  control-plane count at once, so from the seed's next heartbeat —
+  the same tick that deletes the dead Node — until the replacement
+  was promoted, CloudNativePG's `spec.instances` read 3→2, and only
+  the promote restored it. CloudNativePG takes a smaller spec while
+  every instance pod still reads Ready (the dead node's does, for
+  the node-monitor grace) and then removes the highest-serial ready
+  non-primary instance, PVCs and all — the dead one by luck, or a
+  healthy replica on a live node; on a later tick it refuses, and
+  the smaller spec then only stops it re-creating the dead instance
+  until the promote (observed live on nightly-2026.09.13: Postgres
+  two of three for 860 s inside a green replace). A two-node
+  control plane is not a legal steady state, so a replace is never
+  a scale-down by intent. The eviction tick — which only a replace
+  produces — now arms a hold on the CNPG size that lasts until the
+  committed count is back (or the operator shrinks the control plane
+  on purpose), and `patch_cnpg_instances` defers any scale-down the
+  Cluster reports it cannot take (fewer ready instances than it
+  has) — logged as `cnpg_instances_scale_down_deferred` and retried
+  every tick, so a real demote lands on the first tick the cluster
+  is whole. Scale-up and the anti-affinity repair are untouched.
+
 - **PR-time Trivy lanes scanned a frozen package layer, and trusted
   Trivy's exit code (#1093).** Four workflows build an image on a PR
   and scan it — DNS, DHCP, looking-glass, supervisor. All four cache

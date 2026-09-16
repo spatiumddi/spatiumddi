@@ -36,6 +36,7 @@ from __future__ import annotations
 import hashlib
 import time
 import uuid
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -327,6 +328,66 @@ _evicted_pending: set[str] = set()
 # back to the sweep as evicted names next tick so it scans past its
 # "Postgres is whole" early-out; cleared by the tick that settles them.
 _stranded_pending: set[str] = set()
+
+
+class _ReplaceHold:
+    """#1059 — the CloudNativePG size hold a dead-node replace arms.
+
+    ``/fleet/control-plane/{id}/replace`` drops the replaced row from the
+    committed control-plane count at once and asks the seed to evict its
+    Node, so from the eviction tick until the replacement is promoted the
+    count the heartbeat carries is one short of what the cluster is
+    committed to — and a replace is never a scale-down by intent (the
+    product refuses an even count). Only ``/replace`` sets
+    ``evict_requested``; a demote is a ``leaving`` row, never an eviction —
+    so an eviction tick is a replace tick by construction. The hold is
+    armed on it and kept until the count is back at the size CNPG has
+    (``settle``: the replacement settled) or the operator shrinks the
+    control plane below the count the eviction tick carried (a deliberate
+    demote: the slot is abandoned). Module state, like ``_evicted_pending``:
+    a supervisor restart mid-replace forgets it, and ``patch_cnpg_instances``'s
+    own readiness guard covers the rest of the install window (the Cluster
+    is not whole until the replacement joins).
+    """
+
+    def __init__(self) -> None:
+        self.armed = False
+        self.cp_size = 0
+        self.nodes: list[str] = []
+
+    def _why(self, cp_size: int) -> str:
+        return (
+            f"replacing {self.nodes}: the committed count {cp_size} is short until the "
+            "replacement is promoted"
+        )
+
+    def reason(self, evict_names: Iterable[str], cp_size: int) -> str:
+        """Arm (or re-arm) on an eviction tick; otherwise why this tick must
+        not scale CNPG down, or ``""`` when it may."""
+        evicting = sorted(str(n) for n in evict_names if n)
+        if evicting:
+            self.armed, self.cp_size, self.nodes = True, cp_size, evicting
+            return self._why(cp_size)
+        if not self.armed:
+            return ""
+        if cp_size < self.cp_size:
+            # Below what the eviction left: the operator demoted on purpose.
+            self.clear()
+            return ""
+        return self._why(cp_size)
+
+    def settle(self, cp_size: int, current_spec: int | None) -> None:
+        """Release once the committed count is back at (or above) the size
+        CNPG has — ``current_spec`` is ``spec.instances`` as the tick read it;
+        an unreadable Cluster keeps the hold."""
+        if self.armed and current_spec is not None and cp_size >= current_spec:
+            self.clear()
+
+    def clear(self) -> None:
+        self.armed, self.cp_size, self.nodes = False, 0, []
+
+
+_replace_hold = _ReplaceHold()
 
 
 def _carry_stranded(previous: set[str], evicted_now: list[str], outcome) -> set[str]:
@@ -1029,13 +1090,40 @@ def heartbeat_once(
         # kept Cluster stays at its initial instance count, so scale it
         # directly here (a merge-patch isn't a Helm op → keep doesn't
         # apply). Idempotent — only patches on a real size change.
-        pg_changed, pg_err = k8s_api.patch_cnpg_instances(cp_size)
-        if pg_changed:
+        #
+        # #1059 — never DOWN while a dead node is being replaced. The replace
+        # endpoint drops the replaced row from the committed count at once,
+        # so this tick — the one that also deletes the Node below — used to
+        # ask for one instance fewer, and every tick after it too, until the
+        # replacement was promoted (~10 min). CNPG took the smaller spec while
+        # the dead node's pod still read Ready and deleted whichever ready
+        # non-primary instance had the highest serial (the dead one by luck,
+        # or a healthy replica); on a later tick it refused instead, and the
+        # smaller spec then only stopped it re-creating the dead instance —
+        # Postgres two of three until the promote restored the count. The
+        # eviction tick arms _replace_hold, which keeps the size until the
+        # committed count is back (or the operator shrinks on purpose), and
+        # patch_cnpg_instances itself defers any scale-down the Cluster
+        # reports it cannot take. Scale-up is untouched; a real demote lands
+        # on the first tick the cluster is whole.
+        hold = _replace_hold.reason(body_out.get("evict_node_names") or [], cp_size)
+        pg_scale = k8s_api.patch_cnpg_instances(cp_size, scale_down=not hold, hold_reason=hold)
+        _replace_hold.settle(cp_size, pg_scale.current)
+        if pg_scale.scaled:
             log.info("supervisor.heartbeat.cnpg_instances_scaled", size=cp_size)
-        elif pg_err:
+        elif pg_scale.deferred:
+            log.info(
+                "supervisor.heartbeat.cnpg_instances_scale_down_deferred",
+                size=cp_size,
+                current=pg_scale.current,
+                ready=pg_scale.ready,
+                instances=pg_scale.reported,
+                reason=pg_scale.deferred,
+            )
+        elif pg_scale.error:
             log.warning(
                 "supervisor.heartbeat.cnpg_instances_scale_failed",
-                error=pg_err,
+                error=pg_scale.error,
                 size=cp_size,
             )
 
